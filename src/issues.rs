@@ -15,6 +15,21 @@ use uuid::Uuid;
 use crate::common::*;
 use crate::workitems::{self, ACTIVE, Arg, Base, Scope};
 
+fn uuid_list(body: &Value, field: &str) -> Result<Vec<Uuid>, ApiError> {
+    match body.get(field) {
+        None => Ok(Vec::new()),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                    .ok_or_else(|| ApiError::bad("Invalid UUID list"))
+            })
+            .collect(),
+        _ => Err(ApiError::bad("Invalid UUID list")),
+    }
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route(
@@ -60,10 +75,10 @@ async fn create(
         .filter(|n| !n.trim().is_empty() && n.chars().count() <= 255)
         .ok_or_else(|| ApiError::bad("A name of at most 255 characters is required"))?;
     // Reject fields not yet implemented rather than silently discard user data.
-    if body
-        .as_object()
-        .is_none_or(|b| b.keys().any(|k| k != "name" && k != "state_id"))
-    {
+    if body.as_object().is_none_or(|b| {
+        b.keys()
+            .any(|k| !["name", "state_id", "assignee_ids", "label_ids", "priority"].contains(&k.as_str()))
+    }) {
         return Err(ApiError::bad("Unsupported issue creation field"));
     }
     let state = if body.get("state_id").is_some_and(|v| !v.is_null()) {
@@ -72,6 +87,12 @@ async fn create(
         None
     };
     let mut tx = st.db.begin().await?;
+    let assignees = uuid_list(&body, "assignee_ids")?;
+    let labels = uuid_list(&body, "label_ids")?;
+    let priority = s(&body, "priority").unwrap_or("none");
+    if !["none", "urgent", "high", "medium", "low"].contains(&priority) {
+        return Err(ApiError::bad("Invalid priority"));
+    }
     let state: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM states WHERE project_id=$1 AND workspace_id=$2 AND deleted_at IS NULL
          AND NOT is_triage AND ($3::uuid IS NULL OR id=$3) ORDER BY \"default\" DESC, sequence LIMIT 1",
@@ -97,6 +118,27 @@ async fn create(
         VALUES ($1,$2,$3,$4,$5,$6,$6,COALESCE((SELECT MAX(sort_order)+10000 FROM issues WHERE project_id=$2 AND workspace_id=$3 AND state_id=$4 AND deleted_at IS NULL),65535),
         CASE WHEN (SELECT \"group\" FROM states WHERE id=$4 AND project_id=$2 AND workspace_id=$3)='completed' THEN now() ELSE NULL END) RETURNING id")
         .bind(name).bind(project_id).bind(p.workspace_id()).bind(state).bind(sequence).bind(user.id).fetch_one(&mut *tx).await?;
+    sqlx::query("UPDATE issues SET priority=$4 WHERE id=$1 AND project_id=$2 AND workspace_id=$3")
+        .bind(id)
+        .bind(project_id)
+        .bind(p.workspace_id())
+        .bind(priority)
+        .execute(&mut *tx)
+        .await?;
+    for assignee in assignees {
+        let result = sqlx::query("INSERT INTO issue_assignees (issue_id,project_id,workspace_id,assignee_id,created_by_id,updated_by_id) SELECT $1,$2,$3,$4,$5,$5 WHERE EXISTS (SELECT 1 FROM project_members WHERE project_id=$2 AND workspace_id=$3 AND member_id=$4 AND is_active AND role>=15 AND deleted_at IS NULL) AND NOT EXISTS (SELECT 1 FROM issue_assignees WHERE issue_id=$1 AND project_id=$2 AND workspace_id=$3 AND assignee_id=$4 AND deleted_at IS NULL)")
+            .bind(id).bind(project_id).bind(p.workspace_id()).bind(assignee).bind(user.id).execute(&mut *tx).await?;
+        if result.rows_affected() == 0 {
+            return Err(ApiError::bad("Invalid or duplicate assignee"));
+        }
+    }
+    for label in labels {
+        let result = sqlx::query("INSERT INTO issue_labels (issue_id,project_id,workspace_id,label_id,created_by_id,updated_by_id) SELECT $1,$2,$3,$4,$5,$5 WHERE EXISTS (SELECT 1 FROM labels WHERE id=$4 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL) AND NOT EXISTS (SELECT 1 FROM issue_labels WHERE issue_id=$1 AND project_id=$2 AND workspace_id=$3 AND label_id=$4 AND deleted_at IS NULL)")
+            .bind(id).bind(project_id).bind(p.workspace_id()).bind(label).bind(user.id).execute(&mut *tx).await?;
+        if result.rows_affected() == 0 {
+            return Err(ApiError::bad("Invalid or duplicate label"));
+        }
+    }
     sqlx::query("INSERT INTO issue_sequences (issue_id, project_id, workspace_id, sequence, created_by_id, updated_by_id) VALUES ($1,$2,$3,$4,$5,$5)")
         .bind(id).bind(project_id).bind(p.workspace_id()).bind(i64::from(sequence)).bind(user.id).execute(&mut *tx).await?;
     sqlx::query("INSERT INTO issue_activities (issue_id, project_id, workspace_id, actor_id, created_by_id, updated_by_id, verb, comment, attachments, epoch) VALUES ($1,$2,$3,$4,$4,$4,'created','',ARRAY[]::varchar[],extract(epoch from now()))")
