@@ -1,5 +1,6 @@
 mod auth;
 mod common;
+mod instance;
 mod session;
 mod web;
 mod workitems;
@@ -33,6 +34,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
 pub fn app(state: AppState) -> Router {
     let api = Router::new()
         .merge(auth::routes())
+        .merge(instance::routes())
         .merge(users::routes())
         .merge(workspaces::routes())
         .merge(projects::routes())
@@ -88,7 +90,8 @@ async fn migrate(db: &sqlx::PgPool) -> anyhow::Result<()> {
             .await?;
         tx.commit().await?;
     }
-    auth::ensure_instance(db).await
+    auth::ensure_instance(db).await?;
+    instance::ensure_configurations(db).await
 }
 
 fn env(k: &str, d: &str) -> String {
