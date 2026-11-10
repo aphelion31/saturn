@@ -140,6 +140,10 @@ pub fn routes() -> Router<AppState> {
             axum::routing::delete(bulk_delete),
         )
         .route(
+            "/api/workspaces/{slug}/projects/{project_id}/bulk-archive-issues/",
+            axum::routing::post(bulk_archive),
+        )
+        .route(
             "/api/workspaces/{slug}/projects/{project_id}/bulk-operation-issues/",
             axum::routing::post(bulk_operation),
         )
@@ -243,16 +247,23 @@ async fn global_search(
             "module" => {
                 "SELECT jsonb_build_object('name',c.name,'id',c.id,'project_id',p.id,'project__identifier',p.identifier,'workspace__slug',$5::text) FROM modules c JOIN projects p ON p.id=c.project_id AND p.workspace_id=c.workspace_id JOIN project_members m ON m.project_id=p.id AND m.workspace_id=p.workspace_id WHERE c.workspace_id=$1 AND m.member_id=$2 AND m.is_active AND m.deleted_at IS NULL AND c.deleted_at IS NULL AND p.deleted_at IS NULL AND p.archived_at IS NULL AND c.name ILIKE '%'||$3||'%' AND ($4::uuid IS NULL OR $6 OR p.id=$4) ORDER BY c.created_at DESC LIMIT 100"
             }
-            "page" | "issue_view" | "intake" => {
-                results.insert(entity.to_owned(), serde_json::json!([]));
-                continue;
+            "issue_view" => {
+                "SELECT jsonb_build_object('name',v.name,'id',v.id,'project_id',p.id,'project__identifier',p.identifier,'workspace__slug',$5::text) FROM issue_views v JOIN projects p ON p.id=v.project_id AND p.workspace_id=v.workspace_id JOIN project_members m ON m.project_id=p.id AND m.workspace_id=p.workspace_id WHERE v.workspace_id=$1 AND m.member_id=$2 AND m.is_active AND m.deleted_at IS NULL AND v.deleted_at IS NULL AND v.archived_at IS NULL AND p.deleted_at IS NULL AND p.archived_at IS NULL AND (m.role>5 OR p.guest_view_all_features OR v.owned_by_id=$2) AND (v.owned_by_id=$2 OR v.access=1) AND v.name ILIKE '%'||$3||'%' AND ($4::uuid IS NULL OR $6 OR p.id=$4) ORDER BY v.created_at DESC LIMIT 100"
+            }
+            "page" => {
+                "SELECT jsonb_build_object('name',pg.name,'id',pg.id,'project_ids',jsonb_agg(DISTINCT p.id),'project_identifiers',jsonb_agg(DISTINCT p.identifier),'workspace__slug',$5::text) FROM pages pg JOIN project_pages pp ON pp.page_id=pg.id AND pp.workspace_id=pg.workspace_id AND pp.deleted_at IS NULL JOIN projects p ON p.id=pp.project_id AND p.workspace_id=pp.workspace_id JOIN project_members m ON m.project_id=p.id AND m.workspace_id=p.workspace_id WHERE pg.workspace_id=$1 AND m.member_id=$2 AND m.is_active AND m.deleted_at IS NULL AND pg.deleted_at IS NULL AND pg.archived_at IS NULL AND p.deleted_at IS NULL AND p.archived_at IS NULL AND (m.role>5 OR p.guest_view_all_features OR pg.owned_by_id=$2) AND (pg.owned_by_id=$2 OR pg.access=1) AND pg.name ILIKE '%'||$3||'%' AND ($4::uuid IS NULL OR $6 OR p.id=$4) GROUP BY pg.id ORDER BY pg.created_at DESC LIMIT 100"
+            }
+            "intake" => {
+                "SELECT jsonb_build_object('name',i.name,'id',i.id,'sequence_id',i.sequence_id,'project__identifier',p.identifier,'project_id',p.id,'workspace__slug',$5::text) FROM issues i JOIN projects p ON p.id=i.project_id AND p.workspace_id=i.workspace_id JOIN project_members m ON m.project_id=p.id AND m.workspace_id=p.workspace_id WHERE i.workspace_id=$1 AND m.member_id=$2 AND m.is_active AND m.deleted_at IS NULL AND i.deleted_at IS NULL AND p.deleted_at IS NULL AND p.archived_at IS NULL AND (m.role>5 OR p.guest_view_all_features OR i.created_by_id=$2) AND EXISTS (SELECT 1 FROM intake_issues ii WHERE ii.issue_id=i.id AND ii.workspace_id=i.workspace_id AND ii.project_id=i.project_id AND ii.deleted_at IS NULL AND ii.status IN (0,-2)) AND (i.name ILIKE '%'||$3||'%' OR (p.identifier||'-'||i.sequence_id::text) ILIKE '%'||$3||'%') AND ($4::uuid IS NULL OR $6 OR p.id=$4) ORDER BY i.created_at DESC LIMIT 100"
             }
             _ => continue,
         };
-        let sql = sql.replace(
-            "$4::uuid IS NOT NULL AND $5::text",
-            "($4::uuid IS NULL OR $4::uuid IS NOT NULL) AND $5::text",
-        );
+        let sql = sql
+            .replace(
+                "$4::uuid IS NOT NULL AND $5::text",
+                "($4::uuid IS NULL OR $4::uuid IS NOT NULL) AND $5::text",
+            )
+            .replace("pg.owned_by_id=$2 OR pg.access=1", "pg.owned_by_id=$2 OR pg.access=0");
         let rows: Vec<Value> = sqlx::query_scalar(&sql)
             .bind(ws.workspace_id)
             .bind(user.id)
@@ -346,6 +357,36 @@ async fn bulk_delete(
     Ok(Json(
         serde_json::json!({"message":format!("{} issues were deleted",ids.len())}),
     ))
+}
+async fn bulk_archive(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let ids = uuid_list(&body, "issue_ids")?;
+    if ids.is_empty() {
+        return Err(ApiError::bad("Issue IDs are required"));
+    }
+    let mut tx = st.db.begin().await?;
+    let rows: Vec<(Uuid, String)> = sqlx::query_as("SELECT i.id, s.group FROM issues i JOIN states s ON s.id=i.state_id AND s.project_id=i.project_id AND s.workspace_id=i.workspace_id AND s.deleted_at IS NULL WHERE i.id=ANY($1) AND i.project_id=$2 AND i.workspace_id=$3 AND i.deleted_at IS NULL FOR UPDATE OF i")
+        .bind(&ids).bind(pid).bind(p.workspace_id()).fetch_all(&mut *tx).await?;
+    if rows.len() != ids.len()
+        || rows
+            .iter()
+            .any(|(_, group)| group != "completed" && group != "cancelled")
+    {
+        return Err(ApiError::bad(
+            "Can only archive completed or cancelled issues in this project",
+        ));
+    }
+    let date: chrono::NaiveDate = sqlx::query_scalar("SELECT CURRENT_DATE").fetch_one(&mut *tx).await?;
+    sqlx::query("UPDATE issues SET archived_at=$4,updated_at=now(),updated_by_id=$5 WHERE id=ANY($1) AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL")
+        .bind(&ids).bind(pid).bind(p.workspace_id()).bind(date).bind(user.id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(Json(serde_json::json!({"archived_at":date})))
 }
 async fn bulk_operation(
     State(st): State<AppState>,
@@ -1014,6 +1055,7 @@ async fn history(
     let sql = format!(
         "SELECT value FROM (SELECT c.created_at, {COMMENT_JSON} AS value FROM issue_comments c WHERE c.issue_id=$1 AND c.project_id=$2 AND c.workspace_id=$3 AND c.deleted_at IS NULL AND ($4::timestamptz IS NULL OR c.created_at>$4) AND $5 <> 'issue-property' UNION ALL SELECT a.created_at, (to_jsonb(a)-'actor_id'-'issue_id'-'project_id'-'workspace_id'-'created_by_id'-'updated_by_id'-'issue_comment_id') || jsonb_build_object('actor',a.actor_id,'issue',a.issue_id,'project',a.project_id,'workspace',a.workspace_id,'created_by',a.created_by_id,'updated_by',a.updated_by_id,'issue_comment',a.issue_comment_id,'source_data',NULL) FROM issue_activities a WHERE a.issue_id=$1 AND a.project_id=$2 AND a.workspace_id=$3 AND a.deleted_at IS NULL AND (a.field IS NULL OR a.field NOT IN ('comment','vote','reaction','draft')) AND ($4::timestamptz IS NULL OR a.created_at>$4) AND $5 <> 'issue-comment') x ORDER BY created_at"
     );
+    let sql = sql.replace("'source_data',NULL)", "'source_data',CASE WHEN $5='issue-property' THEN (SELECT jsonb_build_object('source',ii.source,'source_email',ii.source_email,'extra',ii.extra) FROM intake_issues ii WHERE ii.issue_id=a.issue_id AND ii.project_id=a.project_id AND ii.workspace_id=a.workspace_id AND ii.deleted_at IS NULL LIMIT 1) ELSE NULL END,'actor_detail',(SELECT jsonb_build_object('id',u.id,'first_name',u.first_name,'last_name',u.last_name,'avatar',u.avatar,'avatar_url',CASE WHEN u.avatar_asset_id IS NOT NULL THEN '/api/assets/v2/static/'||u.avatar_asset_id||'/' ELSE NULLIF(u.avatar,'') END,'is_bot',u.is_bot,'display_name',u.display_name) FROM users u WHERE u.id=a.actor_id),'issue_detail',(SELECT jsonb_build_object('id',i.id,'name',i.name,'description_json',i.description_json,'description_html',i.description_html,'priority',i.priority,'start_date',i.start_date,'target_date',i.target_date,'sequence_id',i.sequence_id,'sort_order',i.sort_order,'is_draft',i.is_draft) FROM issues i WHERE i.id=a.issue_id AND i.project_id=a.project_id AND i.workspace_id=a.workspace_id),'project_detail',(SELECT jsonb_build_object('id',p.id,'identifier',p.identifier,'name',p.name,'cover_image',p.cover_image,'cover_image_url',CASE WHEN p.cover_image_asset_id IS NOT NULL THEN '/api/assets/v2/static/'||p.cover_image_asset_id||'/' ELSE NULLIF(p.cover_image,'') END,'logo_props',p.logo_props,'description',p.description) FROM projects p WHERE p.id=a.project_id AND p.workspace_id=a.workspace_id),'workspace_detail',(SELECT jsonb_build_object('id',w.id,'name',w.name,'slug',w.slug,'logo_url',NULLIF(w.logo,'')) FROM workspaces w WHERE w.id=a.workspace_id))");
     json_rows(
         sqlx::query_scalar(&sql)
             .bind(issue)
