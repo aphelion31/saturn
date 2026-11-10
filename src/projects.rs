@@ -44,7 +44,18 @@ pub fn routes() -> Router<AppState> {
             get(label).patch(update_label).delete(delete_label),
         )
         .route("/api/workspaces/{slug}/project-identifiers/", get(project_identifiers))
-        .route("/api/workspaces/{slug}/projects/{project_id}/members/", get(members))
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/members/",
+            get(members).post(add_members),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/members/{member_id}/",
+            axum::routing::patch(update_member).delete(remove_member),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/members/leave/",
+            axum::routing::post(leave_project),
+        )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/project-members/me/",
             get(my_membership),
@@ -70,6 +81,136 @@ pub fn routes() -> Router<AppState> {
 }
 
 const LABEL_JSON: &str = "jsonb_build_object('id', id, 'name', name, 'color', color, 'parent', parent_id, 'project_id', project_id, 'workspace_id', workspace_id, 'sort_order', sort_order)";
+
+async fn add_members(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let p = require_project(&st.db, &user, &slug, project).await?;
+    p.require(&[ADMIN])?;
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    let requested = b
+        .get("members")
+        .and_then(Value::as_array)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| ApiError::bad("At least one member is required"))?;
+    let mut tx = st.db.begin().await?;
+    for member in requested {
+        let id = uuid_of(member, "member_id").ok_or_else(|| ApiError::bad("Invalid member"))?;
+        let role = member.get("role").and_then(Value::as_i64).unwrap_or(5);
+        if ![5, 15, 20].contains(&role) {
+            return Err(ApiError::bad("Invalid role"));
+        }
+        if !ws.is_admin() {
+            let existing:Option<i16>=sqlx::query_scalar("SELECT role FROM project_members WHERE workspace_id=$1 AND project_id=$2 AND member_id=$3 AND is_active AND deleted_at IS NULL").bind(p.workspace_id()).bind(project).bind(id).fetch_optional(&mut *tx).await?;
+            if role >= 20 || existing.is_some_and(|r| r >= 20) {
+                return Err(ApiError::forbidden());
+            }
+        }
+        let ws_role:i16=sqlx::query_scalar("SELECT role FROM workspace_members WHERE workspace_id=$1 AND member_id=$2 AND is_active AND deleted_at IS NULL").bind(p.workspace_id()).bind(id).fetch_optional(&mut *tx).await?.ok_or_else(|| ApiError::bad("Invalid workspace member"))?;
+        if (ws_role == 20 && role != 20) || (ws_role == 5 && role != 5) {
+            return Err(ApiError::bad("Invalid role for workspace member"));
+        }
+        sqlx::query("INSERT INTO project_members (workspace_id,project_id,member_id,role,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$5,$5) ON CONFLICT (project_id,member_id) WHERE deleted_at IS NULL DO UPDATE SET role=EXCLUDED.role,is_active=true,updated_at=now(),updated_by_id=EXCLUDED.updated_by_id").bind(p.workspace_id()).bind(project).bind(id).bind(role as i16).bind(user.id).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO project_user_properties (workspace_id,project_id,user_id,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$4) ON CONFLICT DO NOTHING").bind(p.workspace_id()).bind(project).bind(id).bind(user.id).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    let Json(rows) = members(State(st), user, Path((slug, project))).await?;
+    Ok((StatusCode::CREATED, Json(rows)))
+}
+
+async fn update_member(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, id)): Path<(String, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project).await?;
+    p.require(&[ADMIN])?;
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    let (target,target_role,workspace_role):(Uuid,i16,i16)=sqlx::query_as("SELECT pm.member_id,pm.role,wm.role FROM project_members pm JOIN workspace_members wm ON wm.member_id=pm.member_id AND wm.workspace_id=pm.workspace_id AND wm.is_active AND wm.deleted_at IS NULL WHERE pm.id=$1 AND pm.project_id=$2 AND pm.workspace_id=$3 AND pm.is_active AND pm.deleted_at IS NULL").bind(id).bind(project).bind(p.workspace_id()).fetch_one(&st.db).await?;
+    if b.get("preferences").is_some() || b.get("view_props").is_some() || b.get("default_props").is_some() {
+        if target != user.id {
+            return Err(ApiError::forbidden());
+        }
+        return Err(ApiError::bad("Personal settings are not supported here"));
+    }
+    if !ws.is_admin() && (target == user.id || target_role >= 20) {
+        return Err(ApiError::forbidden());
+    }
+    let role = if let Some(v) = b.get("role") {
+        let r = v
+            .as_i64()
+            .filter(|r| [5, 15, 20].contains(r))
+            .ok_or_else(|| ApiError::bad("Invalid role"))?;
+        if (workspace_role == 5 && r != 5) || (!ws.is_admin() && r >= 20) {
+            return Err(ApiError::forbidden());
+        }
+        Some(r as i16)
+    } else {
+        None
+    };
+    let active = if let Some(v) = b.get("is_active") {
+        Some(v.as_bool().ok_or_else(|| ApiError::bad("Invalid active status"))?)
+    } else {
+        None
+    };
+    let sql = format!(
+        "UPDATE project_members SET role=COALESCE($4,role),is_active=COALESCE($5,is_active),updated_by_id=$6,updated_at=now() WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL RETURNING to_jsonb(project_members)"
+    );
+    json_row(
+        sqlx::query_scalar(&sql)
+            .bind(id)
+            .bind(project)
+            .bind(p.workspace_id())
+            .bind(role)
+            .bind(active)
+            .bind(user.id),
+        &st.db,
+    )
+    .await
+}
+
+async fn remove_member(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, id)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, project).await?;
+    p.require(&[ADMIN])?;
+    let r=sqlx::query("UPDATE project_members SET is_active=false,updated_at=now(),updated_by_id=$4 WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND member_id<>$4 AND role<=20 AND is_active AND deleted_at IS NULL").bind(id).bind(project).bind(p.workspace_id()).bind(user.id).execute(&st.db).await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
+}
+
+async fn leave_project(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project)): Path<(String, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, project).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let mut tx = st.db.begin().await?;
+    sqlx::query("SELECT id FROM projects WHERE id=$1 AND workspace_id=$2 FOR UPDATE")
+        .bind(project)
+        .bind(p.workspace_id())
+        .fetch_one(&mut *tx)
+        .await?;
+    let (role,):(i16,)=sqlx::query_as("SELECT role FROM project_members WHERE workspace_id=$1 AND project_id=$2 AND member_id=$3 AND is_active AND deleted_at IS NULL").bind(p.workspace_id()).bind(project).bind(user.id).fetch_one(&mut *tx).await?;
+    if role == 20 {
+        let count:i64=sqlx::query_scalar("SELECT count(*) FROM project_members WHERE workspace_id=$1 AND project_id=$2 AND role=20 AND is_active AND deleted_at IS NULL").bind(p.workspace_id()).bind(project).fetch_one(&mut *tx).await?;
+        if count <= 1 {
+            return Err(ApiError::bad("The only project admin cannot leave"));
+        }
+    }
+    sqlx::query("UPDATE project_members SET is_active=false,updated_at=now(),updated_by_id=$3 WHERE workspace_id=$1 AND project_id=$2 AND member_id=$3 AND is_active AND deleted_at IS NULL").bind(p.workspace_id()).bind(project).bind(user.id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    no_content()
+}
 
 async fn get_estimate(
     State(st): State<AppState>,
