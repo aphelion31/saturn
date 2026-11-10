@@ -83,10 +83,503 @@ pub fn routes() -> Router<AppState> {
             "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/history/",
             get(history),
         )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-links/",
+            get(links).post(link_create),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-links/{link_id}/",
+            get(link_detail).patch(link_update).put(link_update).delete(link_delete),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/reactions/",
+            get(issue_reactions).post(issue_reaction_create),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/reactions/{code}/",
+            axum::routing::delete(issue_reaction_delete),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/comments/{comment_id}/reactions/",
+            get(comment_reactions).post(comment_reaction_create),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/comments/{comment_id}/reactions/{code}/",
+            axum::routing::delete(comment_reaction_delete),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/subscribe/",
+            get(subscription_status).post(subscribe).delete(unsubscribe),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-subscribers/",
+            get(subscribers).post(subscriber_create),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-subscribers/{subscriber_id}/",
+            axum::routing::delete(subscriber_delete),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-relation/",
+            get(relations).post(relation_create),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/remove-relation/",
+            axum::routing::post(relation_remove),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/sub-issues/",
+            get(sub_issues).post(sub_issue_assign),
+        )
 }
 
 type IssuePath = (String, Uuid, Uuid);
 type CommentPath = (String, Uuid, Uuid, Uuid);
+
+async fn subscription_status(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, iid)): Path<IssuePath>,
+) -> ApiResult {
+    let p = visible_issue(&st, &user, &slug, pid, iid).await?;
+    let subscribed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM issue_subscribers WHERE workspace_id=$1 AND project_id=$2 AND issue_id=$3 AND subscriber_id=$4 AND deleted_at IS NULL)").bind(p.workspace_id()).bind(pid).bind(iid).bind(user.id).fetch_one(&st.db).await?;
+    Ok(Json(serde_json::json!({"subscribed":subscribed})))
+}
+async fn add_subscriber(
+    st: AppState,
+    user: CurrentUser,
+    path: IssuePath,
+    subscriber: Uuid,
+) -> ApiResult<(axum::http::StatusCode, Json<Value>)> {
+    let (slug, pid, iid) = path;
+    let p = visible_issue(&st, &user, &slug, pid, iid).await?;
+    let v:Option<Value>=sqlx::query_scalar("INSERT INTO issue_subscribers (workspace_id,project_id,issue_id,subscriber_id,created_by_id,updated_by_id) SELECT $1,$2,$3,$4,$5,$5 WHERE EXISTS(SELECT 1 FROM project_members WHERE workspace_id=$1 AND project_id=$2 AND member_id=$4 AND is_active AND deleted_at IS NULL) AND NOT EXISTS(SELECT 1 FROM issue_subscribers WHERE workspace_id=$1 AND project_id=$2 AND issue_id=$3 AND subscriber_id=$4 AND deleted_at IS NULL) RETURNING (to_jsonb(issue_subscribers)-'workspace_id'-'project_id'-'issue_id'-'subscriber_id'-'created_by_id'-'updated_by_id') || jsonb_build_object('workspace',workspace_id,'project',project_id,'issue',issue_id,'subscriber',subscriber_id,'created_by',created_by_id,'updated_by',updated_by_id)").bind(p.workspace_id()).bind(pid).bind(iid).bind(subscriber).bind(user.id).fetch_optional(&st.db).await?;
+    created(v.ok_or_else(|| ApiError::bad("Subscriber is invalid or already subscribed"))?)
+}
+async fn subscribe(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(path): Path<IssuePath>,
+) -> ApiResult<(axum::http::StatusCode, Json<Value>)> {
+    let id = user.id;
+    add_subscriber(st, user, path, id).await
+}
+async fn subscriber_create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(path): Path<IssuePath>,
+    Json(body): Json<Value>,
+) -> ApiResult<(axum::http::StatusCode, Json<Value>)> {
+    let id = uuid_of(&body, "subscriber").ok_or_else(|| ApiError::bad("Invalid subscriber"))?;
+    add_subscriber(st, user, path, id).await
+}
+async fn remove_subscriber(
+    st: AppState,
+    user: CurrentUser,
+    path: IssuePath,
+    subscriber: Uuid,
+) -> ApiResult<axum::http::StatusCode> {
+    let (slug, pid, iid) = path;
+    let p = visible_issue(&st, &user, &slug, pid, iid).await?;
+    if subscriber != user.id {
+        p.require(&[ADMIN, MEMBER])?;
+    }
+    let r=sqlx::query("UPDATE issue_subscribers SET deleted_at=now(),updated_at=now(),updated_by_id=$5 WHERE workspace_id=$1 AND project_id=$2 AND issue_id=$3 AND subscriber_id=$4 AND deleted_at IS NULL").bind(p.workspace_id()).bind(pid).bind(iid).bind(subscriber).bind(user.id).execute(&st.db).await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
+}
+async fn unsubscribe(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(path): Path<IssuePath>,
+) -> ApiResult<axum::http::StatusCode> {
+    let id = user.id;
+    remove_subscriber(st, user, path, id).await
+}
+async fn subscriber_delete(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, iid, id)): Path<CommentPath>,
+) -> ApiResult<axum::http::StatusCode> {
+    remove_subscriber(st, user, (slug, pid, iid), id).await
+}
+async fn subscribers(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, iid)): Path<IssuePath>,
+) -> ApiResult {
+    let p = visible_issue(&st, &user, &slug, pid, iid).await?;
+    json_rows(sqlx::query_scalar("SELECT (to_jsonb(m)-'member_id'-'workspace_id'-'project_id'-'created_by_id'-'updated_by_id') || jsonb_build_object('member',m.member_id,'workspace',m.workspace_id,'project',m.project_id,'created_by',m.created_by_id,'updated_by',m.updated_by_id,'member_detail',jsonb_build_object('id',u.id,'display_name',u.display_name,'first_name',u.first_name,'last_name',u.last_name,'avatar',u.avatar,'is_bot',u.is_bot)) FROM project_members m JOIN users u ON u.id=m.member_id WHERE m.workspace_id=$1 AND m.project_id=$2 AND m.is_active AND m.deleted_at IS NULL").bind(p.workspace_id()).bind(pid),&st.db).await
+}
+
+async fn relations(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, iid)): Path<IssuePath>,
+) -> ApiResult {
+    let p = visible_issue(&st, &user, &slug, pid, iid).await?;
+    let sql = format!(
+        "SELECT jsonb_build_object('kind',CASE WHEN r.relation_type='blocked_by' AND r.related_issue_id=$1 THEN 'blocking' WHEN r.relation_type='start_before' AND r.related_issue_id=$1 THEN 'start_after' WHEN r.relation_type='finish_before' AND r.related_issue_id=$1 THEN 'finish_after' ELSE r.relation_type END,'item',{item}) FROM issue_relations r JOIN issues i ON i.id=CASE WHEN r.issue_id=$1 THEN r.related_issue_id ELSE r.issue_id END AND i.workspace_id=$3 WHERE r.workspace_id=$3 AND (r.issue_id=$1 OR r.related_issue_id=$1) AND r.deleted_at IS NULL AND i.deleted_at IS NULL AND i.archived_at IS NULL AND NOT i.is_draft AND EXISTS(SELECT 1 FROM project_members pm WHERE pm.project_id=i.project_id AND pm.workspace_id=$3 AND pm.member_id=$4 AND pm.is_active AND pm.deleted_at IS NULL) AND (NOT $5 OR i.created_by_id=$4)",
+        item = workitems::ITEM_JSON
+    );
+    let sql = sql.replace(
+        "r.workspace_id=$3 AND (r.issue_id",
+        "r.workspace_id=$3 AND $2::uuid IS NOT NULL AND (r.issue_id",
+    );
+    let rows: Vec<Value> = sqlx::query_scalar(&sql)
+        .bind(iid)
+        .bind(pid)
+        .bind(p.workspace_id())
+        .bind(user.id)
+        .bind(p.restricted_guest())
+        .fetch_all(&st.db)
+        .await?;
+    let mut out = serde_json::Map::new();
+    for k in [
+        "blocking",
+        "blocked_by",
+        "duplicate",
+        "relates_to",
+        "start_after",
+        "start_before",
+        "finish_after",
+        "finish_before",
+    ] {
+        out.insert(k.into(), serde_json::json!([]));
+    }
+    for row in rows {
+        if let Some(k) = row["kind"].as_str() {
+            if let Some(v) = out.get_mut(k).and_then(Value::as_array_mut) {
+                let mut item = row["item"].clone();
+                item["relation_type"] = Value::String(k.into());
+                v.push(item);
+            }
+        }
+    }
+    Ok(Json(Value::Object(out)))
+}
+async fn relation_create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, iid)): Path<IssuePath>,
+    Json(body): Json<Value>,
+) -> ApiResult<(axum::http::StatusCode, Json<Value>)> {
+    let p = visible_issue(&st, &user, &slug, pid, iid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let kind = s(&body, "relation_type").ok_or_else(|| ApiError::bad("Relation type required"))?;
+    let (stored, reverse) = match kind {
+        "blocking" => ("blocked_by", true),
+        "blocked_by" => ("blocked_by", false),
+        "start_after" => ("start_before", true),
+        "start_before" => ("start_before", false),
+        "finish_after" => ("finish_before", true),
+        "finish_before" => ("finish_before", false),
+        "duplicate" => ("duplicate", false),
+        "relates_to" => ("relates_to", false),
+        _ => return Err(ApiError::bad("Invalid relation type")),
+    };
+    let ids = uuid_list(&body, "issues")?;
+    let mut tx = st.db.begin().await?;
+    let mut rows = Vec::new();
+    for id in ids {
+        if id == iid {
+            return Err(ApiError::bad("Cannot relate an issue to itself"));
+        }
+        let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM issues i JOIN project_members pm ON pm.project_id=i.project_id AND pm.workspace_id=i.workspace_id WHERE i.id=$1 AND i.workspace_id=$2 AND i.deleted_at IS NULL AND i.archived_at IS NULL AND NOT i.is_draft AND pm.member_id=$3 AND pm.is_active AND pm.deleted_at IS NULL AND (NOT $4 OR i.created_by_id=$3))").bind(id).bind(p.workspace_id()).bind(user.id).bind(p.restricted_guest()).fetch_one(&mut *tx).await?;
+        if !valid {
+            return Err(ApiError::bad("Invalid related issue"));
+        }
+        let (a, b) = if reverse { (id, iid) } else { (iid, id) };
+        let row:Option<Value>=sqlx::query_scalar("INSERT INTO issue_relations (workspace_id,project_id,issue_id,related_issue_id,relation_type,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$5,$6,$6) ON CONFLICT DO NOTHING RETURNING (to_jsonb(issue_relations)-'workspace_id'-'project_id'-'issue_id'-'related_issue_id'-'created_by_id'-'updated_by_id') || jsonb_build_object('workspace',workspace_id,'project',project_id,'issue',issue_id,'related_issue',related_issue_id,'created_by',created_by_id,'updated_by',updated_by_id)").bind(p.workspace_id()).bind(pid).bind(a).bind(b).bind(stored).bind(user.id).fetch_optional(&mut *tx).await?;
+        if let Some(v) = row {
+            rows.push(v);
+        }
+    }
+    tx.commit().await?;
+    created(Value::Array(rows))
+}
+async fn relation_remove(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, iid)): Path<IssuePath>,
+    Json(body): Json<Value>,
+) -> ApiResult<axum::http::StatusCode> {
+    let p = visible_issue(&st, &user, &slug, pid, iid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let other = uuid_of(&body, "related_issue").ok_or_else(|| ApiError::bad("Invalid related issue"))?;
+    let r=sqlx::query("UPDATE issue_relations SET deleted_at=now(),updated_at=now(),updated_by_id=$4 WHERE id=(SELECT id FROM issue_relations WHERE workspace_id=$1 AND ((issue_id=$2 AND related_issue_id=$3) OR (issue_id=$3 AND related_issue_id=$2)) AND deleted_at IS NULL LIMIT 1)").bind(p.workspace_id()).bind(iid).bind(other).bind(user.id).execute(&st.db).await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
+}
+async fn sub_issues(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, iid)): Path<IssuePath>,
+) -> ApiResult {
+    let p = visible_issue(&st, &user, &slug, pid, iid).await?;
+    let sql = format!(
+        "SELECT {} || jsonb_build_object('state_group',(SELECT s.group FROM states s WHERE s.id=i.state_id)) FROM issues i WHERE i.parent_id=$1 AND i.project_id=$2 AND i.workspace_id=$3 AND {} AND (NOT $4 OR i.created_by_id=$5) ORDER BY i.created_at DESC",
+        workitems::ITEM_JSON,
+        ACTIVE
+    );
+    let rows: Vec<Value> = sqlx::query_scalar(&sql)
+        .bind(iid)
+        .bind(pid)
+        .bind(p.workspace_id())
+        .bind(p.restricted_guest())
+        .bind(user.id)
+        .fetch_all(&st.db)
+        .await?;
+    let mut groups = serde_json::Map::new();
+    for row in &rows {
+        let key = row["state_group"].as_str().unwrap_or("None");
+        groups
+            .entry(key.to_string())
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .unwrap()
+            .push(row["id"].clone());
+    }
+    Ok(Json(serde_json::json!({"sub_issues":rows,"state_distribution":groups})))
+}
+async fn sub_issue_assign(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, iid)): Path<IssuePath>,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    let p = visible_issue(&st, &user, &slug, pid, iid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let ids = uuid_list(&body, "sub_issue_ids")?;
+    if ids.is_empty() || ids.contains(&iid) {
+        return Err(ApiError::bad("Invalid sub issue IDs"));
+    }
+    let mut tx = st.db.begin().await?;
+    let cycle:bool=sqlx::query_scalar("WITH RECURSIVE ancestors AS (SELECT id,parent_id FROM issues WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL UNION SELECT i.id,i.parent_id FROM issues i JOIN ancestors a ON i.id=a.parent_id WHERE i.project_id=$2 AND i.workspace_id=$3 AND i.deleted_at IS NULL) SELECT EXISTS(SELECT 1 FROM ancestors WHERE id=ANY($4))").bind(iid).bind(pid).bind(p.workspace_id()).bind(&ids).fetch_one(&mut *tx).await?;
+    if cycle {
+        return Err(ApiError::bad("Parent cycle"));
+    }
+    let r=sqlx::query("UPDATE issues SET parent_id=$1,updated_at=now(),updated_by_id=$5 WHERE id=ANY($4) AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL AND archived_at IS NULL AND NOT is_draft").bind(iid).bind(pid).bind(p.workspace_id()).bind(&ids).bind(user.id).execute(&mut *tx).await?;
+    if r.rows_affected() as usize != ids.len() {
+        return Err(ApiError::bad("Invalid sub issue IDs"));
+    }
+    tx.commit().await?;
+    sub_issues(State(st), user, Path((slug, pid, iid))).await
+}
+
+const LINK_JSON: &str = "(to_jsonb(l)-'issue_id'-'project_id'-'workspace_id'-'created_by_id'-'updated_by_id') || jsonb_build_object('issue',l.issue_id,'project',l.project_id,'workspace',l.workspace_id,'created_by',l.created_by_id,'updated_by',l.updated_by_id,'created_by_detail',(SELECT jsonb_build_object('id',u.id,'first_name',u.first_name,'last_name',u.last_name,'display_name',u.display_name,'avatar',u.avatar,'is_bot',u.is_bot) FROM users u WHERE u.id=l.created_by_id))";
+
+fn link_url(body: &Value) -> Result<Option<String>, ApiError> {
+    body.get("url")
+        .map(|v| {
+            let raw = v.as_str().ok_or_else(|| ApiError::bad("Invalid URL"))?;
+            let value = if raw.starts_with("http://") || raw.starts_with("https://") {
+                raw.to_owned()
+            } else {
+                format!("http://{raw}")
+            };
+            let parsed = url::Url::parse(&value).map_err(|_| ApiError::bad("Invalid URL"))?;
+            if parsed.host_str().is_none() || !parsed.username().is_empty() || parsed.password().is_some() {
+                return Err(ApiError::bad("Invalid URL"));
+            }
+            Ok(value)
+        })
+        .transpose()
+}
+
+async fn links(State(st): State<AppState>, user: CurrentUser, Path((slug, pid, iid)): Path<IssuePath>) -> ApiResult {
+    let p = visible_issue(&st, &user, &slug, pid, iid).await?;
+    json_rows(sqlx::query_scalar(&format!("SELECT {LINK_JSON} FROM issue_links l WHERE l.issue_id=$1 AND l.project_id=$2 AND l.workspace_id=$3 AND l.deleted_at IS NULL ORDER BY l.created_at DESC")).bind(iid).bind(pid).bind(p.workspace_id()),&st.db).await
+}
+async fn link_detail(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, iid, id)): Path<CommentPath>,
+) -> ApiResult {
+    let p = visible_issue(&st, &user, &slug, pid, iid).await?;
+    json_row(sqlx::query_scalar(&format!("SELECT {LINK_JSON} FROM issue_links l WHERE l.issue_id=$1 AND l.project_id=$2 AND l.workspace_id=$3 AND l.id=$4 AND l.deleted_at IS NULL")).bind(iid).bind(pid).bind(p.workspace_id()).bind(id),&st.db).await
+}
+async fn link_create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, iid)): Path<IssuePath>,
+    Json(body): Json<Value>,
+) -> ApiResult<(axum::http::StatusCode, Json<Value>)> {
+    let p = visible_issue(&st, &user, &slug, pid, iid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let url = link_url(&body)?.ok_or_else(|| ApiError::bad("URL required"))?;
+    let title = s(&body, "title");
+    if title.is_some_and(|v| v.chars().count() > 255) {
+        return Err(ApiError::bad("Title too long"));
+    }
+    let id: Uuid=sqlx::query_scalar("INSERT INTO issue_links (workspace_id,project_id,issue_id,url,title,created_by_id,updated_by_id) SELECT $1,$2,$3,$4,$5,$6,$6 WHERE NOT EXISTS (SELECT 1 FROM issue_links WHERE workspace_id=$1 AND project_id=$2 AND issue_id=$3 AND url=$4 AND deleted_at IS NULL) RETURNING id").bind(p.workspace_id()).bind(pid).bind(iid).bind(url).bind(title).bind(user.id).fetch_optional(&st.db).await?.ok_or_else(||ApiError::bad("URL already exists"))?;
+    let Json(v) = link_detail(State(st), user, Path((slug, pid, iid, id))).await?;
+    created(v)
+}
+async fn link_update(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, iid, id)): Path<CommentPath>,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    let p = visible_issue(&st, &user, &slug, pid, iid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let url = link_url(&body)?;
+    let title = s(&body, "title");
+    if title.is_some_and(|v| v.chars().count() > 255) {
+        return Err(ApiError::bad("Title too long"));
+    }
+    let r=sqlx::query("UPDATE issue_links SET url=COALESCE($5,url),title=COALESCE($6,title),updated_by_id=$7,updated_at=now() WHERE id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM issue_links other WHERE other.issue_id=$2 AND other.project_id=$3 AND other.workspace_id=$4 AND other.id<>$1 AND other.url=$5 AND other.deleted_at IS NULL)").bind(id).bind(iid).bind(pid).bind(p.workspace_id()).bind(url).bind(title).bind(user.id).execute(&st.db).await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    link_detail(State(st), user, Path((slug, pid, iid, id))).await
+}
+async fn link_delete(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, iid, id)): Path<CommentPath>,
+) -> ApiResult<axum::http::StatusCode> {
+    let p = visible_issue(&st, &user, &slug, pid, iid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let r=sqlx::query("UPDATE issue_links SET deleted_at=now(),updated_at=now(),updated_by_id=$5 WHERE id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND deleted_at IS NULL").bind(id).bind(iid).bind(pid).bind(p.workspace_id()).bind(user.id).execute(&st.db).await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
+}
+
+async fn reaction_context(
+    st: &AppState,
+    user: &CurrentUser,
+    slug: &str,
+    pid: Uuid,
+    id: Uuid,
+    comment: bool,
+) -> Result<ProjectCtx, ApiError> {
+    if comment {
+        let p = require_project(&st.db, user, slug, pid).await?;
+        p.require(&[ADMIN, MEMBER, GUEST])?;
+        let issue:Uuid=sqlx::query_scalar("SELECT issue_id FROM issue_comments WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL").bind(id).bind(pid).bind(p.workspace_id()).fetch_optional(&st.db).await?.ok_or_else(ApiError::not_found)?;
+        visible_issue(st, user, slug, pid, issue).await
+    } else {
+        visible_issue(st, user, slug, pid, id).await
+    }
+}
+async fn reactions(st: AppState, user: CurrentUser, path: IssuePath, comment: bool) -> ApiResult {
+    let (slug, pid, id) = path;
+    let p = reaction_context(&st, &user, &slug, pid, id, comment).await?;
+    let sql = if comment {
+        "SELECT (to_jsonb(r)-'actor_id'-'comment_id'-'project_id'-'workspace_id'-'created_by_id'-'updated_by_id') || jsonb_build_object('actor',r.actor_id,'comment',r.comment_id,'project',r.project_id,'workspace',r.workspace_id,'created_by',r.created_by_id,'updated_by',r.updated_by_id,'display_name',u.display_name) FROM comment_reactions r JOIN users u ON u.id=r.actor_id WHERE r.comment_id=$1 AND r.project_id=$2 AND r.workspace_id=$3 AND r.deleted_at IS NULL ORDER BY r.created_at DESC"
+    } else {
+        "SELECT (to_jsonb(r)-'actor_id'-'issue_id'-'project_id'-'workspace_id'-'created_by_id'-'updated_by_id') || jsonb_build_object('actor',r.actor_id,'issue',r.issue_id,'project',r.project_id,'workspace',r.workspace_id,'created_by',r.created_by_id,'updated_by',r.updated_by_id,'actor_detail',jsonb_build_object('id',u.id,'display_name',u.display_name,'first_name',u.first_name,'last_name',u.last_name,'avatar',u.avatar,'is_bot',u.is_bot)) FROM issue_reactions r JOIN users u ON u.id=r.actor_id WHERE r.issue_id=$1 AND r.project_id=$2 AND r.workspace_id=$3 AND r.deleted_at IS NULL ORDER BY r.created_at DESC"
+    };
+    json_rows(
+        sqlx::query_scalar(sql).bind(id).bind(pid).bind(p.workspace_id()),
+        &st.db,
+    )
+    .await
+}
+async fn reaction_create(
+    st: AppState,
+    user: CurrentUser,
+    path: IssuePath,
+    body: Value,
+    comment: bool,
+) -> ApiResult<(axum::http::StatusCode, Json<Value>)> {
+    let (slug, pid, id) = path;
+    let p = reaction_context(&st, &user, &slug, pid, id, comment).await?;
+    let code = s(&body, "reaction")
+        .filter(|v| !v.is_empty() && v.len() <= 255)
+        .ok_or_else(|| ApiError::bad("Invalid reaction"))?;
+    let sql = if comment {
+        "INSERT INTO comment_reactions (workspace_id,project_id,comment_id,actor_id,reaction,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$5,$4,$4) RETURNING id"
+    } else {
+        "INSERT INTO issue_reactions (workspace_id,project_id,issue_id,actor_id,reaction,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$5,$4,$4) RETURNING id"
+    };
+    let rid: Uuid = sqlx::query_scalar(sql)
+        .bind(p.workspace_id())
+        .bind(pid)
+        .bind(id)
+        .bind(user.id)
+        .bind(code)
+        .fetch_one(&st.db)
+        .await?;
+    let Json(Value::Array(rows)) = reactions(st, user, (slug, pid, id), comment).await? else {
+        return Err(ApiError::not_found());
+    };
+    created(
+        rows.into_iter()
+            .find(|v| v["id"] == rid.to_string())
+            .ok_or_else(ApiError::not_found)?,
+    )
+}
+async fn reaction_delete(
+    st: AppState,
+    user: CurrentUser,
+    path: (String, Uuid, Uuid, String),
+    comment: bool,
+) -> ApiResult<axum::http::StatusCode> {
+    let (slug, pid, id, code) = path;
+    let p = reaction_context(&st, &user, &slug, pid, id, comment).await?;
+    let sql = if comment {
+        "UPDATE comment_reactions SET deleted_at=now(),updated_at=now() WHERE comment_id=$1 AND project_id=$2 AND workspace_id=$3 AND actor_id=$4 AND reaction=$5 AND deleted_at IS NULL"
+    } else {
+        "UPDATE issue_reactions SET deleted_at=now(),updated_at=now() WHERE issue_id=$1 AND project_id=$2 AND workspace_id=$3 AND actor_id=$4 AND reaction=$5 AND deleted_at IS NULL"
+    };
+    let r = sqlx::query(sql)
+        .bind(id)
+        .bind(pid)
+        .bind(p.workspace_id())
+        .bind(user.id)
+        .bind(code)
+        .execute(&st.db)
+        .await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
+}
+async fn issue_reactions(State(s): State<AppState>, u: CurrentUser, Path(p): Path<IssuePath>) -> ApiResult {
+    reactions(s, u, p, false).await
+}
+async fn comment_reactions(State(s): State<AppState>, u: CurrentUser, Path(p): Path<IssuePath>) -> ApiResult {
+    reactions(s, u, p, true).await
+}
+async fn issue_reaction_create(
+    State(s): State<AppState>,
+    u: CurrentUser,
+    Path(p): Path<IssuePath>,
+    Json(b): Json<Value>,
+) -> ApiResult<(axum::http::StatusCode, Json<Value>)> {
+    reaction_create(s, u, p, b, false).await
+}
+async fn comment_reaction_create(
+    State(s): State<AppState>,
+    u: CurrentUser,
+    Path(p): Path<IssuePath>,
+    Json(b): Json<Value>,
+) -> ApiResult<(axum::http::StatusCode, Json<Value>)> {
+    reaction_create(s, u, p, b, true).await
+}
+async fn issue_reaction_delete(
+    State(s): State<AppState>,
+    u: CurrentUser,
+    Path(p): Path<(String, Uuid, Uuid, String)>,
+) -> ApiResult<axum::http::StatusCode> {
+    reaction_delete(s, u, p, false).await
+}
+async fn comment_reaction_delete(
+    State(s): State<AppState>,
+    u: CurrentUser,
+    Path(p): Path<(String, Uuid, Uuid, String)>,
+) -> ApiResult<axum::http::StatusCode> {
+    reaction_delete(s, u, p, true).await
+}
 
 async fn visible_issue(
     st: &AppState,
