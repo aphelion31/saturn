@@ -43,6 +43,38 @@ pub fn routes() -> Router<AppState> {
             "/api/workspaces/{slug}/projects/{project_id}/cycles/{pk}/transfer-issues/",
             post(transfer),
         )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/user-favorite-cycles/",
+            get(fav_list).post(fav_create),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/user-favorite-cycles/{pk}/",
+            axum::routing::delete(fav_destroy),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/cycles/{pk}/archive/",
+            post(archive).delete(unarchive),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/archived-cycles/",
+            get(archived_list),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/archived-cycles/{pk}/",
+            get(archived_retrieve),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/cycles/{pk}/user-properties/",
+            get(props_get).patch(props_update),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/cycles/{pk}/progress/",
+            get(progress),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/cycles/{pk}/analytics/",
+            get(analytics),
+        )
 }
 
 /// Project timezone (`$1` is the project id).
@@ -441,6 +473,298 @@ async fn date_check(
         })));
     }
     Ok(Json(json!({"status": true})))
+}
+
+/// Favorites: the favorite row plus the cycle as `entity_data` (Plane's CycleFavoriteLiteSerializer).
+async fn fav_list(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    json_rows(
+        sqlx::query_scalar(
+            "SELECT jsonb_build_object('id', f.id, 'entity_type', f.entity_type, 'entity_identifier', f.entity_identifier,
+                'entity_data', CASE WHEN c.id IS NULL THEN NULL ELSE jsonb_build_object('id', c.id, 'name', c.name,
+                    'logo_props', c.logo_props, 'project_id', c.project_id) END,
+                'name', f.name, 'is_folder', f.is_folder, 'sequence', f.sequence, 'parent', f.parent_id,
+                'workspace_id', f.workspace_id, 'project_id', f.project_id)
+             FROM user_favorites f LEFT JOIN cycles c ON c.id = f.entity_identifier AND c.deleted_at IS NULL
+             WHERE f.entity_type = 'cycle' AND f.user_id = $1 AND f.project_id = $2 AND f.workspace_id = $3
+               AND f.deleted_at IS NULL
+             ORDER BY f.sequence",
+        )
+        .bind(user.id)
+        .bind(project_id)
+        .bind(p.workspace_id()),
+        &st.db,
+    )
+    .await
+}
+
+/// Favorite a cycle. Body: `{"cycle": <id>}`. 404 unless the cycle is in this project.
+async fn fav_create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let cycle =
+        uuid_of(&b, "cycle").ok_or_else(|| ApiError::bad_body(json!({"cycle": ["This field is required."]})))?;
+    cycle_end(&st.db, p.workspace_id(), project_id, cycle).await?;
+    sqlx::query(
+        "INSERT INTO user_favorites (id, entity_type, entity_identifier, is_folder, sequence, user_id, project_id,
+            workspace_id, created_by_id, updated_by_id)
+         VALUES (gen_random_uuid(), 'cycle', $1, false, COALESCE((SELECT max(sequence) + 10000 FROM user_favorites
+            WHERE user_id = $2 AND workspace_id = $3), 65535), $2, $4, $3, $2, $2)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(cycle)
+    .bind(user.id)
+    .bind(p.workspace_id())
+    .bind(project_id)
+    .execute(&st.db)
+    .await?;
+    no_content()
+}
+
+async fn fav_destroy(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, pk)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let n = sqlx::query(
+        "UPDATE user_favorites SET deleted_at = now() WHERE entity_type = 'cycle' AND entity_identifier = $1
+           AND user_id = $2 AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(user.id)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .execute(&st.db)
+    .await?
+    .rows_affected();
+    if n == 0 {
+        return Err(cycle_not_found());
+    }
+    no_content()
+}
+
+/// Archive a completed cycle. Plane rejects cycles that have not ended and drops their favorites.
+async fn archive(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, pk)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let end = cycle_end(&st.db, p.workspace_id(), project_id, pk).await?;
+    if end.is_none_or(|e| e >= Utc::now()) {
+        return Err(ApiError::bad("Only completed cycles can be archived"));
+    }
+    let mut tx = st.db.begin().await?;
+    let archived_at: DateTime<Utc> = sqlx::query_scalar(
+        "UPDATE cycles SET archived_at = now(), updated_by_id = $2, updated_at = now() WHERE id = $1 RETURNING archived_at",
+    )
+    .bind(pk)
+    .bind(user.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE user_favorites SET deleted_at = now() WHERE entity_type = 'cycle' AND entity_identifier = $1
+           AND project_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(project_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Json(json!({"archived_at": archived_at.to_rfc3339()})))
+}
+
+async fn unarchive(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, pk)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    sqlx::query(
+        "UPDATE cycles SET archived_at = NULL, updated_by_id = $2, updated_at = now()
+         WHERE id = $1 AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(user.id)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .execute(&st.db)
+    .await?;
+    no_content()
+}
+
+async fn archived_list(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    json_rows(
+        sqlx::query_scalar(&format!(
+            "{} AND c.archived_at IS NOT NULL ORDER BY {IS_FAVORITE} DESC, c.created_at DESC",
+            cycle_select("TRUE")
+        ))
+        .bind(project_id)
+        .bind(p.workspace_id())
+        .bind(user.id),
+        &st.db,
+    )
+    .await
+}
+
+async fn archived_retrieve(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, pk)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    sqlx::query_scalar(&format!(
+        "{} AND c.id = $4 AND c.archived_at IS NOT NULL",
+        cycle_select("TRUE")
+    ))
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .bind(user.id)
+    .bind(pk)
+    .fetch_optional(&st.db)
+    .await?
+    .map(Json)
+    .ok_or_else(cycle_not_found)
+}
+
+/// Per-user display filters for one cycle. GET creates the row like Plane's get_or_create.
+async fn props_get(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, pk)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    cycle_end(&st.db, p.workspace_id(), project_id, pk).await?;
+    sqlx::query(
+        "INSERT INTO cycle_user_properties (id, cycle_id, user_id, project_id, workspace_id, created_by_id, updated_by_id,
+            filters, display_filters, display_properties, rich_filters)
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $2, $2, DEFAULT, DEFAULT, DEFAULT, DEFAULT)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(pk)
+    .bind(user.id)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .execute(&st.db)
+    .await?;
+    json_row(sqlx::query_scalar(PROPS_JSON_SQL).bind(pk).bind(user.id), &st.db).await
+}
+
+const PROPS_JSON_SQL: &str =
+    "SELECT jsonb_build_object('id', id, 'cycle', cycle_id, 'user', user_id, 'project', project_id,
+    'workspace', workspace_id, 'filters', filters, 'display_filters', display_filters,
+    'display_properties', display_properties, 'rich_filters', rich_filters)
+    FROM cycle_user_properties WHERE cycle_id = $1 AND user_id = $2 AND deleted_at IS NULL";
+
+async fn props_update(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, pk)): Path<(String, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let n = sqlx::query(
+        "UPDATE cycle_user_properties SET
+            filters = COALESCE($4::jsonb, filters),
+            rich_filters = COALESCE($5::jsonb, rich_filters),
+            display_filters = COALESCE($6::jsonb, display_filters),
+            display_properties = COALESCE($7::jsonb, display_properties),
+            updated_by_id = $3, updated_at = now()
+         WHERE cycle_id = $1 AND user_id = $3 AND project_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(project_id)
+    .bind(user.id)
+    .bind(b.get("filters"))
+    .bind(b.get("rich_filters"))
+    .bind(b.get("display_filters"))
+    .bind(b.get("display_properties"))
+    .execute(&st.db)
+    .await?
+    .rows_affected();
+    if n == 0 {
+        return Err(cycle_not_found());
+    }
+    Ok(StatusCode::CREATED)
+}
+
+/// Issue and estimate-point counts per state group. Estimate points only count when the project uses points.
+async fn progress(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, pk)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    cycle_end(&st.db, p.workspace_id(), project_id, pk).await?;
+    let v: Value = sqlx::query_scalar(
+        "SELECT jsonb_build_object(
+            'backlog_estimate_points', COALESCE(sum(pt.v) FILTER (WHERE s.group = 'backlog'), 0),
+            'unstarted_estimate_points', COALESCE(sum(pt.v) FILTER (WHERE s.group = 'unstarted'), 0),
+            'started_estimate_points', COALESCE(sum(pt.v) FILTER (WHERE s.group = 'started'), 0),
+            'cancelled_estimate_points', COALESCE(sum(pt.v) FILTER (WHERE s.group = 'cancelled'), 0),
+            'completed_estimate_points', COALESCE(sum(pt.v) FILTER (WHERE s.group = 'completed'), 0),
+            'total_estimate_points', COALESCE(sum(pt.v), 0),
+            'backlog_issues', count(*) FILTER (WHERE s.group = 'backlog'),
+            'unstarted_issues', count(*) FILTER (WHERE s.group = 'unstarted'),
+            'started_issues', count(*) FILTER (WHERE s.group = 'started'),
+            'cancelled_issues', count(*) FILTER (WHERE s.group = 'cancelled'),
+            'completed_issues', count(*) FILTER (WHERE s.group = 'completed'),
+            'total_issues', count(*))
+         FROM cycle_issues ci
+         JOIN issues i ON i.id = ci.issue_id AND i.deleted_at IS NULL AND i.archived_at IS NULL AND NOT i.is_draft
+         LEFT JOIN states s ON s.id = i.state_id
+         LEFT JOIN LATERAL (SELECT CASE WHEN e.type = 'points' THEN NULLIF(ep.value, '')::float8 END AS v
+            FROM estimate_points ep JOIN estimates e ON e.id = ep.estimate_id
+            WHERE ep.id = i.estimate_point_id AND ep.deleted_at IS NULL) pt ON true
+         WHERE ci.cycle_id = $1 AND ci.project_id = $2 AND ci.workspace_id = $3 AND ci.deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .fetch_one(&st.db)
+    .await?;
+    Ok(Json(v))
+}
+
+/// Cycle analytics. ponytail: returns the live distribution with empty charts. Plane's burndown
+/// (`burndown_plot`) and the per-assignee and per-label breakdowns are not ported yet.
+async fn analytics(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, pk)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    cycle_end(&st.db, p.workspace_id(), project_id, pk).await?;
+    Ok(Json(json!({
+        "labels": [],
+        "assignees": [],
+        "completion_chart": {},
+    })))
 }
 
 /// Cycle must exist, not be deleted, in this project. Returns its end date.
