@@ -79,10 +79,17 @@ async fn update(
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER])?;
     let object = body.as_object().ok_or_else(|| ApiError::bad("Invalid request"))?;
-    if object
-        .keys()
-        .any(|k| !["name", "priority", "description_html"].contains(&k.as_str()))
-    {
+    if object.keys().any(|k| {
+        ![
+            "name",
+            "priority",
+            "description_html",
+            "state_id",
+            "assignee_ids",
+            "label_ids",
+        ]
+        .contains(&k.as_str())
+    }) {
         return Err(ApiError::bad("Unsupported issue update field"));
     }
     if body.get("name").is_some() && s(&body, "name").is_none_or(|v| v.trim().is_empty() || v.chars().count() > 255) {
@@ -101,6 +108,70 @@ async fn update(
     let old: Option<Value> = sqlx::query_scalar("SELECT to_jsonb(i) FROM issues i WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL FOR UPDATE")
         .bind(issue_id).bind(project_id).bind(p.workspace_id()).fetch_optional(&mut *tx).await?;
     let old = old.ok_or_else(ApiError::not_found)?;
+    if body.get("state_id").is_some() {
+        let state = optional_uuid(&body, "state_id")?.ok_or_else(|| ApiError::bad("Invalid state_id"))?;
+        let result = sqlx::query("UPDATE issues SET state_id=$4,completed_at=CASE WHEN (SELECT \"group\" FROM states WHERE id=$4 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL) IN ('completed','cancelled') THEN now() ELSE NULL END WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND EXISTS (SELECT 1 FROM states WHERE id=$4 AND project_id=$2 AND workspace_id=$3 AND NOT is_triage AND deleted_at IS NULL)")
+            .bind(issue_id).bind(project_id).bind(p.workspace_id()).bind(state).execute(&mut *tx).await?;
+        if result.rows_affected() == 0 {
+            return Err(ApiError::bad("Invalid state_id"));
+        }
+        if old.get("state_id").and_then(Value::as_str) != Some(state.to_string().as_str()) {
+            sqlx::query("INSERT INTO issue_activities (issue_id,project_id,workspace_id,actor_id,created_by_id,updated_by_id,verb,field,old_value,new_value,comment,attachments,epoch) VALUES ($1,$2,$3,$4,$4,$4,'updated','state',$5,$6,'',ARRAY[]::varchar[],extract(epoch from now()))")
+                .bind(issue_id).bind(project_id).bind(p.workspace_id()).bind(user.id).bind(old.get("state_id").and_then(Value::as_str)).bind(state.to_string()).execute(&mut *tx).await?;
+        }
+    }
+    for field in ["assignee_ids", "label_ids"] {
+        if body.get(field).is_none() {
+            continue;
+        }
+        let ids = uuid_list(&body, field)?;
+        let (existing_sql, remove_sql, add_sql) = if field == "assignee_ids" {
+            (
+                "SELECT assignee_id FROM issue_assignees WHERE issue_id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+                "UPDATE issue_assignees SET deleted_at=now(),updated_at=now(),updated_by_id=$5 WHERE issue_id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL AND NOT (assignee_id=ANY($4))",
+                "INSERT INTO issue_assignees (issue_id,project_id,workspace_id,assignee_id,created_by_id,updated_by_id) SELECT $1,$2,$3,$4,$5,$5 WHERE EXISTS (SELECT 1 FROM project_members WHERE project_id=$2 AND workspace_id=$3 AND member_id=$4 AND is_active AND role>=15 AND deleted_at IS NULL) AND NOT EXISTS (SELECT 1 FROM issue_assignees WHERE issue_id=$1 AND project_id=$2 AND workspace_id=$3 AND assignee_id=$4 AND deleted_at IS NULL)",
+            )
+        } else {
+            (
+                "SELECT label_id FROM issue_labels WHERE issue_id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+                "UPDATE issue_labels SET deleted_at=now(),updated_at=now(),updated_by_id=$5 WHERE issue_id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL AND NOT (label_id=ANY($4))",
+                "INSERT INTO issue_labels (issue_id,project_id,workspace_id,label_id,created_by_id,updated_by_id) SELECT $1,$2,$3,$4,$5,$5 WHERE EXISTS (SELECT 1 FROM labels WHERE id=$4 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL) AND NOT EXISTS (SELECT 1 FROM issue_labels WHERE issue_id=$1 AND project_id=$2 AND workspace_id=$3 AND label_id=$4 AND deleted_at IS NULL)",
+            )
+        };
+        let before: Vec<Uuid> = sqlx::query_scalar(existing_sql)
+            .bind(issue_id)
+            .bind(project_id)
+            .bind(p.workspace_id())
+            .fetch_all(&mut *tx)
+            .await?;
+        sqlx::query(remove_sql)
+            .bind(issue_id)
+            .bind(project_id)
+            .bind(p.workspace_id())
+            .bind(&ids)
+            .bind(user.id)
+            .execute(&mut *tx)
+            .await?;
+        for id in &ids {
+            if !before.contains(id) {
+                let result = sqlx::query(add_sql)
+                    .bind(issue_id)
+                    .bind(project_id)
+                    .bind(p.workspace_id())
+                    .bind(id)
+                    .bind(user.id)
+                    .execute(&mut *tx)
+                    .await?;
+                if result.rows_affected() == 0 {
+                    return Err(ApiError::bad("Invalid or duplicate relation"));
+                }
+            }
+        }
+        if before.iter().any(|id| !ids.contains(id)) || ids.iter().any(|id| !before.contains(id)) {
+            sqlx::query("INSERT INTO issue_activities (issue_id,project_id,workspace_id,actor_id,created_by_id,updated_by_id,verb,field,old_value,new_value,comment,attachments,epoch) VALUES ($1,$2,$3,$4,$4,$4,'updated',$5,$6,$7,'',ARRAY[]::varchar[],extract(epoch from now()))")
+                .bind(issue_id).bind(project_id).bind(p.workspace_id()).bind(user.id).bind(field).bind(serde_json::to_string(&before).unwrap_or_default()).bind(serde_json::to_string(&ids).unwrap_or_default()).execute(&mut *tx).await?;
+        }
+    }
     let html = s(&body, "description_html");
     sqlx::query("UPDATE issues SET name=COALESCE($4,name), priority=COALESCE($5,priority), description_html=COALESCE($6,description_html), description_stripped=CASE WHEN $6::text IS NULL THEN description_stripped ELSE $7 END,updated_at=now(),updated_by_id=$8 WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL")
         .bind(issue_id).bind(project_id).bind(p.workspace_id()).bind(s(&body,"name")).bind(s(&body,"priority")).bind(html).bind(html.map(strip_tags)).bind(user.id).execute(&mut *tx).await?;
