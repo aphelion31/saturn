@@ -19,6 +19,7 @@ use crate::workitems::{self, ACTIVE, Arg, Base, Scope};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/api/workspaces/{slug}/cycles/", get(workspace_list))
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/cycles/",
             get(list).post(create),
@@ -977,4 +978,34 @@ async fn transfer(
     .await?;
     tx.commit().await?;
     Ok(Json(json!({"message": "Success"})))
+}
+
+/// `GET /api/workspaces/{slug}/cycles/`: non-archived cycles of every project the user is an active
+/// member of (Plane's `WorkspaceCyclesEndpoint`). Reuses the per-project shape.
+async fn workspace_list(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    let projects: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT pm.project_id FROM project_members pm JOIN projects p ON p.id = pm.project_id
+         WHERE pm.workspace_id = $1 AND pm.member_id = $2 AND pm.is_active AND pm.deleted_at IS NULL
+           AND p.deleted_at IS NULL AND p.archived_at IS NULL",
+    )
+    .bind(ws.workspace_id)
+    .bind(user.id)
+    .fetch_all(&st.db)
+    .await?;
+    let sql = format!(
+        "{} AND c.archived_at IS NULL ORDER BY c.created_at DESC",
+        cycle_select("TRUE")
+    );
+    let mut out = Vec::new();
+    for project_id in projects {
+        let rows: Vec<Value> = sqlx::query_scalar(&sql)
+            .bind(project_id)
+            .bind(ws.workspace_id)
+            .bind(user.id)
+            .fetch_all(&st.db)
+            .await?;
+        out.extend(rows);
+    }
+    Ok(Json(Value::Array(out)))
 }
