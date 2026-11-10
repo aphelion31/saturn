@@ -131,10 +131,291 @@ pub fn routes() -> Router<AppState> {
             "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/sub-issues/",
             get(sub_issues).post(sub_issue_assign),
         )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/archive/",
+            get(archive_detail).post(archive_issue).delete(unarchive_issue),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/bulk-delete-issues/",
+            axum::routing::delete(bulk_delete),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/bulk-operation-issues/",
+            axum::routing::post(bulk_operation),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/search-issues/",
+            get(search_issues),
+        )
+        .route("/api/workspaces/{slug}/search/", get(global_search))
+        .route(
+            "/api/workspaces/{slug}/work-items/{identifier}/",
+            get(identifier_detail),
+        )
 }
 
 type IssuePath = (String, Uuid, Uuid);
 type CommentPath = (String, Uuid, Uuid, Uuid);
+
+async fn search_issues(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let search = q.get("search").map(String::as_str).unwrap_or("");
+    let wide = q.get("workspace_search").is_some_and(|v| v == "true");
+    let issue = q
+        .get("issue_id")
+        .map(|v| Uuid::parse_str(v).map_err(|_| ApiError::bad("Invalid issue_id")))
+        .transpose()?;
+    let module = q
+        .get("module")
+        .map(|v| Uuid::parse_str(v).map_err(|_| ApiError::bad("Invalid module")))
+        .transpose()?;
+    let sql = format!(
+        "SELECT jsonb_build_object('name',i.name,'id',i.id,'start_date',i.start_date,'sequence_id',i.sequence_id,'project__name',p.name,'project__identifier',p.identifier,'project_id',p.id,'workspace__slug',$4::text,'state__name',s.name,'state__group',s.group,'state__color',s.color) FROM issues i JOIN projects p ON p.id=i.project_id AND p.workspace_id=i.workspace_id JOIN states s ON s.id=i.state_id AND s.workspace_id=i.workspace_id JOIN project_members pm ON pm.project_id=i.project_id AND pm.workspace_id=i.workspace_id AND pm.member_id=$3 AND pm.is_active AND pm.deleted_at IS NULL WHERE i.workspace_id=$1 AND ($5 OR i.project_id=$2) AND {ACTIVE} AND (pm.role>5 OR p.guest_view_all_features OR i.created_by_id=$3) AND ($6='' OR i.name ILIKE '%'||$6||'%' OR (p.identifier||'-'||i.sequence_id::text) ILIKE '%'||$6||'%') AND (NOT $7 OR $8::uuid IS NULL OR (i.id<>$8 AND i.parent_id IS DISTINCT FROM $8 AND i.id IS DISTINCT FROM (SELECT parent_id FROM issues WHERE id=$8 AND workspace_id=$1 AND project_id=$2 AND deleted_at IS NULL))) AND (NOT $9 OR $8::uuid IS NULL OR (i.id<>$8 AND NOT EXISTS(SELECT 1 FROM issue_relations r WHERE r.workspace_id=$1 AND r.deleted_at IS NULL AND ((r.issue_id=$8 AND r.related_issue_id=i.id) OR (r.related_issue_id=$8 AND r.issue_id=i.id))))) AND (NOT $10 OR NOT EXISTS(SELECT 1 FROM cycle_issues ci WHERE ci.issue_id=i.id AND ci.workspace_id=$1 AND ci.project_id=i.project_id AND ci.deleted_at IS NULL)) AND ($11::uuid IS NULL OR NOT EXISTS(SELECT 1 FROM module_issues mi WHERE mi.issue_id=i.id AND mi.workspace_id=$1 AND mi.project_id=i.project_id AND mi.module_id=$11 AND mi.deleted_at IS NULL)) AND (NOT $12 OR i.target_date IS NULL) AND (NOT $13 OR (i.parent_id IS NULL AND i.id IS DISTINCT FROM $8)) ORDER BY i.created_at DESC LIMIT 100"
+    );
+    json_rows(
+        sqlx::query_scalar(&sql)
+            .bind(p.workspace_id())
+            .bind(pid)
+            .bind(user.id)
+            .bind(slug)
+            .bind(wide)
+            .bind(search)
+            .bind(q.get("parent").is_some_and(|v| v == "true"))
+            .bind(issue)
+            .bind(q.get("issue_relation").is_some_and(|v| v == "true"))
+            .bind(q.get("cycle").is_some_and(|v| v == "true"))
+            .bind(module)
+            .bind(q.get("target_date").is_some_and(|v| v == "none"))
+            .bind(q.get("sub_issue").is_some_and(|v| v == "true")),
+        &st.db,
+    )
+    .await
+}
+async fn global_search(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(slug): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    let search = q.get("search").map(String::as_str).unwrap_or("");
+    let requested = q
+        .get("entities")
+        .map(|s| s.split(',').map(str::trim).collect::<Vec<_>>())
+        .unwrap_or_else(|| {
+            vec![
+                "workspace",
+                "project",
+                "issue",
+                "cycle",
+                "module",
+                "issue_view",
+                "page",
+                "intake",
+            ]
+        });
+    let project = q
+        .get("project_id")
+        .map(|v| Uuid::parse_str(v).map_err(|_| ApiError::bad("Invalid project_id")))
+        .transpose()?;
+    let wide = q.get("workspace_search").is_some_and(|v| v == "true");
+    let mut results = serde_json::Map::new();
+    for entity in requested {
+        let sql = match entity {
+            "workspace" => {
+                "SELECT jsonb_build_object('name',w.name,'id',w.id,'slug',w.slug) FROM workspaces w JOIN workspace_members m ON m.workspace_id=w.id WHERE m.member_id=$2 AND m.is_active AND m.deleted_at IS NULL AND w.deleted_at IS NULL AND w.name ILIKE '%'||$3||'%' AND $1::uuid IS NOT NULL AND $4::uuid IS NOT NULL AND $5::text IS NOT NULL AND $6::boolean IS NOT NULL ORDER BY w.created_at DESC LIMIT 100"
+            }
+            "project" => {
+                "SELECT jsonb_build_object('name',p.name,'id',p.id,'identifier',p.identifier,'workspace__slug',$5::text) FROM projects p JOIN project_members m ON m.project_id=p.id AND m.workspace_id=p.workspace_id WHERE p.workspace_id=$1 AND m.member_id=$2 AND m.is_active AND m.deleted_at IS NULL AND p.deleted_at IS NULL AND p.archived_at IS NULL AND (p.name ILIKE '%'||$3||'%' OR p.identifier ILIKE '%'||$3||'%') AND ($4::uuid IS NULL OR $6 OR p.id=$4) ORDER BY p.created_at DESC LIMIT 100"
+            }
+            "issue" => {
+                "SELECT jsonb_build_object('name',i.name,'id',i.id,'sequence_id',i.sequence_id,'project__identifier',p.identifier,'project_id',p.id,'workspace__slug',$5::text) FROM issues i JOIN projects p ON p.id=i.project_id AND p.workspace_id=i.workspace_id JOIN project_members m ON m.project_id=p.id AND m.workspace_id=p.workspace_id WHERE i.workspace_id=$1 AND m.member_id=$2 AND m.is_active AND m.deleted_at IS NULL AND i.deleted_at IS NULL AND i.archived_at IS NULL AND NOT i.is_draft AND p.deleted_at IS NULL AND p.archived_at IS NULL AND (m.role>5 OR p.guest_view_all_features OR i.created_by_id=$2) AND (i.name ILIKE '%'||$3||'%' OR (p.identifier||'-'||i.sequence_id::text) ILIKE '%'||$3||'%') AND ($4::uuid IS NULL OR $6 OR p.id=$4) ORDER BY i.created_at DESC LIMIT 100"
+            }
+            "cycle" => {
+                "SELECT jsonb_build_object('name',c.name,'id',c.id,'project_id',p.id,'project__identifier',p.identifier,'workspace__slug',$5::text) FROM cycles c JOIN projects p ON p.id=c.project_id AND p.workspace_id=c.workspace_id JOIN project_members m ON m.project_id=p.id AND m.workspace_id=p.workspace_id WHERE c.workspace_id=$1 AND m.member_id=$2 AND m.is_active AND m.deleted_at IS NULL AND c.deleted_at IS NULL AND p.deleted_at IS NULL AND p.archived_at IS NULL AND c.name ILIKE '%'||$3||'%' AND ($4::uuid IS NULL OR $6 OR p.id=$4) ORDER BY c.created_at DESC LIMIT 100"
+            }
+            "module" => {
+                "SELECT jsonb_build_object('name',c.name,'id',c.id,'project_id',p.id,'project__identifier',p.identifier,'workspace__slug',$5::text) FROM modules c JOIN projects p ON p.id=c.project_id AND p.workspace_id=c.workspace_id JOIN project_members m ON m.project_id=p.id AND m.workspace_id=p.workspace_id WHERE c.workspace_id=$1 AND m.member_id=$2 AND m.is_active AND m.deleted_at IS NULL AND c.deleted_at IS NULL AND p.deleted_at IS NULL AND p.archived_at IS NULL AND c.name ILIKE '%'||$3||'%' AND ($4::uuid IS NULL OR $6 OR p.id=$4) ORDER BY c.created_at DESC LIMIT 100"
+            }
+            "page" | "issue_view" | "intake" => {
+                results.insert(entity.to_owned(), serde_json::json!([]));
+                continue;
+            }
+            _ => continue,
+        };
+        let rows: Vec<Value> = sqlx::query_scalar(sql)
+            .bind(ws.workspace_id)
+            .bind(user.id)
+            .bind(search)
+            .bind(project)
+            .bind(&slug)
+            .bind(wide)
+            .fetch_all(&st.db)
+            .await?;
+        results.insert(entity.to_owned(), Value::Array(rows));
+    }
+    Ok(Json(serde_json::json!({"results":results})))
+}
+
+async fn archive_detail(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, iid)): Path<IssuePath>,
+) -> ApiResult {
+    let p = visible_issue(&st, &user, &slug, pid, iid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let sql = format!(
+        "SELECT {} || jsonb_build_object('description_html',i.description_html) FROM issues i WHERE i.id=$1 AND i.project_id=$2 AND i.workspace_id=$3 AND i.deleted_at IS NULL AND i.archived_at IS NOT NULL",
+        workitems::ITEM_JSON
+    );
+    json_row(
+        sqlx::query_scalar(&sql).bind(iid).bind(pid).bind(p.workspace_id()),
+        &st.db,
+    )
+    .await
+}
+async fn archive_issue(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, iid)): Path<IssuePath>,
+) -> ApiResult {
+    let p = visible_issue(&st, &user, &slug, pid, iid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let date:Option<chrono::NaiveDate>=sqlx::query_scalar("UPDATE issues i SET archived_at=CURRENT_DATE,updated_at=now(),updated_by_id=$4 WHERE i.id=$1 AND i.project_id=$2 AND i.workspace_id=$3 AND i.deleted_at IS NULL AND i.archived_at IS NULL AND EXISTS(SELECT 1 FROM states s WHERE s.id=i.state_id AND s.project_id=$2 AND s.workspace_id=$3 AND s.deleted_at IS NULL AND s.group IN ('completed','cancelled')) RETURNING archived_at").bind(iid).bind(pid).bind(p.workspace_id()).bind(user.id).fetch_optional(&st.db).await?;
+    Ok(Json(
+        serde_json::json!({"archived_at":date.ok_or_else(||ApiError::bad("Can only archive completed or cancelled issues"))?}),
+    ))
+}
+async fn unarchive_issue(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, iid)): Path<IssuePath>,
+) -> ApiResult<axum::http::StatusCode> {
+    let p = visible_issue(&st, &user, &slug, pid, iid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let r=sqlx::query("UPDATE issues SET archived_at=NULL,updated_at=now(),updated_by_id=$4 WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL AND archived_at IS NOT NULL").bind(iid).bind(pid).bind(p.workspace_id()).bind(user.id).execute(&st.db).await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
+}
+async fn bulk_delete(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN])?;
+    let ids = uuid_list(&body, "issue_ids")?;
+    if ids.is_empty() {
+        return Err(ApiError::bad("Issue IDs are required"));
+    }
+    let mut tx = st.db.begin().await?;
+    let ids: Vec<Uuid> = sqlx::query_scalar(&format!(
+        "SELECT i.id FROM issues i WHERE i.id=ANY($1) AND i.project_id=$2 AND i.workspace_id=$3 AND {ACTIVE}"
+    ))
+    .bind(&ids)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_all(&mut *tx)
+    .await?;
+    for sql in [
+        "UPDATE cycle_issues SET deleted_at=now(),updated_at=now() WHERE issue_id=ANY($1) AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+        "UPDATE module_issues SET deleted_at=now(),updated_at=now() WHERE issue_id=ANY($1) AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+        "UPDATE issues SET deleted_at=now(),updated_at=now() WHERE id=ANY($1) AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+    ] {
+        sqlx::query(sql)
+            .bind(&ids)
+            .bind(pid)
+            .bind(p.workspace_id())
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(Json(
+        serde_json::json!({"message":format!("{} issues were deleted",ids.len())}),
+    ))
+}
+async fn bulk_operation(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let ids = uuid_list(&body, "issue_ids")?;
+    if ids.is_empty() {
+        return Err(ApiError::bad("Issue IDs are required"));
+    }
+    let props = body
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or_else(|| ApiError::bad("Properties required"))?;
+    if props
+        .keys()
+        .any(|k| !["state_id", "priority", "start_date", "target_date"].contains(&k.as_str()))
+    {
+        return Err(ApiError::bad("Unsupported bulk property"));
+    }
+    let state = optional_uuid(&body["properties"], "state_id")?;
+    let start = optional_date(&body["properties"], "start_date")?;
+    let end = optional_date(&body["properties"], "target_date")?;
+    let priority = s(&body["properties"], "priority");
+    if priority.is_some_and(|v| !["none", "urgent", "high", "medium", "low"].contains(&v)) {
+        return Err(ApiError::bad("Invalid priority"));
+    }
+    let mut tx = st.db.begin().await?;
+    if let Some(id) = state {
+        let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM states WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL AND NOT is_triage)").bind(id).bind(pid).bind(p.workspace_id()).fetch_one(&mut *tx).await?;
+        if !valid {
+            return Err(ApiError::bad("Invalid state"));
+        }
+    }
+    let count=sqlx::query(&format!("UPDATE issues i SET state_id=COALESCE($4,state_id),priority=COALESCE($5,priority),start_date=CASE WHEN $6 THEN $7 ELSE start_date END,target_date=CASE WHEN $8 THEN $9 ELSE target_date END,completed_at=CASE WHEN $4::uuid IS NULL THEN completed_at WHEN (SELECT s.group FROM states s WHERE s.id=$4 AND s.project_id=$2 AND s.workspace_id=$3) IN ('completed','cancelled') THEN now() ELSE NULL END,updated_at=now(),updated_by_id=$10 WHERE i.id=ANY($1) AND i.project_id=$2 AND i.workspace_id=$3 AND {ACTIVE} AND (CASE WHEN $6 THEN $7 ELSE start_date END IS NULL OR CASE WHEN $8 THEN $9 ELSE target_date END IS NULL OR CASE WHEN $6 THEN $7 ELSE start_date END <= CASE WHEN $8 THEN $9 ELSE target_date END)")).bind(&ids).bind(pid).bind(p.workspace_id()).bind(state).bind(priority).bind(props.contains_key("start_date")).bind(start).bind(props.contains_key("target_date")).bind(end).bind(user.id).execute(&mut *tx).await?.rows_affected();
+    if count as usize != ids.len() {
+        return Err(ApiError::bad("Invalid issues or date range"));
+    }
+    tx.commit().await?;
+    Ok(Json(serde_json::json!({"updated":count})))
+}
+async fn identifier_detail(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, ident)): Path<(String, String)>,
+) -> ApiResult {
+    let (project, seq) = ident
+        .rsplit_once('-')
+        .ok_or_else(|| ApiError::bad("Invalid issue identifier"))?;
+    let seq: i32 = seq.parse().map_err(|_| ApiError::bad("Invalid issue identifier"))?;
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    let pid: Uuid = sqlx::query_scalar(
+        "SELECT id FROM projects WHERE workspace_id=$1 AND upper(identifier)=upper($2) AND deleted_at IS NULL",
+    )
+    .bind(ws.workspace_id)
+    .bind(project)
+    .fetch_optional(&st.db)
+    .await?
+    .ok_or_else(ApiError::not_found)?;
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    let id:Uuid=sqlx::query_scalar("SELECT id FROM issues WHERE workspace_id=$1 AND project_id=$2 AND sequence_id=$3 AND deleted_at IS NULL AND (NOT $4 OR created_by_id=$5)").bind(ws.workspace_id).bind(pid).bind(seq).bind(p.restricted_guest()).bind(user.id).fetch_optional(&st.db).await?.ok_or_else(ApiError::not_found)?;
+    let sql = format!(
+        "SELECT {} || jsonb_build_object('description_html',i.description_html) FROM issues i WHERE i.workspace_id=$1 AND i.project_id=$2 AND i.id=$3 AND i.deleted_at IS NULL",
+        workitems::ITEM_JSON
+    );
+    json_row(
+        sqlx::query_scalar(&sql).bind(ws.workspace_id).bind(pid).bind(id),
+        &st.db,
+    )
+    .await
+}
 
 async fn subscription_status(
     State(st): State<AppState>,
