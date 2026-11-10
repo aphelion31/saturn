@@ -95,7 +95,7 @@ How to commit on a feature branch:
 git switch develop && git pull origin develop
 scripts/new-branch.sh feat-cycles-api            # -> STN-<next>/feat-cycles-api
 # ... edit ...
-git add src/cycles.rs tools/smoke.sh             # stage files explicitly, never `git add -A`
+git add src/cycles.rs tools/smoke.d/40-cycles.sh            # stage files explicitly, never `git add -A`
 git commit -m "feat(cycles): add cycle list and create endpoints"
 git push -u origin STN-014/feat-cycles-api       # then open a PR into develop, squash merge
 ```

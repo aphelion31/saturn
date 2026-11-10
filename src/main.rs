@@ -2,6 +2,7 @@ mod auth;
 mod common;
 mod session;
 mod web;
+mod workitems;
 
 // API areas. Each module owns its routes (full paths, trailing slash, as Plane's apps call them).
 mod assets;

@@ -26,6 +26,11 @@ so Plane's unchanged React apps in `web/apps/*` work against the Saturn binary. 
 - Runtime `sqlx::query`/`query_as`/`query_scalar` only, never the `query!` macros. Bind every value.
 - Types: ids are `uuid` (`Uuid`), roles `smallint` (`i16`), timestamps `timestamptz` (use `chrono::DateTime<Utc>`
   or let Postgres put them into JSON), `sort_order` is `float8` (`f64`).
+- Work-item lists (project issues, cycle/module issues, views, archived, drafts) MUST use
+  `workitems::list(&st.db, Base::new(where_sql, args), &query_map, Scope::...)`. It implements Plane's filters,
+  `order_by`, `group_by`/`sub_group_by`, cursor pagination and response envelope. Pass your own base WHERE on
+  alias `i` (start from `workitems::ACTIVE` for normal lists) and `base.and("i.created_by_id = {}", ...)` for
+  restricted guests. Single work-item JSON: `workitems::ITEM_JSON`. Do not reimplement grouping.
 - Helpers: `common::{AppState, ApiError, ApiResult, CurrentUser, MaybeUser, require_workspace, require_project,
   ADMIN, MEMBER, GUEST, json_rows, json_row, created, no_content, s, uuid_of, strip_tags}`,
   `users::{USER_LITE_JSON, patch_sets}`, `states::{STATE_JSON, slugify}`.
@@ -39,8 +44,8 @@ so Plane's unchanged React apps in `web/apps/*` work against the Saturn binary. 
      then `DATABASE_URL=postgres://localhost/saturn_<you> BIND=127.0.0.1:33xx WEB_URL=http://127.0.0.1:33xx ./target/debug/saturn &`
   3. Sign in: `curl -s -c jar -d 'email=a@b.co&password=Saturn-rocks-2026' http://127.0.0.1:33xx/auth/sign-in/`
      then call your endpoints with `-b jar`. Kill your server and `dropdb saturn_<you>` after.
-  4. Add your endpoints to `tools/smoke.sh` (own section, append only).
-- Commit only your files on your lane branch: `git add src/<module>.rs tools/smoke.sh && git commit -m "feat(<module>): ..."`.
+  4. Add your endpoints to `tools/smoke.d/NN-<module>.sh` (your own file; see `10-states.sh`).
+- Commit only your files on your lane branch: `git add src/<module>.rs tools/smoke.d/NN-<module>.sh && git commit -m "feat(<module>): ..."`.
   Conventional Commits, English, no AI co-author lines. Never `git add -A`.
 
 ## Module ownership
