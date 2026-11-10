@@ -249,7 +249,11 @@ async fn global_search(
             }
             _ => continue,
         };
-        let rows: Vec<Value> = sqlx::query_scalar(sql)
+        let sql = sql.replace(
+            "$4::uuid IS NOT NULL AND $5::text",
+            "($4::uuid IS NULL OR $4::uuid IS NOT NULL) AND $5::text",
+        );
+        let rows: Vec<Value> = sqlx::query_scalar(&sql)
             .bind(ws.workspace_id)
             .bind(user.id)
             .bind(search)
