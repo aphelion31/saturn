@@ -66,8 +66,54 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/",
-            get(detail).delete(destroy),
+            get(detail).patch(update).delete(destroy),
         )
+}
+
+async fn update(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id)): Path<(String, Uuid, Uuid)>,
+    Json(mut body): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let object = body.as_object().ok_or_else(|| ApiError::bad("Invalid request"))?;
+    if object
+        .keys()
+        .any(|k| !["name", "priority", "description_html"].contains(&k.as_str()))
+    {
+        return Err(ApiError::bad("Unsupported issue update field"));
+    }
+    if body.get("name").is_some() && s(&body, "name").is_none_or(|v| v.trim().is_empty() || v.chars().count() > 255) {
+        return Err(ApiError::bad("Invalid name"));
+    }
+    if body.get("priority").is_some()
+        && s(&body, "priority").is_none_or(|v| !["none", "urgent", "high", "medium", "low"].contains(&v))
+    {
+        return Err(ApiError::bad("Invalid priority"));
+    }
+    if let Some(v) = body.get("description_html") {
+        let html = sanitize_html(v.as_str().ok_or_else(|| ApiError::bad("Invalid description_html"))?)?;
+        body["description_html"] = Value::String(html);
+    }
+    let mut tx = st.db.begin().await?;
+    let old: Option<Value> = sqlx::query_scalar("SELECT to_jsonb(i) FROM issues i WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL FOR UPDATE")
+        .bind(issue_id).bind(project_id).bind(p.workspace_id()).fetch_optional(&mut *tx).await?;
+    let old = old.ok_or_else(ApiError::not_found)?;
+    let html = s(&body, "description_html");
+    sqlx::query("UPDATE issues SET name=COALESCE($4,name), priority=COALESCE($5,priority), description_html=COALESCE($6,description_html), description_stripped=CASE WHEN $6::text IS NULL THEN description_stripped ELSE $7 END,updated_at=now(),updated_by_id=$8 WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL")
+        .bind(issue_id).bind(project_id).bind(p.workspace_id()).bind(s(&body,"name")).bind(s(&body,"priority")).bind(html).bind(html.map(strip_tags)).bind(user.id).execute(&mut *tx).await?;
+    for field in ["name", "priority", "description_html"] {
+        if let Some(value) = body.get(field)
+            && old.get(field) != Some(value)
+        {
+            sqlx::query("INSERT INTO issue_activities (issue_id,project_id,workspace_id,actor_id,created_by_id,updated_by_id,verb,field,old_value,new_value,comment,attachments,epoch) VALUES ($1,$2,$3,$4,$4,$4,'updated',$5,$6,$7,'',ARRAY[]::varchar[],extract(epoch from now()))")
+                .bind(issue_id).bind(project_id).bind(p.workspace_id()).bind(user.id).bind(field).bind(old.get(field).and_then(Value::as_str)).bind(value.as_str()).execute(&mut *tx).await?;
+        }
+    }
+    tx.commit().await?;
+    detail(State(st), user, Path((slug, project_id, issue_id))).await
 }
 
 async fn destroy(
@@ -76,9 +122,9 @@ async fn destroy(
     Path((slug, project_id, issue_id)): Path<(String, Uuid, Uuid)>,
 ) -> ApiResult<axum::http::StatusCode> {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
-    p.require(&[ADMIN, MEMBER])?;
-    let result = sqlx::query("UPDATE issues SET deleted_at=now(), updated_at=now(), updated_by_id=$4 WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL")
-        .bind(issue_id).bind(project_id).bind(p.workspace_id()).bind(user.id).execute(&st.db).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let result = sqlx::query("UPDATE issues SET deleted_at=now(), updated_at=now(), updated_by_id=$4 WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL AND ($5 OR created_by_id=$4)")
+        .bind(issue_id).bind(project_id).bind(p.workspace_id()).bind(user.id).bind(p.role == ADMIN || p.ws.is_admin()).execute(&st.db).await?;
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
