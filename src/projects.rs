@@ -73,6 +73,15 @@ async fn create(
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let ws = require_workspace(&st.db, &user, &slug).await?;
     ws.require(&[ADMIN, MEMBER])?;
+    if let Some(lead) = uuid_of(&b, "project_lead") {
+        let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id=$1 AND member_id=$2 AND is_active AND deleted_at IS NULL)")
+            .bind(ws.workspace_id).bind(lead).fetch_one(&st.db).await?;
+        if !valid {
+            return Err(ApiError::bad_body(
+                json!({"project_lead": ["Invalid workspace member."]}),
+            ));
+        }
+    }
     let name = s(&b, "name")
         .map(str::trim)
         .filter(|x| !x.is_empty())
