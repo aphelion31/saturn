@@ -2,17 +2,19 @@
 //! TODO (worker): port the `/api/workspaces/{slug}/projects/...` routes.
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::get,
 };
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::common::*;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/api/workspaces/{slug}/project-identifiers/", get(project_identifiers))
         .route("/api/workspaces/{slug}/projects/", get(list_projects).post(create))
         .route("/api/workspaces/{slug}/projects/details/", get(list_projects))
         .route(
@@ -23,6 +25,28 @@ pub fn routes() -> Router<AppState> {
             "/api/workspaces/{slug}/projects/{project_id}/archive/",
             axum::routing::post(archive).delete(unarchive),
         )
+}
+
+async fn project_identifiers(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(slug): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER])?;
+    let name = query.get("name").map(|s| s.trim().to_uppercase()).unwrap_or_default();
+    if name.is_empty() {
+        return Err(ApiError::bad("Name is required"));
+    }
+    let identifiers: Vec<Value> = sqlx::query_scalar(
+        "SELECT jsonb_build_object('id', id, 'name', name, 'project', project_id) FROM project_identifiers WHERE workspace_id=$1 AND name=$2 AND deleted_at IS NULL",
+    )
+    .bind(ws.workspace_id)
+    .bind(name)
+    .fetch_all(&st.db)
+    .await?;
+    Ok(Json(json!({"exists": identifiers.len(), "identifiers": identifiers})))
 }
 
 async fn update(
