@@ -10,11 +10,12 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::common::*;
+use crate::workitems::{self, ACTIVE, Arg, Base, Scope};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -29,6 +30,18 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/cycles/{pk}/",
             get(retrieve).patch(update).put(update).delete(destroy),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/cycles/{pk}/cycle-issues/",
+            get(ci_list).post(ci_add),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/cycles/{pk}/cycle-issues/{issue_id}/",
+            get(ci_retrieve).delete(ci_destroy),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/cycles/{pk}/transfer-issues/",
+            post(transfer),
         )
 }
 
@@ -428,4 +441,216 @@ async fn date_check(
         })));
     }
     Ok(Json(json!({"status": true})))
+}
+
+/// Cycle must exist, not be deleted, in this project. Returns its end date.
+async fn cycle_end(db: &sqlx::PgPool, ws: Uuid, project_id: Uuid, cycle_id: Uuid) -> ApiResult<Option<DateTime<Utc>>> {
+    sqlx::query_scalar(
+        "SELECT c.end_date FROM cycles c WHERE c.id = $1 AND c.project_id = $2 AND c.workspace_id = $3 AND c.deleted_at IS NULL",
+    )
+    .bind(cycle_id)
+    .bind(project_id)
+    .bind(ws)
+    .fetch_optional(db)
+    .await?
+    .ok_or_else(cycle_not_found)
+}
+
+/// Work items in a cycle, with Plane's filters, ordering, grouping and pagination.
+async fn ci_list(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, cycle_id)): Path<(String, Uuid, Uuid)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let base = Base::new(
+        format!(
+            "i.project_id = $1 AND i.workspace_id = $2 AND {ACTIVE}
+             AND EXISTS (SELECT 1 FROM cycle_issues ci WHERE ci.issue_id = i.id AND ci.cycle_id = $3 AND ci.deleted_at IS NULL)"
+        ),
+        vec![Arg::Uuid(project_id), Arg::Uuid(p.workspace_id()), Arg::Uuid(cycle_id)],
+    );
+    workitems::list(&st.db, base, &q, Scope::Project(project_id)).await
+}
+
+/// Add work items to a cycle. Issues in another cycle move here (one active cycle per issue).
+async fn ci_add(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, cycle_id)): Path<(String, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let issues: Vec<Uuid> = b
+        .get("issues")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().and_then(|x| Uuid::parse_str(x).ok()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if issues.is_empty() {
+        return Err(ApiError::bad("Issues are required"));
+    }
+    let end = cycle_end(&st.db, p.workspace_id(), project_id, cycle_id).await?;
+    if end.is_some_and(|e| e < Utc::now()) {
+        return Err(ApiError::bad(
+            "The Cycle has already been completed so no new issues can be added",
+        ));
+    }
+    let mut tx = st.db.begin().await?;
+    sqlx::query(
+        "UPDATE cycle_issues SET cycle_id = $1, updated_by_id = $2, updated_at = now()
+         WHERE issue_id = ANY($3) AND project_id = $4 AND workspace_id = $5 AND deleted_at IS NULL AND cycle_id <> $1",
+    )
+    .bind(cycle_id)
+    .bind(user.id)
+    .bind(&issues)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!(
+        "INSERT INTO cycle_issues (id, cycle_id, issue_id, project_id, workspace_id, created_by_id, updated_by_id)
+         SELECT gen_random_uuid(), $1, i.id, i.project_id, i.workspace_id, $2, $2 FROM issues i
+         WHERE i.id = ANY($3) AND i.project_id = $4 AND i.workspace_id = $5 AND {ACTIVE}
+           AND NOT EXISTS (SELECT 1 FROM cycle_issues ci
+                           WHERE ci.issue_id = i.id AND ci.cycle_id = $1 AND ci.deleted_at IS NULL)"
+    ))
+    .bind(cycle_id)
+    .bind(user.id)
+    .bind(&issues)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok((StatusCode::CREATED, Json(json!({"message": "success"}))))
+}
+
+/// One cycle-issue bridge row as Plane's CycleIssueSerializer fields.
+/// ponytail: Plane also embeds `issue_detail`; the UI reads the work item from the list instead.
+async fn ci_retrieve(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, cycle_id, issue_id)): Path<(String, Uuid, Uuid, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    json_row(
+        sqlx::query_scalar(
+            "SELECT jsonb_build_object('id', ci.id, 'cycle', ci.cycle_id, 'issue', ci.issue_id, 'project', ci.project_id,
+                'workspace', ci.workspace_id, 'created_by', ci.created_by_id, 'updated_by', ci.updated_by_id,
+                'created_at', ci.created_at, 'updated_at', ci.updated_at)
+             FROM cycle_issues ci
+             WHERE ci.issue_id = $1 AND ci.cycle_id = $2 AND ci.project_id = $3 AND ci.workspace_id = $4
+               AND ci.deleted_at IS NULL",
+        )
+        .bind(issue_id)
+        .bind(cycle_id)
+        .bind(project_id)
+        .bind(p.workspace_id()),
+        &st.db,
+    )
+    .await
+}
+
+/// Remove one work item from a cycle (soft delete of the bridge row). Plane returns 204 even when absent.
+async fn ci_destroy(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, cycle_id, issue_id)): Path<(String, Uuid, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    sqlx::query(
+        "UPDATE cycle_issues SET deleted_at = now(), updated_by_id = $5
+         WHERE issue_id = $1 AND cycle_id = $2 AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
+    )
+    .bind(issue_id)
+    .bind(cycle_id)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
+    no_content()
+}
+
+/// Move incomplete work items (backlog, unstarted, started) to another cycle.
+/// Stores the source cycle counts in `progress_snapshot` first, like Plane.
+/// ponytail: `distribution` (assignee, label and completion chart data) is not written; the analytics
+/// endpoint returns empty charts for transferred cycles. Add when the analytics UI needs it.
+async fn transfer(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, cycle_id)): Path<(String, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let Some(new_id) = uuid_of(&b, "new_cycle_id") else {
+        return Err(ApiError::bad("New Cycle Id is required"));
+    };
+    let new_end = cycle_end(&st.db, p.workspace_id(), project_id, new_id)
+        .await
+        .map_err(|_| ApiError::bad("The cycle where the issues are transferred is already completed"))?;
+    if new_end.is_some_and(|e| e < Utc::now()) {
+        return Err(ApiError::bad(
+            "The cycle where the issues are transferred is already completed",
+        ));
+    }
+    if cycle_end(&st.db, p.workspace_id(), project_id, cycle_id).await.is_err() {
+        return Err(ApiError::bad("Source cycle not found"));
+    }
+    let mut tx = st.db.begin().await?;
+    // (total, completed, cancelled, started, unstarted, backlog)
+    let c: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(&format!(
+        "SELECT count(*), count(*) FILTER (WHERE s.group = 'completed'), count(*) FILTER (WHERE s.group = 'cancelled'),
+            count(*) FILTER (WHERE s.group = 'started'), count(*) FILTER (WHERE s.group = 'unstarted'),
+            count(*) FILTER (WHERE s.group = 'backlog')
+         FROM cycle_issues ci JOIN issues i ON i.id = ci.issue_id AND {ACTIVE}
+         LEFT JOIN states s ON s.id = i.state_id
+         WHERE ci.cycle_id = $1 AND ci.project_id = $2 AND ci.workspace_id = $3 AND ci.deleted_at IS NULL"
+    ))
+    .bind(cycle_id)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE cycles SET progress_snapshot = jsonb_build_object('total_issues', $2::bigint,
+            'completed_issues', $3::bigint, 'cancelled_issues', $4::bigint, 'started_issues', $5::bigint,
+            'unstarted_issues', $6::bigint, 'backlog_issues', $7::bigint)
+         WHERE id = $1",
+    )
+    .bind(cycle_id)
+    .bind(c.0)
+    .bind(c.1)
+    .bind(c.2)
+    .bind(c.3)
+    .bind(c.4)
+    .bind(c.5)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!(
+        "UPDATE cycle_issues ci SET cycle_id = $1, updated_by_id = $2, updated_at = now()
+         WHERE ci.cycle_id = $3 AND ci.project_id = $4 AND ci.workspace_id = $5 AND ci.deleted_at IS NULL
+           AND ci.issue_id IN (SELECT i.id FROM issues i JOIN states s ON s.id = i.state_id
+               WHERE s.group = ANY($6) AND {ACTIVE})"
+    ))
+    .bind(new_id)
+    .bind(user.id)
+    .bind(cycle_id)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .bind(vec!["backlog", "unstarted", "started"])
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Json(json!({"message": "Success"})))
 }
