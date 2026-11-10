@@ -30,6 +30,28 @@ fn uuid_list(body: &Value, field: &str) -> Result<Vec<Uuid>, ApiError> {
     }
 }
 
+fn optional_uuid(body: &Value, field: &str) -> Result<Option<Uuid>, ApiError> {
+    match body.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_str()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .map(Some)
+            .ok_or_else(|| ApiError::bad("Invalid UUID")),
+    }
+}
+
+fn optional_date(body: &Value, field: &str) -> Result<Option<chrono::NaiveDate>, ApiError> {
+    match body.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_str()
+            .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+            .map(Some)
+            .ok_or_else(|| ApiError::bad("Invalid date")),
+    }
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route(
@@ -76,8 +98,25 @@ async fn create(
         .ok_or_else(|| ApiError::bad("A name of at most 255 characters is required"))?;
     // Reject fields not yet implemented rather than silently discard user data.
     if body.as_object().is_none_or(|b| {
-        b.keys()
-            .any(|k| !["name", "state_id", "assignee_ids", "label_ids", "priority"].contains(&k.as_str()))
+        b.keys().any(|k| {
+            ![
+                "name",
+                "state_id",
+                "assignee_ids",
+                "label_ids",
+                "priority",
+                "description_html",
+                "parent_id",
+                "start_date",
+                "target_date",
+                "estimate_point",
+                "sort_order",
+                "cycle_id",
+                "module_ids",
+                "type_id",
+            ]
+            .contains(&k.as_str())
+        })
     }) {
         return Err(ApiError::bad("Unsupported issue creation field"));
     }
@@ -89,6 +128,59 @@ async fn create(
     let mut tx = st.db.begin().await?;
     let assignees = uuid_list(&body, "assignee_ids")?;
     let labels = uuid_list(&body, "label_ids")?;
+    let modules = uuid_list(&body, "module_ids")?;
+    let parent = optional_uuid(&body, "parent_id")?;
+    let estimate = optional_uuid(&body, "estimate_point")?;
+    let cycle = optional_uuid(&body, "cycle_id")?;
+    let issue_type = optional_uuid(&body, "type_id")?;
+    let start = optional_date(&body, "start_date")?;
+    let target = optional_date(&body, "target_date")?;
+    if start.zip(target).is_some_and(|(a, b)| a > b) {
+        return Err(ApiError::bad("Start date cannot exceed target date"));
+    }
+    let html = match body.get("description_html") {
+        None => "<p></p>".to_string(),
+        Some(Value::String(v)) => sanitize_html(v)?,
+        _ => return Err(ApiError::bad("Invalid description_html")),
+    };
+    let sort = match body.get("sort_order") {
+        None => None,
+        Some(v) => Some(
+            v.as_f64()
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| ApiError::bad("Invalid sort_order"))?,
+        ),
+    };
+    for (id, sql) in [
+        (
+            parent,
+            "SELECT EXISTS(SELECT 1 FROM issues WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL)",
+        ),
+        (
+            estimate,
+            "SELECT EXISTS(SELECT 1 FROM estimate_points WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL)",
+        ),
+        (
+            cycle,
+            "SELECT EXISTS(SELECT 1 FROM cycles WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL)",
+        ),
+        (
+            issue_type,
+            "SELECT EXISTS(SELECT 1 FROM issue_types WHERE id=$1 AND workspace_id=$3 AND deleted_at IS NULL AND $2::uuid IS NOT NULL)",
+        ),
+    ] {
+        if let Some(id) = id {
+            let valid: bool = sqlx::query_scalar(sql)
+                .bind(id)
+                .bind(project_id)
+                .bind(p.workspace_id())
+                .fetch_one(&mut *tx)
+                .await?;
+            if !valid {
+                return Err(ApiError::bad("Invalid related object"));
+            }
+        }
+    }
     let priority = s(&body, "priority").unwrap_or("none");
     if !["none", "urgent", "high", "medium", "low"].contains(&priority) {
         return Err(ApiError::bad("Invalid priority"));
@@ -118,13 +210,19 @@ async fn create(
         VALUES ($1,$2,$3,$4,$5,$6,$6,COALESCE((SELECT MAX(sort_order)+10000 FROM issues WHERE project_id=$2 AND workspace_id=$3 AND state_id=$4 AND deleted_at IS NULL),65535),
         CASE WHEN (SELECT \"group\" FROM states WHERE id=$4 AND project_id=$2 AND workspace_id=$3)='completed' THEN now() ELSE NULL END) RETURNING id")
         .bind(name).bind(project_id).bind(p.workspace_id()).bind(state).bind(sequence).bind(user.id).fetch_one(&mut *tx).await?;
-    sqlx::query("UPDATE issues SET priority=$4 WHERE id=$1 AND project_id=$2 AND workspace_id=$3")
-        .bind(id)
-        .bind(project_id)
-        .bind(p.workspace_id())
-        .bind(priority)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query("UPDATE issues SET priority=$4,description_html=$5,description_stripped=$6,parent_id=$7,start_date=$8,target_date=$9,estimate_point_id=$10,sort_order=COALESCE($11,sort_order),type_id=$12 WHERE id=$1 AND project_id=$2 AND workspace_id=$3")
+        .bind(id).bind(project_id).bind(p.workspace_id()).bind(priority).bind(&html).bind(if html.is_empty() { None } else { Some(strip_tags(&html)) }).bind(parent).bind(start).bind(target).bind(estimate).bind(sort).bind(issue_type).execute(&mut *tx).await?;
+    if let Some(cycle) = cycle {
+        sqlx::query("INSERT INTO cycle_issues (issue_id,project_id,workspace_id,cycle_id,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$5,$5)")
+            .bind(id).bind(project_id).bind(p.workspace_id()).bind(cycle).bind(user.id).execute(&mut *tx).await?;
+    }
+    for module in modules {
+        let result = sqlx::query("INSERT INTO module_issues (issue_id,project_id,workspace_id,module_id,created_by_id,updated_by_id) SELECT $1,$2,$3,$4,$5,$5 WHERE EXISTS (SELECT 1 FROM modules WHERE id=$4 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL) AND NOT EXISTS (SELECT 1 FROM module_issues WHERE issue_id=$1 AND project_id=$2 AND workspace_id=$3 AND module_id=$4 AND deleted_at IS NULL)")
+            .bind(id).bind(project_id).bind(p.workspace_id()).bind(module).bind(user.id).execute(&mut *tx).await?;
+        if result.rows_affected() == 0 {
+            return Err(ApiError::bad("Invalid or duplicate module"));
+        }
+    }
     for assignee in assignees {
         let result = sqlx::query("INSERT INTO issue_assignees (issue_id,project_id,workspace_id,assignee_id,created_by_id,updated_by_id) SELECT $1,$2,$3,$4,$5,$5 WHERE EXISTS (SELECT 1 FROM project_members WHERE project_id=$2 AND workspace_id=$3 AND member_id=$4 AND is_active AND role>=15 AND deleted_at IS NULL) AND NOT EXISTS (SELECT 1 FROM issue_assignees WHERE issue_id=$1 AND project_id=$2 AND workspace_id=$3 AND assignee_id=$4 AND deleted_at IS NULL)")
             .bind(id).bind(project_id).bind(p.workspace_id()).bind(assignee).bind(user.id).execute(&mut *tx).await?;
@@ -144,7 +242,7 @@ async fn create(
     sqlx::query("INSERT INTO issue_activities (issue_id, project_id, workspace_id, actor_id, created_by_id, updated_by_id, verb, comment, attachments, epoch) VALUES ($1,$2,$3,$4,$4,$4,'created','',ARRAY[]::varchar[],extract(epoch from now()))")
         .bind(id).bind(project_id).bind(p.workspace_id()).bind(user.id).execute(&mut *tx).await?;
     let result: Value = sqlx::query_scalar(&format!(
-        "SELECT {} FROM issues i WHERE i.id=$1 AND i.project_id=$2 AND i.workspace_id=$3",
+        "SELECT {} || jsonb_build_object('description_html',i.description_html,'is_subscribed',false,'is_intake',false) FROM issues i WHERE i.id=$1 AND i.project_id=$2 AND i.workspace_id=$3",
         workitems::ITEM_JSON
     ))
     .bind(id)
