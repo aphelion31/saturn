@@ -14,6 +14,7 @@ use crate::common::*;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/api/workspaces/{slug}/estimates/", get(workspace_estimates))
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/user-properties/",
             get(get_properties).patch(update_properties),
@@ -57,6 +58,12 @@ pub fn routes() -> Router<AppState> {
 }
 
 const LABEL_JSON: &str = "jsonb_build_object('id', id, 'name', name, 'color', color, 'parent', parent_id, 'project_id', project_id, 'workspace_id', workspace_id, 'sort_order', sort_order)";
+
+async fn workspace_estimates(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER, GUEST])?;
+    json_rows(sqlx::query_scalar("SELECT (to_jsonb(e)-'workspace_id'-'project_id'-'created_by_id'-'updated_by_id') || jsonb_build_object('workspace',e.workspace_id,'project',e.project_id,'created_by',e.created_by_id,'updated_by',e.updated_by_id,'points',COALESCE((SELECT jsonb_agg((to_jsonb(ep)-'workspace_id'-'project_id'-'estimate_id'-'created_by_id'-'updated_by_id') || jsonb_build_object('workspace',ep.workspace_id,'project',ep.project_id,'estimate',ep.estimate_id,'created_by',ep.created_by_id,'updated_by',ep.updated_by_id) ORDER BY ep.key) FROM estimate_points ep WHERE ep.estimate_id=e.id AND ep.project_id=e.project_id AND ep.workspace_id=e.workspace_id AND ep.deleted_at IS NULL),'[]'::jsonb)) FROM estimates e JOIN projects p ON p.id=e.project_id AND p.workspace_id=e.workspace_id AND p.estimate_id=e.id AND p.deleted_at IS NULL WHERE e.workspace_id=$1 AND e.deleted_at IS NULL AND ($3=20 OR ($3=15 AND p.network=2) OR EXISTS(SELECT 1 FROM project_members pm WHERE pm.project_id=p.id AND pm.workspace_id=p.workspace_id AND pm.member_id=$2 AND pm.is_active AND pm.deleted_at IS NULL))").bind(ws.workspace_id).bind(user.id).bind(ws.role), &st.db).await
+}
 
 async fn estimates(State(st): State<AppState>, user: CurrentUser, Path((slug, id)): Path<(String, Uuid)>) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, id).await?;
