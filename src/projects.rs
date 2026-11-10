@@ -21,7 +21,19 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/estimates/",
-            get(estimates),
+            get(estimates).post(create_estimate),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/estimates/{estimate_id}/",
+            get(get_estimate).patch(update_estimate).delete(delete_estimate),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/estimates/{estimate_id}/estimate-points/",
+            axum::routing::post(create_point),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/estimates/{estimate_id}/estimate-points/{point_id}/",
+            axum::routing::patch(update_point).delete(delete_point),
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/issue-labels/",
@@ -58,6 +70,176 @@ pub fn routes() -> Router<AppState> {
 }
 
 const LABEL_JSON: &str = "jsonb_build_object('id', id, 'name', name, 'color', color, 'parent', parent_id, 'project_id', project_id, 'workspace_id', workspace_id, 'sort_order', sort_order)";
+
+async fn get_estimate(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, estimate)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult {
+    let Json(rows) = estimates(State(st), user, Path((slug, project))).await?;
+    rows.as_array()
+        .and_then(|v| v.iter().find(|x| x["id"].as_str() == Some(&estimate.to_string())))
+        .cloned()
+        .map(Json)
+        .ok_or_else(ApiError::not_found)
+}
+
+async fn create_estimate(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let e = b
+        .get("estimate")
+        .and_then(Value::as_object)
+        .ok_or_else(|| ApiError::bad("Estimate is required"))?;
+    let name = e
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty() && v.len() <= 255)
+        .ok_or_else(|| ApiError::bad("Invalid estimate name"))?;
+    let kind = e.get("type").and_then(Value::as_str).unwrap_or("categories");
+    if kind.len() > 255 {
+        return Err(ApiError::bad("Invalid estimate type"));
+    }
+    let points = b
+        .get("estimate_points")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError::bad("Estimate points are required"))?;
+    for point in points {
+        validate_point(point, true)?;
+    }
+    let mut tx = st.db.begin().await?;
+    let id:Uuid=sqlx::query_scalar("INSERT INTO estimates (workspace_id,project_id,name,type,last_used,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$5,$6,$6) RETURNING id").bind(p.workspace_id()).bind(project).bind(name).bind(kind).bind(e.get("last_used").and_then(Value::as_bool).unwrap_or(false)).bind(user.id).fetch_one(&mut *tx).await?;
+    for point in points {
+        sqlx::query("INSERT INTO estimate_points (workspace_id,project_id,estimate_id,key,value,description,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$7)").bind(p.workspace_id()).bind(project).bind(id).bind(point["key"].as_i64().unwrap() as i32).bind(s(point,"value").unwrap()).bind(s(point,"description").unwrap_or("")).bind(user.id).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    get_estimate(State(st), user, Path((slug, project, id))).await
+}
+
+fn validate_point(b: &Value, required: bool) -> Result<(), ApiError> {
+    if required || b.get("key").is_some() {
+        let k = b
+            .get("key")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| ApiError::bad("Invalid key"))?;
+        if i32::try_from(k).is_err() {
+            return Err(ApiError::bad("Invalid key"));
+        }
+    }
+    if required || b.get("value").is_some() {
+        s(b, "value")
+            .filter(|s| !s.is_empty() && s.len() <= 20)
+            .ok_or_else(|| ApiError::bad("Invalid value"))?;
+    }
+    Ok(())
+}
+
+async fn update_estimate(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, id)): Path<(String, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let points = b
+        .get("estimate_points")
+        .and_then(Value::as_array)
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| ApiError::bad("Estimate points are required"))?;
+    for point in points {
+        validate_point(point, false)?;
+        if uuid_of(point, "id").is_none() {
+            return Err(ApiError::bad("Invalid point id"));
+        }
+    }
+    let e = b.get("estimate").unwrap_or(&Value::Null);
+    let mut tx = st.db.begin().await?;
+    let r=sqlx::query("UPDATE estimates SET name=COALESCE($4,name),type=COALESCE($5,type),updated_at=now(),updated_by_id=$6 WHERE workspace_id=$1 AND project_id=$2 AND id=$3 AND deleted_at IS NULL").bind(p.workspace_id()).bind(project).bind(id).bind(s(e,"name")).bind(s(e,"type")).bind(user.id).execute(&mut *tx).await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    for point in points {
+        let r=sqlx::query("UPDATE estimate_points SET key=COALESCE($5,key),value=COALESCE($6,value),updated_at=now(),updated_by_id=$7 WHERE workspace_id=$1 AND project_id=$2 AND estimate_id=$3 AND id=$4 AND deleted_at IS NULL").bind(p.workspace_id()).bind(project).bind(id).bind(uuid_of(point,"id")).bind(point.get("key").and_then(Value::as_i64).map(|n|n as i32)).bind(s(point,"value")).bind(user.id).execute(&mut *tx).await?;
+        if r.rows_affected() == 0 {
+            return Err(ApiError::not_found());
+        }
+    }
+    tx.commit().await?;
+    get_estimate(State(st), user, Path((slug, project, id))).await
+}
+
+async fn delete_estimate(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, id)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, project).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let r=sqlx::query("UPDATE estimates SET deleted_at=now(),updated_by_id=$4 WHERE workspace_id=$1 AND project_id=$2 AND id=$3 AND deleted_at IS NULL").bind(p.workspace_id()).bind(project).bind(id).bind(user.id).execute(&st.db).await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
+}
+
+const POINT_JSON: &str = "(to_jsonb(estimate_points)-'workspace_id'-'project_id'-'estimate_id'-'created_by_id'-'updated_by_id') || jsonb_build_object('workspace',workspace_id,'project',project_id,'estimate',estimate_id,'created_by',created_by_id,'updated_by',updated_by_id)";
+
+async fn create_point(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, estimate)): Path<(String, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    validate_point(&b, true)?;
+    json_row(sqlx::query_scalar(&format!("INSERT INTO estimate_points (workspace_id,project_id,estimate_id,key,value,description,created_by_id,updated_by_id) SELECT $1,$2,e.id,$4,$5,$6,$7,$7 FROM estimates e WHERE e.id=$3 AND e.project_id=$2 AND e.workspace_id=$1 AND e.deleted_at IS NULL RETURNING {POINT_JSON}")).bind(p.workspace_id()).bind(project).bind(estimate).bind(b["key"].as_i64().unwrap() as i32).bind(s(&b,"value")).bind(s(&b,"description").unwrap_or("")).bind(user.id),&st.db).await
+}
+
+async fn update_point(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, estimate, id)): Path<(String, Uuid, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    validate_point(&b, false)?;
+    json_row(sqlx::query_scalar(&format!("UPDATE estimate_points SET key=COALESCE($5,key),value=COALESCE($6,value),description=COALESCE($7,description),updated_at=now(),updated_by_id=$8 WHERE workspace_id=$1 AND project_id=$2 AND estimate_id=$3 AND id=$4 AND deleted_at IS NULL RETURNING {POINT_JSON}")).bind(p.workspace_id()).bind(project).bind(estimate).bind(id).bind(b.get("key").and_then(Value::as_i64).map(|v|v as i32)).bind(s(&b,"value")).bind(s(&b,"description")).bind(user.id),&st.db).await
+}
+
+async fn delete_point(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, estimate, id)): Path<(String, Uuid, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let replacement = uuid_of(&b, "new_estimate_id");
+    if b.get("new_estimate_id").is_some_and(|v| !v.is_null()) && replacement.is_none() {
+        return Err(ApiError::bad("Invalid new estimate point"));
+    }
+    let mut tx = st.db.begin().await?;
+    let key: i32=sqlx::query_scalar("SELECT key FROM estimate_points WHERE workspace_id=$1 AND project_id=$2 AND estimate_id=$3 AND id=$4 AND deleted_at IS NULL FOR UPDATE").bind(p.workspace_id()).bind(project).bind(estimate).bind(id).fetch_one(&mut *tx).await?;
+    if let Some(new_id) = replacement {
+        let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM estimate_points WHERE workspace_id=$1 AND project_id=$2 AND estimate_id=$3 AND id=$4 AND id<>$5 AND deleted_at IS NULL)").bind(p.workspace_id()).bind(project).bind(estimate).bind(new_id).bind(id).fetch_one(&mut *tx).await?;
+        if !valid {
+            return Err(ApiError::bad("Invalid new estimate point"));
+        }
+    }
+    sqlx::query("UPDATE issues SET estimate_point_id=$4,updated_at=now(),updated_by_id=$5 WHERE workspace_id=$1 AND project_id=$2 AND estimate_point_id=$3 AND deleted_at IS NULL").bind(p.workspace_id()).bind(project).bind(id).bind(replacement).bind(user.id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE estimate_points SET deleted_at=now(),updated_by_id=$5 WHERE workspace_id=$1 AND project_id=$2 AND estimate_id=$3 AND id=$4 AND deleted_at IS NULL").bind(p.workspace_id()).bind(project).bind(estimate).bind(id).bind(user.id).execute(&mut *tx).await?;
+    let rows:Vec<Value>=sqlx::query_scalar(&format!("UPDATE estimate_points SET key=key-1,updated_at=now() WHERE workspace_id=$1 AND project_id=$2 AND estimate_id=$3 AND key>$4 AND deleted_at IS NULL RETURNING {POINT_JSON}")).bind(p.workspace_id()).bind(project).bind(estimate).bind(key).fetch_all(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(Json(json!(rows)))
+}
 
 async fn workspace_estimates(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>) -> ApiResult {
     let ws = require_workspace(&st.db, &user, &slug).await?;
