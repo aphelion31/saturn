@@ -14,6 +14,22 @@ use crate::common::*;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/user-properties/",
+            get(get_properties).patch(update_properties),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/estimates/",
+            get(estimates),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/issue-labels/",
+            get(labels).post(create_label),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/issue-labels/{label_id}/",
+            get(label).patch(update_label).delete(delete_label),
+        )
         .route("/api/workspaces/{slug}/project-identifiers/", get(project_identifiers))
         .route("/api/workspaces/{slug}/projects/{project_id}/members/", get(members))
         .route(
@@ -38,6 +54,147 @@ pub fn routes() -> Router<AppState> {
             "/api/workspaces/{slug}/projects/{project_id}/archive/",
             axum::routing::post(archive).delete(unarchive),
         )
+}
+
+const LABEL_JSON: &str = "jsonb_build_object('id', id, 'name', name, 'color', color, 'parent', parent_id, 'project_id', project_id, 'workspace_id', workspace_id, 'sort_order', sort_order)";
+
+async fn estimates(State(st): State<AppState>, user: CurrentUser, Path((slug, id)): Path<(String, Uuid)>) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    json_rows(sqlx::query_scalar("SELECT (to_jsonb(e)-'workspace_id'-'project_id'-'created_by_id'-'updated_by_id') || jsonb_build_object('workspace', e.workspace_id, 'project', e.project_id, 'created_by', e.created_by_id, 'updated_by', e.updated_by_id, 'points', COALESCE((SELECT jsonb_agg((to_jsonb(ep)-'workspace_id'-'project_id'-'estimate_id'-'created_by_id'-'updated_by_id') || jsonb_build_object('workspace', ep.workspace_id, 'project', ep.project_id, 'estimate', ep.estimate_id, 'created_by', ep.created_by_id, 'updated_by', ep.updated_by_id) ORDER BY ep.key) FROM estimate_points ep WHERE ep.estimate_id=e.id AND ep.project_id=e.project_id AND ep.workspace_id=e.workspace_id AND ep.deleted_at IS NULL), '[]'::jsonb)) FROM estimates e WHERE e.project_id=$1 AND e.workspace_id=$2 AND e.deleted_at IS NULL").bind(id).bind(p.workspace_id()), &st.db).await
+}
+
+async fn ensure_properties(st: &AppState, workspace: Uuid, project: Uuid, user: Uuid) -> Result<(), ApiError> {
+    sqlx::query("INSERT INTO project_user_properties (workspace_id,project_id,user_id,created_by_id,updated_by_id) VALUES ($1,$2,$3,$3,$3) ON CONFLICT DO NOTHING").bind(workspace).bind(project).bind(user).execute(&st.db).await?;
+    Ok(())
+}
+
+async fn get_properties(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, id)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    ensure_properties(&st, p.workspace_id(), id, user.id).await?;
+    json_row(sqlx::query_scalar("SELECT (to_jsonb(p)-'workspace_id'-'project_id'-'user_id'-'created_by_id'-'updated_by_id') || jsonb_build_object('workspace',workspace_id,'project',project_id,'user',user_id,'created_by',created_by_id,'updated_by',updated_by_id) FROM project_user_properties p WHERE project_id=$1 AND workspace_id=$2 AND user_id=$3 AND deleted_at IS NULL").bind(id).bind(p.workspace_id()).bind(user.id), &st.db).await
+}
+
+async fn update_properties(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, id)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    for key in [
+        "filters",
+        "display_filters",
+        "display_properties",
+        "rich_filters",
+        "preferences",
+    ] {
+        if b.get(key).is_some_and(Value::is_null) {
+            return Err(ApiError::bad(format!("{key} may not be null")));
+        }
+    }
+    ensure_properties(&st, p.workspace_id(), id, user.id).await?;
+    sqlx::query("UPDATE project_user_properties SET filters=COALESCE($4,filters),display_filters=COALESCE($5,display_filters),display_properties=COALESCE($6,display_properties),rich_filters=COALESCE($7,rich_filters),preferences=COALESCE($8,preferences),updated_at=now(),updated_by_id=$3 WHERE project_id=$1 AND workspace_id=$2 AND user_id=$3 AND deleted_at IS NULL").bind(id).bind(p.workspace_id()).bind(user.id).bind(b.get("filters")).bind(b.get("display_filters")).bind(b.get("display_properties")).bind(b.get("rich_filters")).bind(b.get("preferences")).execute(&st.db).await?;
+    get_properties(State(st), user, Path((slug, id))).await
+}
+
+async fn labels(State(st): State<AppState>, user: CurrentUser, Path((slug, id)): Path<(String, Uuid)>) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    json_rows(sqlx::query_scalar(&format!("SELECT {LABEL_JSON} FROM labels WHERE project_id=$1 AND workspace_id=$2 AND deleted_at IS NULL ORDER BY sort_order")).bind(id).bind(p.workspace_id()), &st.db).await
+}
+
+async fn label(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, id, label_id)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    json_row(
+        sqlx::query_scalar(&format!(
+            "SELECT {LABEL_JSON} FROM labels WHERE project_id=$1 AND workspace_id=$2 AND id=$3 AND deleted_at IS NULL"
+        ))
+        .bind(id)
+        .bind(p.workspace_id())
+        .bind(label_id),
+        &st.db,
+    )
+    .await
+}
+
+async fn create_label(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, id)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let p = require_project(&st.db, &user, &slug, id).await?;
+    p.require(&[ADMIN])?;
+    let name = s(&b, "name")
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.len() <= 255)
+        .ok_or_else(|| ApiError::bad("Invalid name"))?;
+    let color = s(&b, "color")
+        .filter(|s| !s.is_empty() && s.len() <= 255)
+        .ok_or_else(|| ApiError::bad("Invalid color"))?;
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM labels WHERE project_id=$1 AND workspace_id=$2 AND lower(name)=lower($3) AND deleted_at IS NULL)").bind(id).bind(p.workspace_id()).bind(name).fetch_one(&st.db).await?;
+    if exists {
+        return Err(ApiError::bad_body(json!({"name":["LABEL_NAME_ALREADY_EXISTS"]})));
+    }
+    let parent = uuid_of(&b, "parent");
+    if b.get("parent").is_some_and(|v| !v.is_null()) {
+        let parent = parent.ok_or_else(|| ApiError::bad("Invalid parent"))?;
+        let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM labels WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL)").bind(parent).bind(id).bind(p.workspace_id()).fetch_one(&st.db).await?;
+        if !valid {
+            return Err(ApiError::bad("Invalid parent"));
+        }
+    }
+    let value: Value = sqlx::query_scalar(&format!("INSERT INTO labels (project_id,workspace_id,name,color,parent_id,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$5,$6,$6) RETURNING {LABEL_JSON}")).bind(id).bind(p.workspace_id()).bind(name).bind(color).bind(parent).bind(user.id).fetch_one(&st.db).await?;
+    created(value)
+}
+
+async fn update_label(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, id, label_id)): Path<(String, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, id).await?;
+    p.require(&[ADMIN])?;
+    if b.get("parent").is_some() {
+        return Err(ApiError::bad("Updating parent is not supported"));
+    }
+    if let Some(name) = s(&b, "name") {
+        if name.trim().is_empty() || name.len() > 255 {
+            return Err(ApiError::bad("Invalid name"));
+        }
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM labels WHERE project_id=$1 AND workspace_id=$2 AND id<>$3 AND lower(name)=lower($4) AND deleted_at IS NULL)").bind(id).bind(p.workspace_id()).bind(label_id).bind(name).fetch_one(&st.db).await?;
+        if exists {
+            return Err(ApiError::bad_body(json!({"name":["LABEL_NAME_ALREADY_EXISTS"]})));
+        }
+    }
+    json_row(sqlx::query_scalar(&format!("UPDATE labels SET name=COALESCE($4,name),color=COALESCE($5,color),sort_order=COALESCE($6,sort_order),updated_by_id=$7,updated_at=now() WHERE project_id=$1 AND workspace_id=$2 AND id=$3 AND deleted_at IS NULL RETURNING {LABEL_JSON}")).bind(id).bind(p.workspace_id()).bind(label_id).bind(s(&b,"name")).bind(s(&b,"color")).bind(b.get("sort_order").and_then(Value::as_f64)).bind(user.id), &st.db).await
+}
+
+async fn delete_label(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, id, label_id)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, id).await?;
+    p.require(&[ADMIN])?;
+    let r=sqlx::query("UPDATE labels SET deleted_at=now(),updated_by_id=$4 WHERE project_id=$1 AND workspace_id=$2 AND id=$3 AND deleted_at IS NULL").bind(id).bind(p.workspace_id()).bind(label_id).bind(user.id).execute(&st.db).await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
 }
 
 async fn members(State(st): State<AppState>, user: CurrentUser, Path((slug, id)): Path<(String, Uuid)>) -> ApiResult {

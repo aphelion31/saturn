@@ -3,6 +3,16 @@ call GET "/api/workspaces/$SLUG/projects/"
 call GET "/api/workspaces/$SLUG/projects/details/"
 call GET "/api/workspaces/$SLUG/project-identifiers/?name=GS"
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/"
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/user-properties/"
+call PATCH "/api/workspaces/$SLUG/projects/$PROJECT/user-properties/" '{"filters":{"priority":["high"]}}'
+[[ $(field "['filters']['priority'][0]") == high ]]
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/estimates/"
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/issue-labels/"
+call POST "/api/workspaces/$SLUG/projects/$PROJECT/issue-labels/" '{"name":"Smoke '$RANDOM'","color":"#123456"}'
+LABEL=$(field "['id']")
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/issue-labels/$LABEL/"
+call PATCH "/api/workspaces/$SLUG/projects/$PROJECT/issue-labels/$LABEL/" '{"color":"#654321"}'
+call DELETE "/api/workspaces/$SLUG/projects/$PROJECT/issue-labels/$LABEL/"
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/members/"
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/project-members/me/"
 call GET "/api/workspaces/$SLUG/user-favorite-projects/"
