@@ -53,6 +53,7 @@ DATABASE_URL=postgres://localhost/saturn cargo run -- seed admin@example.com 'Ch
 DATABASE_URL=postgres://localhost/saturn cargo run          # http://localhost:3000
 scripts/build-web.sh                                        # build web, admin, space SPAs
 BASE=http://127.0.0.1:3000 tools/smoke.sh                   # API smoke test over real HTTP
+BASE=http://127.0.0.1:3000 node tools/e2e.mjs               # real web app in Chromium, prints failed API calls
 (cd web && pnpm turbo run check:types --filter=web)         # frontend types
 ```
 
