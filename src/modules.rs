@@ -18,6 +18,7 @@ use crate::workitems::{self, ACTIVE, Arg, Base, Scope};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/api/workspaces/{slug}/modules/", get(workspace_list))
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/modules/",
             get(list).post(create),
@@ -1100,4 +1101,25 @@ mod tests {
         assert!(check_url("javascript:alert(1)").is_err());
         assert!(check_url("http://").is_err());
     }
+}
+
+/// `GET /api/workspaces/{slug}/modules/`: non-archived modules of every project the user is an active
+/// member of (Plane's `WorkspaceModulesEndpoint`).
+async fn workspace_list(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    json_rows(
+        sqlx::query_scalar(&format!(
+            "SELECT {} FROM modules m {COUNTS}
+             JOIN projects p ON p.id = m.project_id AND p.deleted_at IS NULL AND p.archived_at IS NULL
+             WHERE m.workspace_id = $2 AND m.archived_at IS NULL AND m.deleted_at IS NULL
+               AND EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id = m.project_id AND pm.member_id = $1
+                           AND pm.is_active AND pm.deleted_at IS NULL)
+             ORDER BY m.created_at DESC",
+            module_json(&fav("$1")),
+        ))
+        .bind(user.id)
+        .bind(ws.workspace_id),
+        &st.db,
+    )
+    .await
 }
