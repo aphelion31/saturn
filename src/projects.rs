@@ -14,6 +14,14 @@ use crate::common::*;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route(
+            "/api/users/me/workspaces/{slug}/projects/invitations/",
+            axum::routing::post(join_projects),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/join/{invite_id}/",
+            axum::routing::post(accept_invite),
+        )
         .route("/api/workspaces/{slug}/estimates/", get(workspace_estimates))
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/user-properties/",
@@ -81,6 +89,79 @@ pub fn routes() -> Router<AppState> {
 }
 
 const LABEL_JSON: &str = "jsonb_build_object('id', id, 'name', name, 'color', color, 'parent', parent_id, 'project_id', project_id, 'workspace_id', workspace_id, 'sort_order', sort_order)";
+
+async fn join_projects(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(slug): Path<String>,
+    Json(b): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER])?;
+    let ids = b
+        .get("project_ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError::bad("project_ids is required"))?;
+    let mut tx = st.db.begin().await?;
+    for v in ids {
+        let id = v
+            .as_str()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .ok_or_else(|| ApiError::bad("Invalid project id"))?;
+        let network: i16 =
+            sqlx::query_scalar("SELECT network FROM projects WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL")
+                .bind(id)
+                .bind(ws.workspace_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if network != 2 && !ws.is_admin() {
+            return Err(ApiError::forbidden());
+        }
+        sqlx::query("INSERT INTO project_members (workspace_id,project_id,member_id,role,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$3,$3) ON CONFLICT (project_id,member_id) WHERE deleted_at IS NULL DO UPDATE SET is_active=true,role=EXCLUDED.role,updated_at=now(),updated_by_id=EXCLUDED.updated_by_id WHERE NOT project_members.is_active").bind(ws.workspace_id).bind(id).bind(user.id).bind(ws.role).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO project_user_properties (workspace_id,project_id,user_id,created_by_id,updated_by_id) VALUES ($1,$2,$3,$3,$3) ON CONFLICT DO NOTHING").bind(ws.workspace_id).bind(id).bind(user.id).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({"message":"Projects joined successfully"})),
+    ))
+}
+
+async fn accept_invite(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, invite)): Path<(String, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let token = s(&b, "token")
+        .filter(|v| !v.is_empty())
+        .ok_or_else(ApiError::forbidden)?;
+    let accepted = b
+        .get("accepted")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| ApiError::bad("`accepted` must be a boolean"))?;
+    let mut tx = st.db.begin().await?;
+    let row:Option<(Uuid,i16,String,String,Option<chrono::DateTime<chrono::Utc>>)>=sqlx::query_as("SELECT i.workspace_id,i.role,i.email,i.token,i.responded_at FROM project_member_invites i JOIN workspaces w ON w.id=i.workspace_id AND w.deleted_at IS NULL JOIN projects p ON p.id=i.project_id AND p.workspace_id=i.workspace_id AND p.deleted_at IS NULL WHERE i.id=$1 AND i.project_id=$2 AND w.slug=$3 AND i.deleted_at IS NULL FOR UPDATE OF i").bind(invite).bind(project).bind(&slug).fetch_optional(&mut *tx).await?;
+    let (workspace, role, email, expected, responded) = row.ok_or_else(ApiError::not_found)?;
+    if token != expected || !email.eq_ignore_ascii_case(&user.email) {
+        return Err(ApiError::forbidden());
+    }
+    if responded.is_some() {
+        return Err(ApiError::bad("You have already responded to the invitation request"));
+    }
+    if ![5, 15, 20].contains(&role) {
+        return Err(ApiError::bad("Invalid invitation role"));
+    }
+    sqlx::query("UPDATE project_member_invites SET accepted=$4,responded_at=now(),updated_at=now(),updated_by_id=$5 WHERE id=$1 AND project_id=$2 AND workspace_id=$3").bind(invite).bind(project).bind(workspace).bind(accepted).bind(user.id).execute(&mut *tx).await?;
+    if accepted {
+        sqlx::query("INSERT INTO workspace_members (workspace_id,member_id,role,created_by_id,updated_by_id) VALUES ($1,$2,$3,$2,$2) ON CONFLICT (workspace_id,member_id) WHERE deleted_at IS NULL DO UPDATE SET is_active=true,updated_at=now()").bind(workspace).bind(user.id).bind(if role>=15 {15i16} else {role}).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO project_members (workspace_id,project_id,member_id,role,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$3,$3) ON CONFLICT (project_id,member_id) WHERE deleted_at IS NULL DO UPDATE SET is_active=true,role=EXCLUDED.role,updated_at=now()").bind(workspace).bind(project).bind(user.id).bind(role).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(Json(
+        json!({"message":if accepted {"Project Invitation Accepted"} else {"Project Invitation was not accepted"}}),
+    ))
+}
 
 async fn add_members(
     State(st): State<AppState>,
