@@ -15,6 +15,19 @@ use crate::common::*;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/workspaces/{slug}/project-identifiers/", get(project_identifiers))
+        .route("/api/workspaces/{slug}/projects/{project_id}/members/", get(members))
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/project-members/me/",
+            get(my_membership),
+        )
+        .route(
+            "/api/workspaces/{slug}/user-favorite-projects/",
+            get(favorites).post(add_favorite),
+        )
+        .route(
+            "/api/workspaces/{slug}/user-favorite-projects/{project_id}/",
+            axum::routing::delete(remove_favorite),
+        )
         .route("/api/workspaces/{slug}/projects/", get(list_projects).post(create))
         .route("/api/workspaces/{slug}/projects/details/", get(list_projects))
         .route(
@@ -25,6 +38,67 @@ pub fn routes() -> Router<AppState> {
             "/api/workspaces/{slug}/projects/{project_id}/archive/",
             axum::routing::post(archive).delete(unarchive),
         )
+}
+
+async fn members(State(st): State<AppState>, user: CurrentUser, Path((slug, id)): Path<(String, Uuid)>) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let sql = format!(
+        "SELECT jsonb_build_object('id', pm.id, 'member', {}, 'role', pm.role) FROM project_members pm JOIN users u ON u.id=pm.member_id JOIN workspace_members wm ON wm.member_id=u.id AND wm.workspace_id=pm.workspace_id AND wm.is_active AND wm.deleted_at IS NULL WHERE pm.project_id=$1 AND pm.workspace_id=$2 AND pm.is_active AND pm.deleted_at IS NULL AND NOT u.is_bot",
+        crate::users::USER_LITE_JSON
+    );
+    json_rows(sqlx::query_scalar(&sql).bind(id).bind(p.workspace_id()), &st.db).await
+}
+
+async fn my_membership(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, id)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let sql = format!(
+        "SELECT (to_jsonb(pm) - 'member_id' - 'project_id' - 'workspace_id') || jsonb_build_object('member', {}, 'project', jsonb_build_object('id', p.id, 'name', p.name, 'identifier', p.identifier, 'description', p.description, 'logo_props', p.logo_props, 'cover_image', p.cover_image, 'cover_image_url', p.cover_image), 'workspace', jsonb_build_object('id', w.id, 'name', w.name, 'slug', w.slug)) FROM project_members pm JOIN users u ON u.id=pm.member_id JOIN projects p ON p.id=pm.project_id AND p.workspace_id=pm.workspace_id JOIN workspaces w ON w.id=pm.workspace_id WHERE pm.project_id=$1 AND pm.workspace_id=$2 AND pm.member_id=$3 AND pm.is_active AND pm.deleted_at IS NULL",
+        crate::users::USER_LITE_JSON
+    );
+    json_row(
+        sqlx::query_scalar(&sql).bind(id).bind(p.workspace_id()).bind(user.id),
+        &st.db,
+    )
+    .await
+}
+
+async fn favorites(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER, GUEST])?;
+    json_rows(sqlx::query_scalar("SELECT to_jsonb(f) FROM user_favorites f JOIN projects p ON p.id=f.project_id AND p.workspace_id=f.workspace_id AND p.deleted_at IS NULL WHERE f.workspace_id=$1 AND f.user_id=$2 AND f.entity_type='project' AND f.deleted_at IS NULL AND (EXISTS(SELECT 1 FROM project_members pm WHERE pm.project_id=p.id AND pm.workspace_id=p.workspace_id AND pm.member_id=$2 AND pm.is_active AND pm.deleted_at IS NULL) OR $3=20 OR ($3=15 AND p.network=2))").bind(ws.workspace_id).bind(user.id).bind(ws.role), &st.db).await
+}
+
+async fn add_favorite(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(slug): Path<String>,
+    Json(b): Json<Value>,
+) -> ApiResult<StatusCode> {
+    let id = uuid_of(&b, "project").ok_or_else(|| ApiError::bad("Project is required"))?;
+    let p = require_project(&st.db, &user, &slug, id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    sqlx::query("INSERT INTO user_favorites (workspace_id, project_id, user_id, entity_type, entity_identifier, created_by_id) VALUES ($1,$2,$3,'project',$2,$3) ON CONFLICT DO NOTHING").bind(p.workspace_id()).bind(id).bind(user.id).execute(&st.db).await?;
+    no_content()
+}
+
+async fn remove_favorite(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, id)): Path<(String, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER, GUEST])?;
+    let result = sqlx::query("UPDATE user_favorites SET deleted_at=now() WHERE workspace_id=$1 AND project_id=$2 AND entity_identifier=$2 AND user_id=$3 AND entity_type='project' AND deleted_at IS NULL").bind(ws.workspace_id).bind(id).bind(user.id).execute(&st.db).await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
 }
 
 async fn project_identifiers(
