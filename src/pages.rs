@@ -104,16 +104,15 @@ async fn create(
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let ctx = require_project(&st.db, &user, &slug, project).await?;
     ctx.require(&[ADMIN, MEMBER])?;
-    if b.get("description_html").is_some() {
-        return Err(ApiError::bad("HTML updates are not supported"));
-    }
+    let html = sanitize_html(s(&b, "description_html").unwrap_or("<p></p>"))?;
+    let stripped = strip_tags(&html);
     let access = b.get("access").and_then(Value::as_i64).unwrap_or(0);
     if !(0..=1).contains(&access) {
         return Err(ApiError::bad("Invalid access"));
     }
     let mut tx = st.db.begin().await?;
-    let id: Uuid = sqlx::query_scalar("INSERT INTO pages (name,color,workspace_id,owned_by_id,created_by_id,updated_by_id,access,description_html) VALUES ($1,$2,$3,$4,$4,$4,$5,$6) RETURNING id")
-        .bind(s(&b,"name").unwrap_or("")).bind(s(&b,"color").unwrap_or("")).bind(ctx.workspace_id()).bind(user.id).bind(access as i16).bind(s(&b,"description_html").unwrap_or("<p></p>"))
+    let id: Uuid = sqlx::query_scalar("INSERT INTO pages (name,color,workspace_id,owned_by_id,created_by_id,updated_by_id,access,description_html,description_stripped) VALUES ($1,$2,$3,$4,$4,$4,$5,$6,$7) RETURNING id")
+        .bind(s(&b,"name").unwrap_or("")).bind(s(&b,"color").unwrap_or("")).bind(ctx.workspace_id()).bind(user.id).bind(access as i16).bind(&html).bind(&stripped)
         .fetch_one(&mut *tx).await?;
     sqlx::query("INSERT INTO project_pages (workspace_id,project_id,page_id,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$4)")
         .bind(ctx.workspace_id()).bind(project).bind(id).bind(user.id).execute(&mut *tx).await?;
@@ -150,8 +149,10 @@ async fn update(
     if access != old_access as i64 && owner != user.id {
         return Err(ApiError::forbidden());
     }
-    sqlx::query(&format!("UPDATE pages p SET name=COALESCE($6,p.name),color=COALESCE($7,p.color),access=$8,view_props=COALESCE($9,p.view_props),logo_props=COALESCE($10,p.logo_props),updated_by_id=$3,updated_at=now() WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked"))
-        .bind(ctx.workspace_id()).bind(project).bind(user.id).bind(ctx.restricted_guest()).bind(id).bind(s(&b,"name")).bind(s(&b,"color")).bind(access as i16).bind(b.get("view_props")).bind(b.get("logo_props")).execute(&st.db).await?;
+    let html = s(&b, "description_html").map(sanitize_html).transpose()?;
+    let stripped = html.as_deref().map(strip_tags);
+    sqlx::query(&format!("UPDATE pages p SET name=COALESCE($6,p.name),color=COALESCE($7,p.color),access=$8,view_props=COALESCE($9,p.view_props),logo_props=COALESCE($10,p.logo_props),description_html=COALESCE($11,p.description_html),description_stripped=COALESCE($12,p.description_stripped),updated_by_id=$3,updated_at=now() WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked"))
+        .bind(ctx.workspace_id()).bind(project).bind(user.id).bind(ctx.restricted_guest()).bind(id).bind(s(&b,"name")).bind(s(&b,"color")).bind(access as i16).bind(b.get("view_props")).bind(b.get("logo_props")).bind(html).bind(stripped).execute(&st.db).await?;
     retrieve(State(st), user, Path((slug, project, id))).await
 }
 async fn destroy(
@@ -220,16 +221,15 @@ async fn update_description(
 ) -> ApiResult {
     let ctx = require_project(&st.db, &user, &slug, project).await?;
     ctx.require(&[ADMIN, MEMBER])?;
-    if b.get("description_html").is_some() {
-        return Err(ApiError::bad("HTML updates are not supported"));
-    }
+    let html = s(&b, "description_html").map(sanitize_html).transpose()?;
+    let stripped = html.as_deref().map(strip_tags);
     let binary = match b.get("description_binary") {
         None => None,
         Some(Value::String(v)) => Some(STANDARD.decode(v).map_err(|_| ApiError::bad("Invalid base64"))?),
         _ => return Err(ApiError::bad("Invalid description_binary")),
     };
-    let r = sqlx::query(&format!("UPDATE pages p SET description_binary=COALESCE($6,p.description_binary),description_html=COALESCE($7,p.description_html),description_json=COALESCE($8,p.description_json),updated_at=now(),updated_by_id=$3 WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL"))
-        .bind(ctx.workspace_id()).bind(project).bind(user.id).bind(ctx.restricted_guest()).bind(id).bind(binary).bind(s(&b,"description_html")).bind(b.get("description_json")).execute(&st.db).await?;
+    let r = sqlx::query(&format!("UPDATE pages p SET description_binary=COALESCE($6,p.description_binary),description_html=COALESCE($7,p.description_html),description_json=COALESCE($8,p.description_json),description_stripped=COALESCE($9,p.description_stripped),updated_at=now(),updated_by_id=$3 WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL"))
+        .bind(ctx.workspace_id()).bind(project).bind(user.id).bind(ctx.restricted_guest()).bind(id).bind(binary).bind(html).bind(b.get("description_json")).bind(stripped).execute(&st.db).await?;
     if r.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
