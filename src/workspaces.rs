@@ -59,6 +59,19 @@ pub fn routes() -> Router<AppState> {
         .route("/api/workspaces/{slug}/user-stats/{user_id}/", get(user_stats))
         .route("/api/workspaces/{slug}/user-profile/{user_id}/", get(user_profile))
         .route("/api/workspaces/{slug}/user-activity/{user_id}/", get(user_activity))
+        .route(
+            "/api/workspaces/{slug}/sidebar-preferences/",
+            get(sidebar_prefs_list).patch(sidebar_prefs_bulk),
+        )
+        .route(
+            "/api/workspaces/{slug}/sidebar-preferences/{key}/",
+            patch(sidebar_pref_update),
+        )
+        .route("/api/workspaces/{slug}/home-preferences/", get(home_prefs_list))
+        .route(
+            "/api/workspaces/{slug}/home-preferences/{key}/",
+            patch(home_pref_update),
+        )
 }
 
 /// WorkSpaceSerializer fields, with `total_members` (active, non-bot) and `logo_url`.
@@ -1208,4 +1221,165 @@ async fn user_activity(
     let ws = require_workspace(&st.db, &user, &slug).await?;
     ws.require(&[ADMIN, MEMBER, GUEST])?;
     Ok(Json(json!({"results": [], "count": 0, "next": null, "previous": null})))
+}
+
+// --- sidebar and home preferences (WorkspaceUserPreference, WorkspaceHomePreference) ---
+
+const SIDEBAR_KEYS: &[&str] = &[
+    "views",
+    "active_cycles",
+    "analytics",
+    "drafts",
+    "your_work",
+    "archives",
+    "stickies",
+];
+const SIDEBAR_PINNED: &[&str] = &["drafts", "your_work", "stickies"];
+/// Plane creates every home widget except these two by default.
+const HOME_KEYS: &[&str] = &["quick_links", "recents", "my_stickies"];
+
+/// Insert the default sidebar rows this user does not have yet (Plane does this on GET).
+async fn ensure_sidebar_prefs(st: &AppState, ws: &WorkspaceCtx) -> Result<(), ApiError> {
+    for (i, key) in SIDEBAR_KEYS.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO workspace_user_preferences (key, is_pinned, sort_order, user_id, workspace_id, created_by_id, updated_by_id)
+             SELECT $1, $2, $3, $4, $5, $4, $4
+             WHERE NOT EXISTS (SELECT 1 FROM workspace_user_preferences
+                               WHERE workspace_id = $5 AND user_id = $4 AND key = $1 AND deleted_at IS NULL)",
+        )
+        .bind(key)
+        .bind(SIDEBAR_PINNED.contains(key))
+        .bind(65535.0 + i as f64 * 10000.0)
+        .bind(ws.user_id)
+        .bind(ws.workspace_id)
+        .execute(&st.db)
+        .await?;
+    }
+    Ok(())
+}
+
+/// GET: `{key: {is_pinned, sort_order}}`, ordered by sort_order.
+async fn sidebar_prefs_list(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ensure_sidebar_prefs(&st, &ws).await?;
+    let rows: Vec<(String, bool, f64)> = sqlx::query_as(
+        "SELECT key, is_pinned, sort_order FROM workspace_user_preferences
+         WHERE workspace_id = $1 AND user_id = $2 AND deleted_at IS NULL ORDER BY sort_order",
+    )
+    .bind(ws.workspace_id)
+    .bind(user.id)
+    .fetch_all(&st.db)
+    .await?;
+    let mut out = serde_json::Map::new();
+    for (key, is_pinned, sort_order) in rows {
+        out.insert(key, json!({"is_pinned": is_pinned, "sort_order": sort_order}));
+    }
+    Ok(Json(Value::Object(out)))
+}
+
+async fn update_sidebar_pref(
+    st: &AppState,
+    ws: &WorkspaceCtx,
+    key: &str,
+    b: &Value,
+) -> Result<Option<Value>, ApiError> {
+    Ok(sqlx::query_scalar(
+        "UPDATE workspace_user_preferences SET is_pinned = COALESCE($4, is_pinned), sort_order = COALESCE($5, sort_order),
+                updated_at = now(), updated_by_id = $2
+         WHERE workspace_id = $1 AND user_id = $2 AND key = $3 AND deleted_at IS NULL
+         RETURNING jsonb_build_object('key', key, 'is_pinned', is_pinned, 'sort_order', sort_order)",
+    )
+    .bind(ws.workspace_id)
+    .bind(ws.user_id)
+    .bind(key)
+    .bind(b.get("is_pinned").and_then(Value::as_bool))
+    .bind(b.get("sort_order").and_then(Value::as_f64))
+    .fetch_optional(&st.db)
+    .await?)
+}
+
+/// PATCH with a list of `{key, is_pinned?, sort_order?}`; unknown keys are skipped, as in Plane.
+async fn sidebar_prefs_bulk(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(slug): Path<String>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    for item in b.as_array().cloned().unwrap_or_default() {
+        if let Some(key) = s(&item, "key") {
+            update_sidebar_pref(&st, &ws, key, &item).await?;
+        }
+    }
+    Ok(Json(json!({"message": "Successfully updated"})))
+}
+
+/// PATCH one key. Plane's web app calls this path although Plane only routes the bulk form.
+async fn sidebar_pref_update(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, key)): Path<(String, String)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ensure_sidebar_prefs(&st, &ws).await?;
+    update_sidebar_pref(&st, &ws, &key, &b)
+        .await?
+        .map(Json)
+        .ok_or_else(ApiError::not_found)
+}
+
+/// GET: list of `{key, is_enabled, config, sort_order}`, creating defaults first.
+async fn home_prefs_list(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    for (i, key) in HOME_KEYS.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO workspace_home_preferences (key, is_enabled, config, sort_order, user_id, workspace_id,
+                                                    created_by_id, updated_by_id)
+             SELECT $1, true, '{}'::jsonb, $2, $3, $4, $3, $3
+             WHERE NOT EXISTS (SELECT 1 FROM workspace_home_preferences
+                               WHERE workspace_id = $4 AND user_id = $3 AND key = $1 AND deleted_at IS NULL)",
+        )
+        .bind(key)
+        .bind(1000.0 - (i as f64 + 1.0))
+        .bind(user.id)
+        .bind(ws.workspace_id)
+        .execute(&st.db)
+        .await?;
+    }
+    json_rows(
+        sqlx::query_scalar(
+            "SELECT jsonb_build_object('key', key, 'is_enabled', is_enabled, 'config', config, 'sort_order', sort_order)
+             FROM workspace_home_preferences WHERE workspace_id = $1 AND user_id = $2 AND deleted_at IS NULL",
+        )
+        .bind(ws.workspace_id)
+        .bind(user.id),
+        &st.db,
+    )
+    .await
+}
+
+async fn home_pref_update(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, key)): Path<(String, String)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    let v: Option<Value> = sqlx::query_scalar(
+        "UPDATE workspace_home_preferences SET is_enabled = COALESCE($4, is_enabled), sort_order = COALESCE($5, sort_order),
+                config = COALESCE($6, config), updated_at = now(), updated_by_id = $2
+         WHERE workspace_id = $1 AND user_id = $2 AND key = $3 AND deleted_at IS NULL
+         RETURNING jsonb_build_object('key', key, 'is_enabled', is_enabled, 'sort_order', sort_order)",
+    )
+    .bind(ws.workspace_id)
+    .bind(user.id)
+    .bind(&key)
+    .bind(b.get("is_enabled").and_then(Value::as_bool))
+    .bind(b.get("sort_order").and_then(Value::as_f64))
+    .bind(b.get("config"))
+    .fetch_optional(&st.db)
+    .await?;
+    v.map(Json)
+        .ok_or_else(|| ApiError::bad_body(json!({"detail": "Preference not found"})))
 }
