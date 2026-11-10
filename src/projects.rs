@@ -1,13 +1,176 @@
 //! Projects, project members, invites, identifiers, favorites, deploy boards.
 //! TODO (worker): port the `/api/workspaces/{slug}/projects/...` routes.
-use axum::Router;
-use serde_json::Value;
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    routing::get,
+};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::common::*;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/api/workspaces/{slug}/projects/", get(list_projects).post(create))
+        .route("/api/workspaces/{slug}/projects/details/", get(list_projects))
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/",
+            get(retrieve).patch(update).delete(destroy),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/archive/",
+            axum::routing::post(archive).delete(unarchive),
+        )
+}
+
+async fn update(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, id)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    if !ws.is_admin() {
+        require_project(&st.db, &user, &slug, id).await?.require(&[ADMIN])?;
+    }
+    let result = sqlx::query("UPDATE projects SET name=COALESCE($3,name), description=COALESCE($4,description), network=COALESCE($5,network), updated_by_id=$6, updated_at=now() WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL AND archived_at IS NULL")
+        .bind(id).bind(ws.workspace_id).bind(s(&b,"name")).bind(s(&b,"description"))
+        .bind(b.get("network").and_then(Value::as_i64).map(|n| n as i16)).bind(user.id).execute(&st.db).await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    retrieve(State(st), user, Path((slug, id))).await
+}
+
+async fn archive(State(st): State<AppState>, user: CurrentUser, Path((slug, id)): Path<(String, Uuid)>) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    json_row(sqlx::query_scalar("UPDATE projects SET archived_at=now() WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL RETURNING jsonb_build_object('archived_at',archived_at)").bind(id).bind(p.workspace_id()), &st.db).await
+}
+
+async fn unarchive(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, id)): Path<(String, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    sqlx::query("UPDATE projects SET archived_at=NULL WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL")
+        .bind(id)
+        .bind(p.workspace_id())
+        .execute(&st.db)
+        .await?;
+    no_content()
+}
+
+async fn create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(slug): Path<String>,
+    Json(b): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER])?;
+    let name = s(&b, "name")
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .ok_or_else(|| ApiError::bad_body(json!({"name": ["This field is required."]})))?;
+    let identifier = s(&b, "identifier")
+        .map(str::trim)
+        .filter(|x| !x.is_empty() && x.len() <= 12)
+        .ok_or_else(|| ApiError::bad_body(json!({"identifier": ["Invalid identifier."]})))?;
+    for (field, value) in [("name", name), ("identifier", identifier)] {
+        let taken: bool = if field == "name" {
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE workspace_id=$1 AND name=$2 AND deleted_at IS NULL)",
+            )
+            .bind(ws.workspace_id)
+            .bind(value)
+            .fetch_one(&st.db)
+            .await?
+        } else {
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE workspace_id=$1 AND identifier=$2 AND deleted_at IS NULL)",
+            )
+            .bind(ws.workspace_id)
+            .bind(value.to_uppercase())
+            .fetch_one(&st.db)
+            .await?
+        };
+        if taken {
+            return Err(ApiError::bad_body(
+                json!({field: [if field == "name" {"PROJECT_NAME_ALREADY_EXIST"} else {"PROJECT_IDENTIFIER_ALREADY_EXIST"}]}),
+            ));
+        }
+    }
+    let mut tx = st.db.begin().await?;
+    let id = create_project(&mut tx, ws.workspace_id, user.id, name, identifier, &b).await?;
+    tx.commit().await?;
+    let Json(project) = retrieve(State(st), user, Path((slug, id))).await?;
+    Ok((StatusCode::CREATED, Json(project)))
+}
+
+async fn retrieve(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let Json(projects) = list_projects(State(st), user, Path(slug)).await?;
+    projects
+        .as_array()
+        .and_then(|rows| rows.iter().find(|v| v["id"].as_str() == Some(&project_id.to_string())))
+        .cloned()
+        .map(Json)
+        .ok_or_else(ApiError::not_found)
+}
+
+async fn destroy(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id)): Path<(String, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    if !ws.is_admin() {
+        let p = require_project(&st.db, &user, &slug, project_id).await?;
+        p.require(&[ADMIN])?;
+    }
+    let r = sqlx::query(
+        "UPDATE projects SET deleted_at=now(), updated_by_id=$3 WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL",
+    )
+    .bind(project_id)
+    .bind(ws.workspace_id)
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
+}
+
+async fn list_projects(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER, GUEST])?;
+    json_rows(sqlx::query_scalar(
+        "SELECT (to_jsonb(p) - 'workspace_id' - 'created_by_id' - 'updated_by_id' - 'default_assignee_id' - 'project_lead_id' - 'estimate_id' - 'default_state_id' - 'cover_image_asset_id') ||
+         jsonb_build_object('workspace', p.workspace_id, 'created_by', p.created_by_id, 'updated_by', p.updated_by_id,
+         'default_assignee', p.default_assignee_id, 'project_lead', p.project_lead_id, 'estimate', p.estimate_id,
+         'default_state', p.default_state_id, 'cover_image_asset', p.cover_image_asset_id, 'inbox_view', p.intake_view,
+         'cover_image_url', p.cover_image, 'member_role', pm.role, 'is_member', pm.id IS NOT NULL,
+         'sort_order', pup.sort_order,
+         'members', COALESCE((SELECT jsonb_agg(m.member_id) FROM project_members m JOIN users u ON u.id=m.member_id
+             WHERE m.project_id=p.id AND m.workspace_id=p.workspace_id AND m.deleted_at IS NULL AND m.is_active AND NOT u.is_bot), '[]'::jsonb),
+         'is_favorite', EXISTS (SELECT 1 FROM user_favorites f WHERE f.workspace_id=p.workspace_id AND f.project_id=p.id AND f.user_id=$2 AND f.entity_type='project' AND f.deleted_at IS NULL),
+         'next_work_item_sequence', COALESCE((SELECT MAX(seq.sequence) + 1 FROM issue_sequences seq WHERE seq.project_id=p.id AND seq.workspace_id=p.workspace_id AND seq.deleted_at IS NULL), 1))
+         FROM projects p LEFT JOIN project_members pm ON pm.project_id=p.id AND pm.workspace_id=p.workspace_id AND pm.member_id=$2 AND pm.is_active AND pm.deleted_at IS NULL
+         LEFT JOIN project_user_properties pup ON pup.project_id=p.id AND pup.workspace_id=p.workspace_id AND pup.user_id=$2 AND pup.deleted_at IS NULL
+         WHERE p.workspace_id=$1 AND p.deleted_at IS NULL AND (pm.id IS NOT NULL OR $3 = 20 OR ($3 = 15 AND p.network=2))
+         ORDER BY pup.sort_order, p.name")
+        .bind(ws.workspace_id).bind(user.id).bind(ws.role), &st.db).await
 }
 
 /// Insert a project with its creator as admin member, default states and identifier row.
