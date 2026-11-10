@@ -7,6 +7,7 @@ call GET "/api/workspaces/$SLUG/projects/$PROJECT/user-properties/"
 call PATCH "/api/workspaces/$SLUG/projects/$PROJECT/user-properties/" '{"filters":{"priority":["high"]}}'
 [[ $(field "['filters']['priority'][0]") == high ]]
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/estimates/"
+call GET "/api/workspaces/$SLUG/estimates/"
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/issue-labels/"
 call POST "/api/workspaces/$SLUG/projects/$PROJECT/issue-labels/" '{"name":"Smoke '$RANDOM'","color":"#123456"}'
 LABEL=$(field "['id']")
