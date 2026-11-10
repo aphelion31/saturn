@@ -340,10 +340,101 @@ pub fn strip_tags(html: &str) -> String {
     out
 }
 
+/// Sanitize rich-text HTML before storing it, like Plane's `validate_html_content` (nh3 with the
+/// editor's tags and attributes). Use for every `description_html` / `comment_html` write.
+/// Returns 400 when the HTML is larger than 10 MB.
+pub fn sanitize_html(html: &str) -> Result<String, ApiError> {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::OnceLock;
+    if html.len() > 10 * 1024 * 1024 {
+        return Err(ApiError::bad("HTML content exceeds maximum size limit (10MB)"));
+    }
+    static CLEANER: OnceLock<ammonia::Builder<'static>> = OnceLock::new();
+    let cleaner = CLEANER.get_or_init(|| {
+        let mut b = ammonia::Builder::default();
+        b.add_tags(["mention-component", "label", "input", "image-component"]);
+        b.add_generic_attributes([
+            "class",
+            "id",
+            "title",
+            "role",
+            "aria-label",
+            "aria-hidden",
+            "style",
+            "start",
+            "type",
+            "xmlns",
+            "data-tight",
+            "data-node-type",
+            "data-type",
+            "data-checked",
+            "data-background-color",
+            "data-text-color",
+            "data-name",
+            "data-id",
+            "data-icon-name",
+            "data-icon-color",
+            "data-background",
+            "data-emoji-unicode",
+            "data-emoji-url",
+            "data-logo-in-use",
+            "data-block-type",
+        ]);
+        let tag_attrs: HashMap<&'static str, HashSet<&'static str>> = [
+            ("a", vec!["href", "target"]),
+            (
+                "image-component",
+                vec!["id", "width", "height", "aspectratio", "src", "alignment", "status"],
+            ),
+            (
+                "img",
+                vec!["width", "height", "aspectratio", "alignment", "src", "alt", "title"],
+            ),
+            ("mention-component", vec!["id", "entity_identifier", "entity_name"]),
+            ("th", vec!["colspan", "rowspan", "colwidth", "background", "style"]),
+            (
+                "td",
+                vec!["colspan", "rowspan", "colwidth", "background", "textcolor", "style"],
+            ),
+            ("tr", vec!["background", "textcolor", "style"]),
+            ("pre", vec!["language"]),
+            ("code", vec!["language", "spellcheck"]),
+            ("input", vec!["type", "checked"]),
+        ]
+        .into_iter()
+        .map(|(t, a)| (t, a.into_iter().collect()))
+        .collect();
+        b.tag_attributes(tag_attrs);
+        b.url_schemes(["http", "https", "mailto", "tel"].into_iter().collect());
+        b.link_rel(None);
+        b
+    });
+    Ok(cleaner.clean(html).to_string())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn strip_tags_works() {
         assert_eq!(super::strip_tags("<p>hi <b>there</b></p>"), "hi there");
+    }
+
+    #[test]
+    fn sanitize_keeps_editor_markup_and_drops_scripts() {
+        let out = super::sanitize_html(
+            r#"<p class="x" onclick="evil()">hi<script>alert(1)</script></p><a href="javascript:x">l</a><mention-component entity_identifier="u1" entity_name="user_mention"></mention-component><img src="https://a/b.png" onerror="x">"#,
+        )
+        .unwrap();
+        assert!(out.contains(r#"<p class="x">hi</p>"#), "{out}");
+        assert!(
+            !out.contains("script")
+                && !out.contains("onclick")
+                && !out.contains("onerror")
+                && !out.contains("javascript")
+        );
+        assert!(
+            out.contains(r#"<mention-component entity_identifier="u1" entity_name="user_mention">"#),
+            "{out}"
+        );
     }
 }

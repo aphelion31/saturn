@@ -6,6 +6,7 @@ description = "Saturn: lightweight Rust rewrite of the Plane backend, serving th
 license = "AGPL-3.0-only"
 
 [dependencies]
+ammonia = "4"
 anyhow = "1"
 axum = { version = "0.8", features = ["ws", "macros", "multipart"] }
 base64 = "0.22"
