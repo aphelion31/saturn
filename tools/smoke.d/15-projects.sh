@@ -30,6 +30,10 @@ call POST "/api/workspaces/$SLUG/user-favorite-projects/" '{"project":"'"$PROJEC
 call DELETE "/api/workspaces/$SLUG/user-favorite-projects/$PROJECT/"
 call POST "/api/workspaces/$SLUG/projects/" '{"name":"Smoke project '$RANDOM'","identifier":"S'$RANDOM'"}'
 SMOKE_PROJECT=$(field "['id']")
+call GET "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/project-deploy-boards/"
+call POST "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/project-deploy-boards/" '{"is_comments_enabled":true}'
+BOARD=$(field "['id']")
+call PATCH "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/project-deploy-boards/$BOARD/" '{"is_votes_enabled":true}'
 call PATCH "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/" '{"description":"Smoke test"}'
 call POST "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/archive/"
 call DELETE "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/archive/"

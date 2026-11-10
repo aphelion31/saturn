@@ -15,6 +15,14 @@ use crate::common::*;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route(
+            "/api/workspaces/{slug}/projects/{project_id}/project-deploy-boards/",
+            get(get_board).post(create_board),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/project-deploy-boards/{board_id}/",
+            axum::routing::patch(update_board),
+        )
+        .route(
             "/api/users/me/workspaces/{slug}/projects/invitations/",
             axum::routing::post(join_projects),
         )
@@ -89,6 +97,81 @@ pub fn routes() -> Router<AppState> {
 }
 
 const LABEL_JSON: &str = "jsonb_build_object('id', id, 'name', name, 'color', color, 'parent', parent_id, 'project_id', project_id, 'workspace_id', workspace_id, 'sort_order', sort_order)";
+
+const BOARD_JSON: &str = "(to_jsonb(d)-'workspace_id'-'project_id'-'intake_id'-'created_by_id'-'updated_by_id') || jsonb_build_object('workspace',d.workspace_id,'project',d.project_id,'intake',d.intake_id,'created_by',d.created_by_id,'updated_by',d.updated_by_id,'project_details',jsonb_build_object('id',p.id,'name',p.name,'identifier',p.identifier,'description',p.description,'cover_image',p.cover_image,'cover_image_url',p.cover_image,'logo_props',p.logo_props),'workspace_detail',jsonb_build_object('id',w.id,'name',w.name,'slug',w.slug))";
+
+async fn get_board(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let sql = format!(
+        "SELECT {BOARD_JSON} FROM deploy_boards d JOIN projects p ON p.id=d.project_id AND p.workspace_id=d.workspace_id JOIN workspaces w ON w.id=d.workspace_id WHERE d.workspace_id=$1 AND d.project_id=$2 AND d.entity_name='project' AND d.entity_identifier=$2 AND d.deleted_at IS NULL"
+    );
+    let row: Option<Value> = sqlx::query_scalar(&sql)
+        .bind(p.workspace_id())
+        .bind(project)
+        .fetch_optional(&st.db)
+        .await?;
+    Ok(Json(row.unwrap_or_else(|| json!({}))))
+}
+
+async fn create_board(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let intake = uuid_of(&b, "intake");
+    if b.get("intake").is_some_and(|x| !x.is_null()) && intake.is_none() {
+        return Err(ApiError::bad("Invalid intake"));
+    }
+    if let Some(id) = intake {
+        let valid:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM intakes WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL)").bind(id).bind(project).bind(p.workspace_id()).fetch_one(&st.db).await?;
+        if !valid {
+            return Err(ApiError::bad("Invalid intake"));
+        }
+    }
+    let views = b
+        .get("views")
+        .cloned()
+        .unwrap_or_else(|| json!({"list":true,"kanban":true,"calendar":true,"gantt":true,"spreadsheet":true}));
+    sqlx::query("INSERT INTO deploy_boards (workspace_id,project_id,entity_identifier,entity_name,anchor,intake_id,view_props,is_comments_enabled,is_reactions_enabled,is_votes_enabled,created_by_id,updated_by_id) VALUES ($1,$2,$2,'project',replace(gen_random_uuid()::text,'-',''),$3,$4,$5,$6,$7,$8,$8) ON CONFLICT (entity_name,entity_identifier) WHERE deleted_at IS NULL DO UPDATE SET intake_id=EXCLUDED.intake_id,view_props=EXCLUDED.view_props,is_comments_enabled=EXCLUDED.is_comments_enabled,is_reactions_enabled=EXCLUDED.is_reactions_enabled,is_votes_enabled=EXCLUDED.is_votes_enabled,updated_by_id=EXCLUDED.updated_by_id,updated_at=now() WHERE deploy_boards.workspace_id=EXCLUDED.workspace_id AND deploy_boards.project_id=EXCLUDED.project_id").bind(p.workspace_id()).bind(project).bind(intake).bind(views).bind(b.get("is_comments_enabled").and_then(Value::as_bool).unwrap_or(false)).bind(b.get("is_reactions_enabled").and_then(Value::as_bool).unwrap_or(false)).bind(b.get("is_votes_enabled").and_then(Value::as_bool).unwrap_or(false)).bind(user.id).execute(&st.db).await?;
+    get_board(State(st), user, Path((slug, project))).await
+}
+
+async fn update_board(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, id)): Path<(String, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    if b.get("intake").is_some() {
+        return Err(ApiError::bad("Use board creation to change intake"));
+    }
+    for key in [
+        "is_comments_enabled",
+        "is_reactions_enabled",
+        "is_votes_enabled",
+        "is_activity_enabled",
+        "is_disabled",
+    ] {
+        if b.get(key).is_some_and(|v| !v.is_boolean()) {
+            return Err(ApiError::bad(format!("Invalid {key}")));
+        }
+    }
+    let r=sqlx::query("UPDATE deploy_boards SET is_comments_enabled=COALESCE($4,is_comments_enabled),is_reactions_enabled=COALESCE($5,is_reactions_enabled),is_votes_enabled=COALESCE($6,is_votes_enabled),is_activity_enabled=COALESCE($7,is_activity_enabled),is_disabled=COALESCE($8,is_disabled),view_props=COALESCE($9,view_props),updated_by_id=$10,updated_at=now() WHERE workspace_id=$1 AND project_id=$2 AND id=$3 AND entity_name='project' AND entity_identifier=$2 AND deleted_at IS NULL").bind(p.workspace_id()).bind(project).bind(id).bind(b.get("is_comments_enabled").and_then(Value::as_bool)).bind(b.get("is_reactions_enabled").and_then(Value::as_bool)).bind(b.get("is_votes_enabled").and_then(Value::as_bool)).bind(b.get("is_activity_enabled").and_then(Value::as_bool)).bind(b.get("is_disabled").and_then(Value::as_bool)).bind(b.get("view_props")).bind(user.id).execute(&st.db).await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    get_board(State(st), user, Path((slug, project))).await
+}
 
 async fn join_projects(
     State(st): State<AppState>,
@@ -238,9 +321,7 @@ async fn update_member(
     } else {
         None
     };
-    let sql = format!(
-        "UPDATE project_members SET role=COALESCE($4,role),is_active=COALESCE($5,is_active),updated_by_id=$6,updated_at=now() WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL RETURNING to_jsonb(project_members)"
-    );
+    let sql = "UPDATE project_members SET role=COALESCE($4,role),is_active=COALESCE($5,is_active),updated_by_id=$6,updated_at=now() WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL RETURNING to_jsonb(project_members) - 'preferences' - 'view_props' - 'default_props'";
     json_row(
         sqlx::query_scalar(&sql)
             .bind(id)
