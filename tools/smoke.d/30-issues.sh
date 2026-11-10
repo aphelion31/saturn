@@ -4,3 +4,7 @@ call GET "/api/workspaces/$SLUG/projects/$PROJECT/issues/?group_by=state_id&sub_
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/issues/list/"
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/v2/issues/"
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/archived-issues/"
+call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/" '{"name":"Smoke issue"}'
+ISSUE=$(field "['id']")
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/"
+call DELETE "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/"
