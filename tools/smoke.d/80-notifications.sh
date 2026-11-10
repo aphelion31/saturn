@@ -19,3 +19,34 @@ if [ -n "$ISSUE_ID" ]; then
   call DELETE "/api/workspaces/$SLUG/users/notifications/$NOTIF_ID/archive/"
   call DELETE "/api/workspaces/$SLUG/users/notifications/$NOTIF_ID/"
 fi
+
+# User Notification Preferences
+call GET "/api/users/me/notification-preferences/"
+call PATCH "/api/users/me/notification-preferences/" '{"mention":false}'
+
+# Stickies
+call POST "/api/workspaces/$SLUG/stickies/" '{"name":"Smoke Sticky","description_html":"<p>Sticky note</p>"}'
+STICKY_ID=$(field "['id']")
+call GET "/api/workspaces/$SLUG/stickies/"
+call GET "/api/workspaces/$SLUG/stickies/$STICKY_ID/"
+call PATCH "/api/workspaces/$SLUG/stickies/$STICKY_ID/" '{"name":"Updated Sticky"}'
+call DELETE "/api/workspaces/$SLUG/stickies/$STICKY_ID/"
+
+# Quick Links
+call POST "/api/workspaces/$SLUG/quick-links/" '{"title":"Test Link","url":"https://example.com"}'
+LINK_ID=$(field "['id']")
+call GET "/api/workspaces/$SLUG/quick-links/"
+call GET "/api/workspaces/$SLUG/quick-links/$LINK_ID/"
+call PATCH "/api/workspaces/$SLUG/quick-links/$LINK_ID/" '{"title":"Updated Link"}'
+call DELETE "/api/workspaces/$SLUG/quick-links/$LINK_ID/"
+
+# Recent Visits
+psql "${DATABASE_URL:-postgres://localhost/saturn}" -qc "
+  INSERT INTO user_recent_visits (id, created_at, updated_at, workspace_id, user_id, entity_name, entity_identifier, visited_at)
+  VALUES (gen_random_uuid(), now(), now(), '$WS_ID', '$USER_ID', 'project', '$PROJECT', now());
+"
+call GET "/api/workspaces/$SLUG/recent-visits/"
+call GET "/api/workspaces/$SLUG/recent-visits/?entity_name=project"
+
+# Timezones
+call GET "/api/timezones/"
