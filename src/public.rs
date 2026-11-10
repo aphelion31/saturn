@@ -6,8 +6,10 @@ use std::collections::HashMap;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    routing::get,
+    http::StatusCode,
+    routing::{delete, get, patch, post},
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -30,6 +32,40 @@ pub fn routes() -> Router<AppState> {
         .route("/api/public/anchor/{anchor}/modules/", get(modules))
         // Issues list
         .route("/api/public/anchor/{anchor}/issues/", get(issues_list))
+        // Issue detail
+        .route("/api/public/anchor/{anchor}/issues/{issue_id}/", get(issue_detail))
+        // Comments CRUD
+        .route(
+            "/api/public/anchor/{anchor}/issues/{issue_id}/comments/",
+            get(comments_list).post(comment_create),
+        )
+        .route(
+            "/api/public/anchor/{anchor}/issues/{issue_id}/comments/{pk}/",
+            get(comment_retrieve).patch(comment_update).delete(comment_destroy),
+        )
+        // Issue reactions
+        .route(
+            "/api/public/anchor/{anchor}/issues/{issue_id}/reactions/",
+            get(issue_reactions_list).post(issue_reaction_create),
+        )
+        .route(
+            "/api/public/anchor/{anchor}/issues/{issue_id}/reactions/{reaction_code}/",
+            delete(issue_reaction_destroy),
+        )
+        // Comment reactions
+        .route(
+            "/api/public/anchor/{anchor}/comments/{comment_id}/reactions/",
+            get(comment_reactions_list).post(comment_reaction_create),
+        )
+        .route(
+            "/api/public/anchor/{anchor}/comments/{comment_id}/reactions/{reaction_code}/",
+            delete(comment_reaction_destroy),
+        )
+        // Issue votes
+        .route(
+            "/api/public/anchor/{anchor}/issues/{issue_id}/votes/",
+            get(issue_votes_list).post(issue_vote_create).delete(issue_vote_destroy),
+        )
         // Workspace project anchor reverse-lookup
         .route(
             "/api/public/workspaces/{slug}/projects/{project_id}/anchor/",
@@ -77,6 +113,23 @@ pub async fn require_anchor(db: &sqlx::PgPool, anchor: &str) -> Result<BoardCtx,
     .fetch_optional(db)
     .await?
     .ok_or_else(ApiError::not_found)
+}
+
+/// Check that an issue exists in board scope (not deleted, archived, or draft; not triage state).
+async fn issue_in_board_scope(db: &sqlx::PgPool, b: &BoardCtx, issue_id: Uuid) -> Result<bool, ApiError> {
+    let exists: (bool,) = sqlx::query_as(&format!(
+        "SELECT EXISTS (
+            SELECT 1 FROM issues i
+            WHERE i.id = $1 AND i.project_id = $2 AND i.workspace_id = $3
+              AND {ACTIVE}
+        )"
+    ))
+    .bind(issue_id)
+    .bind(b.project_id)
+    .bind(b.workspace_id)
+    .fetch_one(db)
+    .await?;
+    Ok(exists.0)
 }
 
 /// GET /api/public/anchor/{anchor}/settings/
@@ -310,6 +363,820 @@ async fn issues_list(
     workitems::list(&st.db, base, &q, Scope::Project(b.project_id)).await
 }
 
+/// GET /api/public/anchor/{anchor}/issues/{issue_id}/
+async fn issue_detail(
+    State(st): State<AppState>,
+    _user: MaybeUser,
+    Path((anchor, issue_id)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let b = require_anchor(&st.db, &anchor).await?;
+
+    let row: Option<(Value,)> = sqlx::query_as(&format!(
+        "SELECT jsonb_build_object(
+            'id', i.id,
+            'name', i.name,
+            'state_id', i.state_id,
+            'sort_order', i.sort_order,
+            'description_json', i.description_json,
+            'description_html', i.description_html,
+            'description_stripped', i.description_stripped,
+            'description_binary', i.description_binary,
+            'estimate_point', i.estimate_point_id,
+            'priority', i.priority,
+            'start_date', i.start_date,
+            'target_date', i.target_date,
+            'sequence_id', i.sequence_id,
+            'project_id', i.project_id,
+            'parent_id', i.parent_id,
+            'created_by', i.created_by_id,
+            'state__group', (SELECT s.group FROM states s WHERE s.id = i.state_id),
+            'cycle_id', (SELECT ci.cycle_id FROM cycle_issues ci WHERE ci.issue_id = i.id AND ci.deleted_at IS NULL LIMIT 1),
+            'assignee_ids', COALESCE((SELECT jsonb_agg(a.assignee_id) FROM issue_assignees a JOIN users u ON u.id = a.assignee_id
+                                      WHERE a.issue_id = i.id AND a.deleted_at IS NULL AND u.is_active), '[]'::jsonb),
+            'label_ids', COALESCE((SELECT jsonb_agg(l.label_id) FROM issue_labels l WHERE l.issue_id = i.id AND l.deleted_at IS NULL),
+                                  '[]'::jsonb),
+            'module_ids', COALESCE((SELECT jsonb_agg(m.module_id) FROM module_issues m JOIN modules mod ON mod.id = m.module_id
+                                    WHERE m.issue_id = i.id AND m.deleted_at IS NULL AND mod.archived_at IS NULL),
+                                   '[]'::jsonb),
+            'vote_items', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                    'vote', v.vote,
+                    'actor_details', jsonb_build_object(
+                        'id', u.id,
+                        'first_name', u.first_name,
+                        'last_name', u.last_name,
+                        'avatar', u.avatar,
+                        'display_name', u.display_name
+                    )
+                ))
+                FROM issue_votes v
+                JOIN users u ON u.id = v.actor_id
+                WHERE v.issue_id = i.id AND v.deleted_at IS NULL
+            ), '[]'::jsonb),
+            'reaction_items', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                    'reaction', r.reaction,
+                    'actor_details', jsonb_build_object(
+                        'id', u.id,
+                        'first_name', u.first_name,
+                        'last_name', u.last_name,
+                        'avatar', u.avatar,
+                        'display_name', u.display_name
+                    )
+                ))
+                FROM issue_reactions r
+                JOIN users u ON u.id = r.actor_id
+                WHERE r.issue_id = i.id AND r.deleted_at IS NULL
+            ), '[]'::jsonb)
+        )
+        FROM issues i
+        WHERE i.id = $1 AND i.project_id = $2 AND i.workspace_id = $3
+          AND {ACTIVE}
+        LIMIT 1"
+    ))
+    .bind(issue_id)
+    .bind(b.project_id)
+    .bind(b.workspace_id)
+    .fetch_optional(&st.db)
+    .await?;
+
+    let (val,) = row.ok_or_else(ApiError::not_found)?;
+    Ok(Json(val))
+}
+
+/// GET /api/public/anchor/{anchor}/issues/{issue_id}/comments/
+async fn comments_list(
+    State(st): State<AppState>,
+    user: MaybeUser,
+    Path((anchor, issue_id)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let b = require_anchor(&st.db, &anchor).await?;
+    if !b.is_comments_enabled {
+        return Ok(Json(json!([])));
+    }
+    let current_user_id = user.0.map(|u| u.id).unwrap_or(Uuid::nil());
+
+    let rows: Vec<Value> = sqlx::query_scalar(
+        "SELECT COALESCE(jsonb_agg(jsonb_build_object(
+            'id', c.id,
+            'comment_html', c.comment_html,
+            'comment_json', c.comment_json,
+            'comment_stripped', c.comment_stripped,
+            'attachments', c.attachments,
+            'access', c.access,
+            'created_at', c.created_at,
+            'updated_at', c.updated_at,
+            'created_by', c.created_by_id,
+            'updated_by', c.updated_by_id,
+            'actor', c.actor_id,
+            'issue', c.issue_id,
+            'project', c.project_id,
+            'workspace', c.workspace_id,
+            'actor_detail', jsonb_build_object(
+                'id', u.id,
+                'first_name', u.first_name,
+                'last_name', u.last_name,
+                'avatar', u.avatar,
+                'display_name', u.display_name
+            ),
+            'is_member', EXISTS(
+                SELECT 1 FROM project_members pm
+                WHERE pm.project_id = c.project_id AND pm.workspace_id = c.workspace_id
+                  AND pm.member_id = $4 AND pm.is_active = true
+            ),
+            'comment_reactions', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                    'id', cr.id,
+                    'actor', cr.actor_id,
+                    'comment', cr.comment_id,
+                    'reaction', cr.reaction,
+                    'display_name', ru.display_name,
+                    'workspace', cr.workspace_id,
+                    'project', cr.project_id,
+                    'created_at', cr.created_at,
+                    'updated_at', cr.updated_at
+                ) ORDER BY cr.created_at)
+                FROM comment_reactions cr
+                JOIN users ru ON ru.id = cr.actor_id
+                WHERE cr.comment_id = c.id AND cr.deleted_at IS NULL
+            ), '[]'::jsonb)
+        ) ORDER BY c.created_at), '[]'::jsonb)
+        FROM issue_comments c
+        LEFT JOIN users u ON u.id = c.actor_id
+        WHERE c.issue_id = $1 AND c.project_id = $2 AND c.workspace_id = $3
+          AND c.access = 'EXTERNAL' AND c.deleted_at IS NULL",
+    )
+    .bind(issue_id)
+    .bind(b.project_id)
+    .bind(b.workspace_id)
+    .bind(current_user_id)
+    .fetch_one(&st.db)
+    .await?;
+
+    Ok(Json(rows.into_iter().next().unwrap_or_else(|| json!([]))))
+}
+
+#[derive(Deserialize)]
+struct CommentIn {
+    comment_html: Option<String>,
+    comment_json: Option<Value>,
+}
+
+/// POST /api/public/anchor/{anchor}/issues/{issue_id}/comments/
+async fn comment_create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((anchor, issue_id)): Path<(String, Uuid)>,
+    Json(body): Json<CommentIn>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let b = require_anchor(&st.db, &anchor).await?;
+    if !b.is_comments_enabled {
+        return Err(ApiError::bad("Comments are not enabled for this project"));
+    }
+    if !issue_in_board_scope(&st.db, &b, issue_id).await? {
+        return Err(ApiError::not_found());
+    }
+
+    let id = Uuid::new_v4();
+    let comment_html = body.comment_html.unwrap_or_else(|| "<p></p>".to_string());
+    let comment_json = body.comment_json.unwrap_or_else(|| json!({}));
+    let comment_stripped = html_to_stripped(&comment_html);
+
+    let row: (Value,) = sqlx::query_as(
+        "WITH ins AS (
+            INSERT INTO issue_comments (
+                id, created_at, updated_at, comment_stripped, attachments,
+                created_by_id, updated_by_id, issue_id, project_id, workspace_id,
+                actor_id, comment_html, comment_json, access
+            )
+            VALUES ($1, now(), now(), $2, '{}', $3, $3, $4, $5, $6, $3, $7, $8, 'EXTERNAL')
+            RETURNING *
+        )
+        SELECT jsonb_build_object(
+            'id', ins.id,
+            'comment_html', ins.comment_html,
+            'comment_json', ins.comment_json,
+            'comment_stripped', ins.comment_stripped,
+            'attachments', ins.attachments,
+            'access', ins.access,
+            'created_at', ins.created_at,
+            'updated_at', ins.updated_at,
+            'created_by', ins.created_by_id,
+            'updated_by', ins.updated_by_id,
+            'actor', ins.actor_id,
+            'issue', ins.issue_id,
+            'project', ins.project_id,
+            'workspace', ins.workspace_id,
+            'actor_detail', jsonb_build_object(
+                'id', u.id,
+                'first_name', u.first_name,
+                'last_name', u.last_name,
+                'avatar', u.avatar,
+                'display_name', u.display_name
+            ),
+            'comment_reactions', '[]'::jsonb
+        )
+        FROM ins
+        JOIN users u ON u.id = ins.actor_id",
+    )
+    .bind(id)
+    .bind(&comment_stripped)
+    .bind(user.id)
+    .bind(issue_id)
+    .bind(b.project_id)
+    .bind(b.workspace_id)
+    .bind(&comment_html)
+    .bind(&comment_json)
+    .fetch_one(&st.db)
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(row.0)))
+}
+
+/// GET /api/public/anchor/{anchor}/issues/{issue_id}/comments/{pk}/
+async fn comment_retrieve(
+    State(st): State<AppState>,
+    user: MaybeUser,
+    Path((anchor, issue_id, pk)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult {
+    let b = require_anchor(&st.db, &anchor).await?;
+    let current_user_id = user.0.map(|u| u.id).unwrap_or(Uuid::nil());
+
+    let row: Option<(Value,)> = sqlx::query_as(
+        "SELECT jsonb_build_object(
+            'id', c.id,
+            'comment_html', c.comment_html,
+            'comment_json', c.comment_json,
+            'comment_stripped', c.comment_stripped,
+            'attachments', c.attachments,
+            'access', c.access,
+            'created_at', c.created_at,
+            'updated_at', c.updated_at,
+            'created_by', c.created_by_id,
+            'updated_by', c.updated_by_id,
+            'actor', c.actor_id,
+            'issue', c.issue_id,
+            'project', c.project_id,
+            'workspace', c.workspace_id,
+            'actor_detail', jsonb_build_object(
+                'id', u.id,
+                'first_name', u.first_name,
+                'last_name', u.last_name,
+                'avatar', u.avatar,
+                'display_name', u.display_name
+            ),
+            'is_member', EXISTS(
+                SELECT 1 FROM project_members pm
+                WHERE pm.project_id = c.project_id AND pm.workspace_id = c.workspace_id
+                  AND pm.member_id = $4 AND pm.is_active = true
+            ),
+            'comment_reactions', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                    'id', cr.id,
+                    'actor', cr.actor_id,
+                    'comment', cr.comment_id,
+                    'reaction', cr.reaction,
+                    'display_name', ru.display_name,
+                    'workspace', cr.workspace_id,
+                    'project', cr.project_id,
+                    'created_at', cr.created_at,
+                    'updated_at', cr.updated_at
+                ) ORDER BY cr.created_at)
+                FROM comment_reactions cr
+                JOIN users ru ON ru.id = cr.actor_id
+                WHERE cr.comment_id = c.id AND cr.deleted_at IS NULL
+            ), '[]'::jsonb)
+        )
+        FROM issue_comments c
+        LEFT JOIN users u ON u.id = c.actor_id
+        WHERE c.id = $1 AND c.issue_id = $2 AND c.project_id = $3
+          AND c.access = 'EXTERNAL' AND c.deleted_at IS NULL
+        LIMIT 1",
+    )
+    .bind(pk)
+    .bind(issue_id)
+    .bind(b.project_id)
+    .bind(current_user_id)
+    .fetch_optional(&st.db)
+    .await?;
+
+    let (val,) = row.ok_or_else(ApiError::not_found)?;
+    Ok(Json(val))
+}
+
+/// PATCH /api/public/anchor/{anchor}/issues/{issue_id}/comments/{pk}/
+async fn comment_update(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((anchor, issue_id, pk)): Path<(String, Uuid, Uuid)>,
+    Json(body): Json<CommentIn>,
+) -> ApiResult {
+    let b = require_anchor(&st.db, &anchor).await?;
+    if !b.is_comments_enabled {
+        return Err(ApiError::bad("Comments are not enabled for this project"));
+    }
+
+    let existing: Option<(Option<String>, Option<Value>)> = sqlx::query_as(
+        "SELECT comment_html, comment_json FROM issue_comments
+         WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $4
+           AND access = 'EXTERNAL' AND actor_id = $5 AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(issue_id)
+    .bind(b.project_id)
+    .bind(b.workspace_id)
+    .bind(user.id)
+    .fetch_optional(&st.db)
+    .await?;
+
+    let (old_html, old_json) = existing.ok_or_else(ApiError::not_found)?;
+    let new_html = body.comment_html.or(old_html).unwrap_or_else(|| "<p></p>".to_string());
+    let new_json = body.comment_json.or(old_json).unwrap_or_else(|| json!({}));
+    let new_stripped = html_to_stripped(&new_html);
+
+    let row: (Value,) = sqlx::query_as(
+        "WITH upd AS (
+            UPDATE issue_comments
+            SET comment_html = $1, comment_json = $2, comment_stripped = $3,
+                updated_at = now(), updated_by_id = $4
+            WHERE id = $5 AND issue_id = $6 AND project_id = $7 AND workspace_id = $8
+              AND access = 'EXTERNAL' AND actor_id = $4 AND deleted_at IS NULL
+            RETURNING *
+        )
+        SELECT jsonb_build_object(
+            'id', upd.id,
+            'comment_html', upd.comment_html,
+            'comment_json', upd.comment_json,
+            'comment_stripped', upd.comment_stripped,
+            'attachments', upd.attachments,
+            'access', upd.access,
+            'created_at', upd.created_at,
+            'updated_at', upd.updated_at,
+            'created_by', upd.created_by_id,
+            'updated_by', upd.updated_by_id,
+            'actor', upd.actor_id,
+            'issue', upd.issue_id,
+            'project', upd.project_id,
+            'workspace', upd.workspace_id,
+            'actor_detail', jsonb_build_object(
+                'id', u.id,
+                'first_name', u.first_name,
+                'last_name', u.last_name,
+                'avatar', u.avatar,
+                'display_name', u.display_name
+            )
+        )
+        FROM upd
+        JOIN users u ON u.id = upd.actor_id",
+    )
+    .bind(&new_html)
+    .bind(&new_json)
+    .bind(&new_stripped)
+    .bind(user.id)
+    .bind(pk)
+    .bind(issue_id)
+    .bind(b.project_id)
+    .bind(b.workspace_id)
+    .fetch_one(&st.db)
+    .await?;
+
+    Ok(Json(row.0))
+}
+
+/// DELETE /api/public/anchor/{anchor}/issues/{issue_id}/comments/{pk}/
+async fn comment_destroy(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((anchor, issue_id, pk)): Path<(String, Uuid, Uuid)>,
+) -> Result<StatusCode, ApiError> {
+    let b = require_anchor(&st.db, &anchor).await?;
+    if !b.is_comments_enabled {
+        return Err(ApiError::bad("Comments are not enabled for this project"));
+    }
+
+    let res = sqlx::query(
+        "UPDATE issue_comments
+         SET deleted_at = now()
+         WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $4
+           AND access = 'EXTERNAL' AND actor_id = $5 AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(issue_id)
+    .bind(b.project_id)
+    .bind(b.workspace_id)
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
+
+    if res.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET /api/public/anchor/{anchor}/issues/{issue_id}/reactions/
+async fn issue_reactions_list(
+    State(st): State<AppState>,
+    _user: MaybeUser,
+    Path((anchor, issue_id)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let b = require_anchor(&st.db, &anchor).await?;
+    if !b.is_reactions_enabled {
+        return Ok(Json(json!([])));
+    }
+
+    let rows: Vec<Value> = sqlx::query_scalar(
+        "SELECT COALESCE(jsonb_agg(jsonb_build_object(
+            'id', r.id,
+            'actor', r.actor_id,
+            'issue', r.issue_id,
+            'reaction', r.reaction,
+            'project', r.project_id,
+            'workspace', r.workspace_id,
+            'created_at', r.created_at,
+            'updated_at', r.updated_at,
+            'actor_detail', jsonb_build_object(
+                'id', u.id,
+                'first_name', u.first_name,
+                'last_name', u.last_name,
+                'avatar', u.avatar,
+                'display_name', u.display_name
+            )
+        ) ORDER BY r.created_at DESC), '[]'::jsonb)
+        FROM issue_reactions r
+        JOIN users u ON u.id = r.actor_id
+        WHERE r.issue_id = $1 AND r.project_id = $2 AND r.workspace_id = $3
+          AND r.deleted_at IS NULL",
+    )
+    .bind(issue_id)
+    .bind(b.project_id)
+    .bind(b.workspace_id)
+    .fetch_one(&st.db)
+    .await?;
+
+    Ok(Json(rows.into_iter().next().unwrap_or_else(|| json!([]))))
+}
+
+#[derive(Deserialize)]
+struct ReactionIn {
+    reaction: String,
+}
+
+/// POST /api/public/anchor/{anchor}/issues/{issue_id}/reactions/
+async fn issue_reaction_create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((anchor, issue_id)): Path<(String, Uuid)>,
+    Json(body): Json<ReactionIn>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let b = require_anchor(&st.db, &anchor).await?;
+    if !b.is_reactions_enabled {
+        return Err(ApiError::bad("Reactions are not enabled for this project board"));
+    }
+    if !issue_in_board_scope(&st.db, &b, issue_id).await? {
+        return Err(ApiError::not_found());
+    }
+
+    let id = Uuid::new_v4();
+    let row: (Value,) = sqlx::query_as(
+        "WITH ins AS (
+            INSERT INTO issue_reactions (
+                id, created_at, updated_at, reaction, actor_id, created_by_id,
+                issue_id, project_id, updated_by_id, workspace_id
+            )
+            VALUES ($1, now(), now(), $2, $3, $3, $4, $5, $3, $6)
+            RETURNING *
+        )
+        SELECT jsonb_build_object(
+            'id', ins.id,
+            'actor', ins.actor_id,
+            'issue', ins.issue_id,
+            'reaction', ins.reaction,
+            'project', ins.project_id,
+            'workspace', ins.workspace_id,
+            'created_at', ins.created_at,
+            'updated_at', ins.updated_at,
+            'actor_detail', jsonb_build_object(
+                'id', u.id,
+                'first_name', u.first_name,
+                'last_name', u.last_name,
+                'avatar', u.avatar,
+                'display_name', u.display_name
+            )
+        )
+        FROM ins
+        JOIN users u ON u.id = ins.actor_id",
+    )
+    .bind(id)
+    .bind(&body.reaction)
+    .bind(user.id)
+    .bind(issue_id)
+    .bind(b.project_id)
+    .bind(b.workspace_id)
+    .fetch_one(&st.db)
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(row.0)))
+}
+
+/// DELETE /api/public/anchor/{anchor}/issues/{issue_id}/reactions/{reaction_code}/
+async fn issue_reaction_destroy(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((anchor, issue_id, reaction_code)): Path<(String, Uuid, String)>,
+) -> Result<StatusCode, ApiError> {
+    let b = require_anchor(&st.db, &anchor).await?;
+    if !b.is_reactions_enabled {
+        return Err(ApiError::bad("Reactions are not enabled for this project board"));
+    }
+
+    let res = sqlx::query(
+        "UPDATE issue_reactions
+         SET deleted_at = now()
+         WHERE issue_id = $1 AND reaction = $2 AND actor_id = $3
+           AND project_id = $4 AND workspace_id = $5 AND deleted_at IS NULL",
+    )
+    .bind(issue_id)
+    .bind(&reaction_code)
+    .bind(user.id)
+    .bind(b.project_id)
+    .bind(b.workspace_id)
+    .execute(&st.db)
+    .await?;
+
+    if res.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET /api/public/anchor/{anchor}/comments/{comment_id}/reactions/
+async fn comment_reactions_list(
+    State(st): State<AppState>,
+    _user: MaybeUser,
+    Path((anchor, comment_id)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let b = require_anchor(&st.db, &anchor).await?;
+    if !b.is_reactions_enabled {
+        return Ok(Json(json!([])));
+    }
+
+    let rows: Vec<Value> = sqlx::query_scalar(
+        "SELECT COALESCE(jsonb_agg(jsonb_build_object(
+            'id', cr.id,
+            'actor', cr.actor_id,
+            'comment', cr.comment_id,
+            'reaction', cr.reaction,
+            'display_name', u.display_name,
+            'project', cr.project_id,
+            'workspace', cr.workspace_id,
+            'created_at', cr.created_at,
+            'updated_at', cr.updated_at
+        ) ORDER BY cr.created_at DESC), '[]'::jsonb)
+        FROM comment_reactions cr
+        JOIN users u ON u.id = cr.actor_id
+        JOIN issue_comments c ON c.id = cr.comment_id
+        WHERE cr.comment_id = $1 AND cr.project_id = $2 AND cr.workspace_id = $3
+          AND c.access = 'EXTERNAL' AND cr.deleted_at IS NULL",
+    )
+    .bind(comment_id)
+    .bind(b.project_id)
+    .bind(b.workspace_id)
+    .fetch_one(&st.db)
+    .await?;
+
+    Ok(Json(rows.into_iter().next().unwrap_or_else(|| json!([]))))
+}
+
+/// POST /api/public/anchor/{anchor}/comments/{comment_id}/reactions/
+async fn comment_reaction_create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((anchor, comment_id)): Path<(String, Uuid)>,
+    Json(body): Json<ReactionIn>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let b = require_anchor(&st.db, &anchor).await?;
+    if !b.is_reactions_enabled {
+        return Err(ApiError::bad("Reactions are not enabled for this board"));
+    }
+
+    // Verify comment is external and bound to board project
+    let comment_ok: (bool,) = sqlx::query_as(
+        "SELECT EXISTS (
+            SELECT 1 FROM issue_comments
+            WHERE id = $1 AND project_id = $2 AND workspace_id = $3
+              AND access = 'EXTERNAL' AND deleted_at IS NULL
+        )",
+    )
+    .bind(comment_id)
+    .bind(b.project_id)
+    .bind(b.workspace_id)
+    .fetch_one(&st.db)
+    .await?;
+
+    if !comment_ok.0 {
+        return Err(ApiError::not_found());
+    }
+
+    let id = Uuid::new_v4();
+    let row: (Value,) = sqlx::query_as(
+        "WITH ins AS (
+            INSERT INTO comment_reactions (
+                id, created_at, updated_at, reaction, actor_id, created_by_id,
+                comment_id, project_id, updated_by_id, workspace_id
+            )
+            VALUES ($1, now(), now(), $2, $3, $3, $4, $5, $3, $6)
+            RETURNING *
+        )
+        SELECT jsonb_build_object(
+            'id', ins.id,
+            'actor', ins.actor_id,
+            'comment', ins.comment_id,
+            'reaction', ins.reaction,
+            'display_name', u.display_name,
+            'workspace', ins.workspace_id,
+            'project', ins.project_id,
+            'created_at', ins.created_at,
+            'updated_at', ins.updated_at
+        )
+        FROM ins
+        JOIN users u ON u.id = ins.actor_id",
+    )
+    .bind(id)
+    .bind(&body.reaction)
+    .bind(user.id)
+    .bind(comment_id)
+    .bind(b.project_id)
+    .bind(b.workspace_id)
+    .fetch_one(&st.db)
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(row.0)))
+}
+
+/// DELETE /api/public/anchor/{anchor}/comments/{comment_id}/reactions/{reaction_code}/
+async fn comment_reaction_destroy(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((anchor, comment_id, reaction_code)): Path<(String, Uuid, String)>,
+) -> Result<StatusCode, ApiError> {
+    let b = require_anchor(&st.db, &anchor).await?;
+    if !b.is_reactions_enabled {
+        return Err(ApiError::bad("Reactions are not enabled for this board"));
+    }
+
+    let res = sqlx::query(
+        "UPDATE comment_reactions cr
+         SET deleted_at = now()
+         FROM issue_comments c
+         WHERE cr.comment_id = c.id AND cr.comment_id = $1 AND cr.reaction = $2 AND cr.actor_id = $3
+           AND cr.project_id = $4 AND cr.workspace_id = $5 AND c.access = 'EXTERNAL'
+           AND cr.deleted_at IS NULL",
+    )
+    .bind(comment_id)
+    .bind(&reaction_code)
+    .bind(user.id)
+    .bind(b.project_id)
+    .bind(b.workspace_id)
+    .execute(&st.db)
+    .await?;
+
+    if res.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET /api/public/anchor/{anchor}/issues/{issue_id}/votes/
+async fn issue_votes_list(
+    State(st): State<AppState>,
+    _user: MaybeUser,
+    Path((anchor, issue_id)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let b = require_anchor(&st.db, &anchor).await?;
+    if !b.is_votes_enabled {
+        return Ok(Json(json!([])));
+    }
+
+    let rows: Vec<Value> = sqlx::query_scalar(
+        "SELECT COALESCE(jsonb_agg(jsonb_build_object(
+            'issue', v.issue_id,
+            'vote', v.vote,
+            'workspace', v.workspace_id,
+            'project', v.project_id,
+            'actor', v.actor_id,
+            'actor_detail', jsonb_build_object(
+                'id', u.id,
+                'first_name', u.first_name,
+                'last_name', u.last_name,
+                'avatar', u.avatar,
+                'display_name', u.display_name
+            )
+        ) ORDER BY v.created_at DESC), '[]'::jsonb)
+        FROM issue_votes v
+        JOIN users u ON u.id = v.actor_id
+        WHERE v.issue_id = $1 AND v.project_id = $2 AND v.workspace_id = $3
+          AND v.deleted_at IS NULL",
+    )
+    .bind(issue_id)
+    .bind(b.project_id)
+    .bind(b.workspace_id)
+    .fetch_one(&st.db)
+    .await?;
+
+    Ok(Json(rows.into_iter().next().unwrap_or_else(|| json!([]))))
+}
+
+#[derive(Deserialize)]
+struct VoteIn {
+    vote: Option<i32>,
+}
+
+/// POST /api/public/anchor/{anchor}/issues/{issue_id}/votes/
+async fn issue_vote_create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((anchor, issue_id)): Path<(String, Uuid)>,
+    Json(body): Json<VoteIn>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let b = require_anchor(&st.db, &anchor).await?;
+    if !b.is_votes_enabled {
+        return Err(ApiError::bad("Votes are not enabled for this project board"));
+    }
+    if !issue_in_board_scope(&st.db, &b, issue_id).await? {
+        return Err(ApiError::not_found());
+    }
+
+    let vote_val = body.vote.unwrap_or(1);
+    let id = Uuid::new_v4();
+
+    let row: (Value,) = sqlx::query_as(
+        "WITH ins AS (
+            INSERT INTO issue_votes (
+                id, created_at, updated_at, vote, actor_id, created_by_id,
+                issue_id, project_id, updated_by_id, workspace_id
+            )
+            VALUES ($1, now(), now(), $2, $3, $3, $4, $5, $3, $6)
+            ON CONFLICT (issue_id, actor_id) DO UPDATE
+            SET vote = EXCLUDED.vote, updated_at = now(), deleted_at = NULL
+            RETURNING *
+        )
+        SELECT jsonb_build_object(
+            'issue', ins.issue_id,
+            'vote', ins.vote,
+            'workspace', ins.workspace_id,
+            'project', ins.project_id,
+            'actor', ins.actor_id,
+            'actor_detail', jsonb_build_object(
+                'id', u.id,
+                'first_name', u.first_name,
+                'last_name', u.last_name,
+                'avatar', u.avatar,
+                'display_name', u.display_name
+            )
+        )
+        FROM ins
+        JOIN users u ON u.id = ins.actor_id",
+    )
+    .bind(id)
+    .bind(vote_val)
+    .bind(user.id)
+    .bind(issue_id)
+    .bind(b.project_id)
+    .bind(b.workspace_id)
+    .fetch_one(&st.db)
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(row.0)))
+}
+
+/// DELETE /api/public/anchor/{anchor}/issues/{issue_id}/votes/
+async fn issue_vote_destroy(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((anchor, issue_id)): Path<(String, Uuid)>,
+) -> Result<StatusCode, ApiError> {
+    let b = require_anchor(&st.db, &anchor).await?;
+
+    let res = sqlx::query(
+        "UPDATE issue_votes
+         SET deleted_at = now()
+         WHERE issue_id = $1 AND actor_id = $2
+           AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
+    )
+    .bind(issue_id)
+    .bind(user.id)
+    .bind(b.project_id)
+    .bind(b.workspace_id)
+    .execute(&st.db)
+    .await?;
+
+    if res.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// GET /api/public/workspaces/{slug}/projects/{project_id}/anchor/
 async fn workspace_project_anchor(
     State(st): State<AppState>,
@@ -349,4 +1216,20 @@ async fn workspace_project_anchor(
 
     let (val,) = row.ok_or_else(ApiError::not_found)?;
     Ok(Json(val))
+}
+
+/// Strip basic HTML tags for `comment_stripped`.
+fn html_to_stripped(html: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for c in html.chars() {
+        if c == '<' {
+            in_tag = true;
+        } else if c == '>' {
+            in_tag = false;
+        } else if !in_tag {
+            out.push(c);
+        }
+    }
+    out
 }
