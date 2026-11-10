@@ -56,6 +56,9 @@ pub fn routes() -> Router<AppState> {
             patch(favorites_update).delete(favorites_delete),
         )
         .route("/api/workspaces/{slug}/user-favorites/{pk}/group/", get(favorite_group))
+        .route("/api/workspaces/{slug}/user-stats/{user_id}/", get(user_stats))
+        .route("/api/workspaces/{slug}/user-profile/{user_id}/", get(user_profile))
+        .route("/api/workspaces/{slug}/user-activity/{user_id}/", get(user_activity))
 }
 
 /// WorkSpaceSerializer fields, with `total_members` (active, non-bot) and `logo_url`.
@@ -1130,4 +1133,79 @@ async fn favorite_group(
         &st.db,
     )
     .await
+}
+
+// ---- user profile (step 5): stats, profile page, activity ----
+
+/// Plane `_visible_issues_q`, written for alias `i` on issues: caller must be an active project member,
+/// and guests see only issues they created unless the project enables guest_view_all_features.
+const VISIBLE_ISSUE: &str = "EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id = i.project_id AND pm.member_id = $1
+    AND pm.is_active AND pm.deleted_at IS NULL
+    AND (pm.role > 5 OR EXISTS (SELECT 1 FROM projects p WHERE p.id = i.project_id AND p.guest_view_all_features) OR i.created_by_id = $1))";
+
+/// Plane: issue counts for `user_id` as seen by the caller (WorkspaceUserProfileStatsEndpoint, core counters).
+async fn user_stats(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, target)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER, GUEST])?;
+    let counts: (i64, i64, i64, i64, i64) = sqlx::query_as(&format!(
+        "SELECT
+            count(*) FILTER (WHERE i.created_by_id = $2),
+            count(*) FILTER (WHERE EXISTS (SELECT 1 FROM issue_assignees a WHERE a.issue_id = i.id AND a.assignee_id = $2)),
+            count(*) FILTER (WHERE i.completed_at IS NOT NULL AND EXISTS (SELECT 1 FROM issue_assignees a WHERE a.issue_id = i.id AND a.assignee_id = $2)),
+            count(*) FILTER (WHERE s.\"group\" IN ('backlog','unstarted','started') AND EXISTS (SELECT 1 FROM issue_assignees a WHERE a.issue_id = i.id AND a.assignee_id = $2)),
+            count(*) FILTER (WHERE EXISTS (SELECT 1 FROM issue_subscribers sb WHERE sb.issue_id = i.id AND sb.subscriber_id = $2))
+         FROM issues i LEFT JOIN states s ON s.id = i.state_id
+         WHERE i.workspace_id = $3 AND i.deleted_at IS NULL AND i.archived_at IS NULL AND NOT i.is_draft AND {VISIBLE_ISSUE}"
+    ))
+    .bind(user.id)
+    .bind(target)
+    .bind(ws.workspace_id)
+    .fetch_one(&st.db)
+    .await?;
+    Ok(Json(json!({
+        "created_issues": counts.0,
+        "assigned_issues": counts.1,
+        "completed_issues": counts.2,
+        "pending_issues": counts.3,
+        "subscribed_issues": counts.4,
+    })))
+}
+
+/// Plane: profile page data for a workspace member. Requires the target to be an active member.
+async fn user_profile(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, target)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    let row: Option<Value> = sqlx::query_scalar(
+        "SELECT jsonb_build_object('email', u.email, 'first_name', u.first_name, 'last_name', u.last_name,
+            'avatar_url', NULLIF(u.avatar, ''), 'cover_image_url', u.cover_image, 'date_joined', u.date_joined)
+         FROM workspace_members m JOIN users u ON u.id = m.member_id
+         WHERE m.workspace_id = $1 AND m.member_id = $2 AND m.is_active AND m.deleted_at IS NULL",
+    )
+    .bind(ws.workspace_id)
+    .bind(target)
+    .fetch_optional(&st.db)
+    .await?;
+    let Some(user_data) = row else {
+        return Err(ApiError::not_found());
+    };
+    Ok(Json(json!({"project_data": [], "user_data": user_data})))
+}
+
+/// Plane: activity feed. Returned empty until the activity writer lands.
+// ponytail: issue_activities is not read here yet. Empty page is valid for the UI.
+async fn user_activity(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, _target)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER, GUEST])?;
+    Ok(Json(json!({"results": [], "count": 0, "next": null, "previous": null})))
 }
