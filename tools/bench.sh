@@ -58,9 +58,17 @@ SELECT i.id, i.created_by_id, i.project_id, i.workspace_id FROM issues i WHERE i
 ANALYZE;
 SQL
 }
-login() { # base cookiejar -> session cookie value
-  curl -s -o /dev/null -c "$2" -d "email=$EMAIL&password=$PASSWORD" "$1/auth/sign-in/"
-  awk '$6=="session-id"{print $7}' "$2"
+login() { # base cookiejar -> session cookie value (Plane needs Django's CSRF token; Saturn ignores it)
+  local csrf
+  csrf=$(curl -s -c "$2" "$1/auth/get-csrf-token/" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("csrf_token",""))
+except Exception: print("")')
+  curl -s -o /dev/null -b "$2" -c "$2" -H "Referer: $1/" \
+    --data-urlencode "csrfmiddlewaretoken=$csrf" --data-urlencode "email=$EMAIL" --data-urlencode "password=$PASSWORD" \
+    "$1/auth/sign-in/"
+  local cookie; cookie=$(awk '$6=="session-id"{print $7}' "$2")
+  [[ -n "$cookie" ]] || { log "login failed at $1"; exit 1; }
+  echo "$cookie"
 }
 load() { # name url cookie -> "rps p50 p99"
   oha -z "$DURATION" -c "$CONC" --no-tui -j -H "Cookie: session-id=$3" "$2" > "$OUT/$1.json"
