@@ -30,6 +30,31 @@ call POST "/api/workspaces/$SLUG/user-favorite-projects/" '{"project":"'"$PROJEC
 call DELETE "/api/workspaces/$SLUG/user-favorite-projects/$PROJECT/"
 call POST "/api/workspaces/$SLUG/projects/" '{"name":"Smoke project '$RANDOM'","identifier":"S'$RANDOM'"}'
 SMOKE_PROJECT=$(field "['id']")
+# Use a unique disposable workspace member with the seed user's password hash.
+SMOKE_USER=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -X -q -v ON_ERROR_STOP=1 -At -v email="$EMAIL" <<< "INSERT INTO users (email, username, password, display_name) SELECT gen_random_uuid()::text || '@smoke.invalid', gen_random_uuid()::text, password, 'Smoke member' FROM users WHERE email=:'email' RETURNING id")
+[[ -n "$SMOKE_USER" ]]
+SMOKE_EMAIL=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -X -v ON_ERROR_STOP=1 -At -v id="$SMOKE_USER" <<< "SELECT email FROM users WHERE id=:'id'::uuid")
+psql "${DATABASE_URL:-postgres://localhost/saturn}" -X -v ON_ERROR_STOP=1 -q -v id="$SMOKE_USER" -v slug="$SLUG" <<< "INSERT INTO workspace_members (workspace_id, member_id, role) SELECT id, :'id'::uuid, 15 FROM workspaces WHERE slug=:'slug'"
+MEMBER_JAR=$(mktemp)
+member_redirect=$(curl -s -o /dev/null -w '%{redirect_url}' -c "$MEMBER_JAR" -d "email=$SMOKE_EMAIL&password=$PASSWORD" "$BASE/auth/sign-in/")
+[[ "$member_redirect" != *error_code* ]]
+call POST "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/members/" '{"members":[{"member_id":"'"$SMOKE_USER"'","role":15}]}'
+MEMBERSHIP=$(field "[next(i for i,x in enumerate(d) if x['member']['id']=='$SMOKE_USER')]['id']")
+call PATCH "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/members/$MEMBERSHIP/" '{"role":5}'
+call PATCH "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/members/$MEMBERSHIP/" '{"role":15}'
+code=$(curl -s -o /dev/null -w '%{http_code}' -b "$MEMBER_JAR" -X PATCH -H 'content-type: application/json' -d '{"role":20}' "$BASE/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/members/$MEMBERSHIP/")
+[[ "$code" == 403 ]] || { echo "✖ member promotion -> $code, expected 403" >&2; exit 1; }
+echo "✔ member promotion rejected -> 403"
+INVITE=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -X -q -v ON_ERROR_STOP=1 -At -v project="$SMOKE_PROJECT" -v email="$SMOKE_EMAIL" <<< "INSERT INTO project_member_invites (workspace_id,project_id,email,token,role) SELECT workspace_id,id,:'email','smoke-valid-token',15 FROM projects WHERE id=:'project'::uuid RETURNING id")
+code=$(curl -s -o /dev/null -w '%{http_code}' -b "$MEMBER_JAR" -X POST -H 'content-type: application/json' -d '{"token":"wrong-token","accepted":true}' "$BASE/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/join/$INVITE/")
+[[ "$code" == 403 ]] || { echo "✖ invalid invite token -> $code, expected 403" >&2; exit 1; }
+echo "✔ invalid invite token rejected -> 403"
+code=$(curl -s -o /dev/null -w '%{http_code}' -b "$MEMBER_JAR" -X POST "$BASE/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/members/leave/")
+[[ "$code" == 204 ]] || { echo "✖ member leave -> $code, expected 204" >&2; exit 1; }
+echo "✔ member leave -> 204"
+call POST "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/members/" '{"members":[{"member_id":"'"$SMOKE_USER"'","role":15}]}'
+call DELETE "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/members/$MEMBERSHIP/"
+rm -f "$MEMBER_JAR"
 call GET "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/project-deploy-boards/"
 call POST "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/project-deploy-boards/" '{"is_comments_enabled":true}'
 BOARD=$(field "['id']")
