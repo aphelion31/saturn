@@ -68,6 +68,184 @@ pub fn routes() -> Router<AppState> {
             "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/",
             get(detail).patch(update).delete(destroy),
         )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/comments/",
+            get(comments).post(comment_create),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/comments/{comment_id}/",
+            get(comment_detail)
+                .patch(comment_update)
+                .put(comment_update)
+                .delete(comment_delete),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/history/",
+            get(history),
+        )
+}
+
+type IssuePath = (String, Uuid, Uuid);
+type CommentPath = (String, Uuid, Uuid, Uuid);
+
+async fn visible_issue(
+    st: &AppState,
+    user: &CurrentUser,
+    slug: &str,
+    project: Uuid,
+    issue: Uuid,
+) -> Result<ProjectCtx, ApiError> {
+    let p = require_project(&st.db, user, slug, project).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let owner: Option<Option<Uuid>> = sqlx::query_scalar(
+        "SELECT created_by_id FROM issues WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+    )
+    .bind(issue)
+    .bind(project)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?;
+    let owner = owner.ok_or_else(ApiError::not_found)?;
+    if p.restricted_guest() && owner != Some(user.id) {
+        return Err(ApiError::forbidden());
+    }
+    Ok(p)
+}
+
+// Serializer aliases use DRF's relation names rather than database column names.
+const COMMENT_JSON: &str = "(to_jsonb(c) - 'actor_id' - 'issue_id' - 'project_id' - 'workspace_id' - 'created_by_id' - 'updated_by_id' - 'description_id' - 'parent_id') || jsonb_build_object(
+ 'actor',c.actor_id,'issue',c.issue_id,'project',c.project_id,'workspace',c.workspace_id,'created_by',c.created_by_id,'updated_by',c.updated_by_id,'description',c.description_id,'parent',c.parent_id,
+ 'actor_detail',(SELECT jsonb_build_object('id',u.id,'first_name',u.first_name,'last_name',u.last_name,'avatar',u.avatar,'avatar_url',CASE WHEN u.avatar_asset_id IS NOT NULL THEN '/api/assets/v2/static/' || u.avatar_asset_id || '/' ELSE NULLIF(u.avatar,'') END,'is_bot',u.is_bot,'display_name',u.display_name) FROM users u WHERE u.id=c.actor_id),
+ 'issue_detail',(SELECT jsonb_build_object('id',i.id,'name',i.name,'description_json',i.description_json,'description_html',i.description_html,'priority',i.priority,'start_date',i.start_date,'target_date',i.target_date,'sequence_id',i.sequence_id,'sort_order',i.sort_order,'is_draft',i.is_draft) FROM issues i WHERE i.id=c.issue_id AND i.project_id=c.project_id AND i.workspace_id=c.workspace_id),
+ 'project_detail',(SELECT jsonb_build_object('id',p.id,'identifier',p.identifier,'name',p.name,'cover_image',p.cover_image,'cover_image_url',NULLIF(p.cover_image,''),'logo_props',p.logo_props,'description',p.description) FROM projects p WHERE p.id=c.project_id AND p.workspace_id=c.workspace_id),
+ 'workspace_detail',(SELECT jsonb_build_object('id',w.id,'name',w.name,'slug',w.slug,'logo_url',NULLIF(w.logo,'')) FROM workspaces w WHERE w.id=c.workspace_id),
+ 'comment_reactions',COALESCE((SELECT jsonb_agg((to_jsonb(r)-'actor_id'-'comment_id'-'project_id'-'workspace_id'-'created_by_id'-'updated_by_id') || jsonb_build_object('actor',r.actor_id,'comment',r.comment_id,'project',r.project_id,'workspace',r.workspace_id,'created_by',r.created_by_id,'updated_by',r.updated_by_id,'display_name',u.display_name)) FROM comment_reactions r JOIN users u ON u.id=r.actor_id WHERE r.comment_id=c.id AND r.project_id=c.project_id AND r.workspace_id=c.workspace_id AND r.deleted_at IS NULL),'[]'::jsonb),'is_member',true)";
+
+async fn comments(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, issue)): Path<IssuePath>,
+) -> ApiResult {
+    let p = visible_issue(&st, &user, &slug, project, issue).await?;
+    json_rows(sqlx::query_scalar(&format!("SELECT {COMMENT_JSON} FROM issue_comments c WHERE c.issue_id=$1 AND c.project_id=$2 AND c.workspace_id=$3 AND c.deleted_at IS NULL ORDER BY c.created_at"))
+        .bind(issue).bind(project).bind(p.workspace_id()), &st.db).await
+}
+
+async fn comment_detail(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, issue, comment)): Path<CommentPath>,
+) -> ApiResult {
+    let p = visible_issue(&st, &user, &slug, project, issue).await?;
+    json_row(sqlx::query_scalar(&format!("SELECT {COMMENT_JSON} FROM issue_comments c WHERE c.id=$1 AND c.issue_id=$2 AND c.project_id=$3 AND c.workspace_id=$4 AND c.deleted_at IS NULL"))
+        .bind(comment).bind(issue).bind(project).bind(p.workspace_id()), &st.db).await
+}
+
+fn comment_fields(body: &Value) -> Result<(Option<String>, Option<Value>, Option<&str>), ApiError> {
+    let object = body.as_object().ok_or_else(|| ApiError::bad("Invalid request"))?;
+    let html = object
+        .get("comment_html")
+        .map(|v| {
+            v.as_str()
+                .ok_or_else(|| ApiError::bad("Invalid comment_html"))
+                .and_then(sanitize_html)
+        })
+        .transpose()?;
+    let json = object.get("comment_json").cloned();
+    let access = object
+        .get("access")
+        .map(|v| {
+            v.as_str()
+                .filter(|s| ["INTERNAL", "EXTERNAL"].contains(s))
+                .ok_or_else(|| ApiError::bad("Invalid access"))
+        })
+        .transpose()?;
+    Ok((html, json, access))
+}
+
+async fn comment_create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, issue)): Path<IssuePath>,
+    Json(body): Json<Value>,
+) -> ApiResult<(axum::http::StatusCode, Json<Value>)> {
+    let p = visible_issue(&st, &user, &slug, project, issue).await?;
+    let (html, json, access) = comment_fields(&body)?;
+    let html = html.unwrap_or_else(|| "<p></p>".into());
+    let json = json.unwrap_or_else(|| serde_json::json!({}));
+    let mut tx = st.db.begin().await?;
+    let description: Uuid = sqlx::query_scalar("INSERT INTO descriptions (workspace_id,project_id,created_by_id,updated_by_id,description_html,description_stripped,description_json) VALUES ($1,$2,$3,$3,$4,$5,$6) RETURNING id")
+        .bind(p.workspace_id()).bind(project).bind(user.id).bind(&html).bind(strip_tags(&html)).bind(&json).fetch_one(&mut *tx).await?;
+    let id: Uuid = sqlx::query_scalar("INSERT INTO issue_comments (workspace_id,project_id,issue_id,actor_id,created_by_id,updated_by_id,comment_html,comment_stripped,comment_json,access,attachments,description_id) VALUES ($1,$2,$3,$4,$4,$4,$5,$6,$7,$8,ARRAY[]::varchar[],$9) RETURNING id")
+        .bind(p.workspace_id()).bind(project).bind(issue).bind(user.id).bind(&html).bind(strip_tags(&html)).bind(json).bind(access.unwrap_or("INTERNAL")).bind(description).fetch_one(&mut *tx).await?;
+    tx.commit().await?;
+    let Json(value) = comment_detail(State(st), user, Path((slug, project, issue, id))).await?;
+    created(value)
+}
+
+async fn comment_update(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, issue, comment)): Path<CommentPath>,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    let p = visible_issue(&st, &user, &slug, project, issue).await?;
+    let (html, json, access) = comment_fields(&body)?;
+    let mut tx = st.db.begin().await?;
+    let row: Option<(Uuid,)> = sqlx::query_as("UPDATE issue_comments SET edited_at=CASE WHEN $5::text IS NOT NULL AND comment_html IS DISTINCT FROM $5 THEN now() ELSE edited_at END, comment_html=COALESCE($5,comment_html),comment_stripped=COALESCE($6,comment_stripped),comment_json=COALESCE($7,comment_json),access=COALESCE($8,access),updated_at=now(),updated_by_id=$9 WHERE id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND deleted_at IS NULL AND ($10 OR created_by_id=$9) RETURNING id")
+        .bind(comment).bind(issue).bind(project).bind(p.workspace_id()).bind(&html).bind(html.as_deref().map(strip_tags)).bind(&json).bind(access).bind(user.id).bind(p.is_admin() || p.ws.is_admin()).fetch_optional(&mut *tx).await?;
+    if row.is_none() {
+        return Err(ApiError::not_found());
+    }
+    sqlx::query("UPDATE descriptions d SET description_html=c.comment_html,description_stripped=c.comment_stripped,description_json=c.comment_json,updated_at=now(),updated_by_id=$5 FROM issue_comments c WHERE c.id=$1 AND c.issue_id=$2 AND c.project_id=$3 AND c.workspace_id=$4 AND d.id=c.description_id AND d.project_id=$3 AND d.workspace_id=$4 AND d.deleted_at IS NULL")
+        .bind(comment).bind(issue).bind(project).bind(p.workspace_id()).bind(user.id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    comment_detail(State(st), user, Path((slug, project, issue, comment))).await
+}
+
+async fn comment_delete(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, issue, comment)): Path<CommentPath>,
+) -> ApiResult<axum::http::StatusCode> {
+    let p = visible_issue(&st, &user, &slug, project, issue).await?;
+    let result = sqlx::query("UPDATE issue_comments SET deleted_at=now(),updated_at=now(),updated_by_id=$5 WHERE id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND deleted_at IS NULL AND ($6 OR created_by_id=$5)")
+        .bind(comment).bind(issue).bind(project).bind(p.workspace_id()).bind(user.id).bind(p.is_admin() || p.ws.is_admin()).execute(&st.db).await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
+}
+
+async fn history(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, issue)): Path<IssuePath>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let p = visible_issue(&st, &user, &slug, project, issue).await?;
+    let since = q
+        .get("created_at__gt")
+        .map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|v| v.with_timezone(&chrono::Utc))
+                .map_err(|_| ApiError::bad("Invalid created_at__gt"))
+        })
+        .transpose()?;
+    let activity_type = q.get("activity_type").map(String::as_str).unwrap_or("");
+    let sql = format!(
+        "SELECT value FROM (SELECT c.created_at, {COMMENT_JSON} AS value FROM issue_comments c WHERE c.issue_id=$1 AND c.project_id=$2 AND c.workspace_id=$3 AND c.deleted_at IS NULL AND ($4::timestamptz IS NULL OR c.created_at>$4) AND $5 <> 'issue-property' UNION ALL SELECT a.created_at, (to_jsonb(a)-'actor_id'-'issue_id'-'project_id'-'workspace_id'-'created_by_id'-'updated_by_id'-'issue_comment_id') || jsonb_build_object('actor',a.actor_id,'issue',a.issue_id,'project',a.project_id,'workspace',a.workspace_id,'created_by',a.created_by_id,'updated_by',a.updated_by_id,'issue_comment',a.issue_comment_id,'source_data',NULL) FROM issue_activities a WHERE a.issue_id=$1 AND a.project_id=$2 AND a.workspace_id=$3 AND a.deleted_at IS NULL AND (a.field IS NULL OR a.field NOT IN ('comment','vote','reaction','draft')) AND ($4::timestamptz IS NULL OR a.created_at>$4) AND $5 <> 'issue-comment') x ORDER BY created_at"
+    );
+    json_rows(
+        sqlx::query_scalar(&sql)
+            .bind(issue)
+            .bind(project)
+            .bind(p.workspace_id())
+            .bind(since)
+            .bind(activity_type),
+        &st.db,
+    )
+    .await
 }
 
 async fn update(
