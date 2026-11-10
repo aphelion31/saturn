@@ -1,0 +1,185 @@
+/**
+ * Copyright (c) 2023-present Plane Software, Inc. and contributors
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * See the LICENSE file for details.
+ */
+
+import { useCallback, useRef, useState } from "react";
+import { observer } from "mobx-react";
+import { useParams } from "next/navigation";
+// plane imports
+import { EUserPermissions, EUserPermissionsLevel } from "@plane/constants";
+import { useTranslation } from "@plane/i18n";
+import { EmptyStateCompact } from "@plane/blocks/empty-state";
+import { AddOutline, SearchOutline } from "@makeplane/propel/icons";
+import { setToast } from "@plane/blocks/toast";
+import { Tooltip } from "@makeplane/propel/components/tooltip";
+import { Icon } from "@makeplane/propel/components/icon";
+import { Input, InputGroup } from "@makeplane/propel/components/input";
+import { List } from "@makeplane/propel/components/list";
+import { ScrollArea } from "@makeplane/propel/components/scroll-area";
+import { copyUrlToClipboard, orderJoinedProjects } from "@plane/utils";
+// components
+import { CreateProjectModal } from "@/components/project/create-project-modal";
+import { SidebarProjectsListItem } from "@/components/workspace/sidebar/projects-list-item";
+// hooks
+import { useAppTheme } from "@/hooks/store/use-app-theme";
+import { useProject } from "@/hooks/store/use-project";
+import { useUserPermissions } from "@/hooks/store/user";
+import type { TProject } from "@plane/types";
+import { ExtendedSidebarWrapper } from "./extended-sidebar-wrapper";
+
+export const ExtendedProjectSidebar = observer(function ExtendedProjectSidebar() {
+  // refs
+  const extendedProjectSidebarRef = useRef<HTMLDivElement | null>(null);
+  const [searchQuery, setSearchQuery] = useState<string>("");
+  // states
+  const [isProjectModalOpen, setIsProjectModalOpen] = useState(false);
+  // routers
+  const { workspaceSlug } = useParams();
+  // store hooks
+  const { t } = useTranslation();
+  const { isExtendedProjectSidebarOpened, toggleExtendedProjectSidebar } = useAppTheme();
+  const { getPartialProjectById, joinedProjectIds: joinedProjects, updateProjectView } = useProject();
+  const { allowPermissions } = useUserPermissions();
+
+  const handleOnProjectDrop = (
+    sourceId: string | undefined,
+    destinationId: string | undefined,
+    shouldDropAtEnd: boolean
+  ) => {
+    if (!sourceId || !destinationId || !workspaceSlug) return;
+    if (sourceId === destinationId) return;
+
+    const joinedProjectsList: TProject[] = [];
+    joinedProjects.map((projectId) => {
+      const projectDetails = getPartialProjectById(projectId);
+      if (projectDetails) joinedProjectsList.push(projectDetails);
+    });
+
+    const sourceIndex = joinedProjects.indexOf(sourceId);
+    const destinationIndex = shouldDropAtEnd ? joinedProjects.length : joinedProjects.indexOf(destinationId);
+
+    if (joinedProjectsList.length <= 0) return;
+
+    const updatedSortOrder = orderJoinedProjects(sourceIndex, destinationIndex, sourceId, joinedProjectsList);
+    if (updatedSortOrder != undefined)
+      updateProjectView(workspaceSlug.toString(), sourceId, { sort_order: updatedSortOrder }).catch(() => {
+        setToast({
+          type: "error",
+          title: t("error"),
+          message: t("something_went_wrong"),
+        });
+      });
+  };
+
+  // filter projects based on search query
+  const filteredProjects = joinedProjects.filter((projectId) => {
+    const project = getPartialProjectById(projectId);
+    if (!project) return false;
+    return project.name.toLowerCase().includes(searchQuery.toLowerCase()) || project.identifier.includes(searchQuery);
+  });
+
+  // auth
+  const isAuthorizedUser = allowPermissions(
+    [EUserPermissions.ADMIN, EUserPermissions.MEMBER],
+    EUserPermissionsLevel.WORKSPACE
+  );
+
+  const handleClose = useCallback(() => toggleExtendedProjectSidebar(false), [toggleExtendedProjectSidebar]);
+
+  const handleCopyText = (projectId: string) => {
+    copyUrlToClipboard(`${workspaceSlug}/projects/${projectId}/issues`).then(() => {
+      setToast({
+        type: "success",
+        title: t("link_copied"),
+        message: t("project_link_copied_to_clipboard"),
+      });
+    });
+  };
+  return (
+    <>
+      {workspaceSlug && (
+        <CreateProjectModal
+          isOpen={isProjectModalOpen}
+          onClose={() => setIsProjectModalOpen(false)}
+          setToFavorite={false}
+          workspaceSlug={workspaceSlug.toString()}
+        />
+      )}
+      <ExtendedSidebarWrapper
+        isExtendedSidebarOpened={!!isExtendedProjectSidebarOpened}
+        extendedSidebarRef={extendedProjectSidebarRef}
+        handleClose={handleClose}
+        excludedElementId="extended-project-sidebar-toggle"
+        className="px-0"
+      >
+        <div className="sticky top-4 flex w-full flex-col gap-1 px-4">
+          <div className="flex items-center justify-between">
+            <span className="py-1.5 text-body-xs-semibold text-tertiary">{t("projects")}</span>
+            {isAuthorizedUser && (
+              <Tooltip label={t("create_project")}>
+                <button
+                  type="button"
+                  aria-label={t("create_project")}
+                  className="flex-shrink-0 rounded-sm p-0.5 text-tertiary transition-colors hover:bg-layer-1 hover:text-secondary"
+                  onClick={() => {
+                    setIsProjectModalOpen(true);
+                  }}
+                >
+                  <AddOutline className="size-3" />
+                </button>
+              </Tooltip>
+            )}
+          </div>
+          <div className="w-full">
+            <InputGroup size="lg">
+              <Icon icon={SearchOutline} tint="placeholder" />
+              <Input
+                size="lg"
+                type="text"
+                placeholder={t("search")}
+                value={searchQuery}
+                autoFocus
+                onChange={(e) => setSearchQuery(e.target.value)}
+              />
+            </InputGroup>
+          </div>
+        </div>
+        {filteredProjects.length === 0 ? (
+          <div className="mt-4 flex flex-col items-center p-10">
+            <EmptyStateCompact
+              title={t("common_empty_state.search.title")}
+              description={t("common_empty_state.search.description")}
+              assetKey="search-compact"
+              assetClassName="size-20"
+              align="center"
+            />
+          </div>
+        ) : (
+          <div className="mt-4 flex min-h-0 flex-grow flex-col">
+            <ScrollArea orientation="vertical" variant="inset" size="sm">
+              <div className="px-4">
+                <List gap="px" role="toolbar" aria-label={t("projects")}>
+                  {filteredProjects.map((projectId, index) => (
+                    <SidebarProjectsListItem
+                      key={projectId}
+                      projectId={projectId}
+                      handleCopyText={() => handleCopyText(projectId)}
+                      projectListType={"JOINED"}
+                      disableDrag={false}
+                      disableDrop={false}
+                      isLastChild={index === filteredProjects.length - 1}
+                      handleOnProjectDrop={handleOnProjectDrop}
+                      renderInExtendedSidebar
+                    />
+                  ))}
+                </List>
+              </div>
+            </ScrollArea>
+          </div>
+        )}
+      </ExtendedSidebarWrapper>
+    </>
+  );
+});

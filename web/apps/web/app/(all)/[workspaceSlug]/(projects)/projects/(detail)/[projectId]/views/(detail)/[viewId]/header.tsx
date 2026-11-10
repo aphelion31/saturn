@@ -1,0 +1,267 @@
+/**
+ * Copyright (c) 2023-present Plane Software, Inc. and contributors
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * See the LICENSE file for details.
+ */
+
+import { useCallback, useRef } from "react";
+import { observer } from "mobx-react";
+import { useParams } from "next/navigation";
+
+// plane imports
+import {
+  EIssueFilterType,
+  ISSUE_DISPLAY_FILTERS_BY_PAGE,
+  EUserPermissions,
+  EUserPermissionsLevel,
+} from "@plane/constants";
+import { useTranslation } from "@plane/i18n";
+import { Badge } from "@makeplane/propel/components/badge";
+import { Button } from "@makeplane/propel/components/button";
+import { Icon } from "@makeplane/propel/components/icon";
+import { IconButton as IconButtonElement } from "@makeplane/propel/elements/icon-button";
+import { LockOutline, PreferencesOutline, ViewsOutline } from "@makeplane/propel/icons";
+import { Tooltip } from "@makeplane/propel/components/tooltip";
+import type { IIssueDisplayFilterOptions, IIssueDisplayProperties } from "@plane/types";
+import { EIssuesStoreType, EViewAccess, EIssueLayoutTypes } from "@plane/types";
+import type { BreadcrumbNavigationItem } from "@plane/blocks/breadcrumb";
+import { Breadcrumbs, BreadcrumbNavigationSelect } from "@plane/blocks/breadcrumb";
+import { Header } from "@plane/blocks/layout";
+import { getPublishViewLink } from "@plane/utils";
+// components
+import { BreadcrumbLink } from "@/components/common/breadcrumb-link";
+import { SwitcherIcon, SwitcherLabel } from "@/components/common/switcher-label";
+import { DisplayFiltersSelection, FiltersDropdown, LayoutSelection } from "@/components/issues/issue-layouts/filters";
+import { ViewQuickActions } from "@/components/views/quick-actions";
+import { WorkItemFiltersToggle } from "@/components/work-item-filters/filters-toggle";
+// hooks
+import { useCommandPalette } from "@/hooks/store/use-command-palette";
+import { useIssues } from "@/hooks/store/use-issues";
+import { useProject } from "@/hooks/store/use-project";
+import { useProjectView } from "@/hooks/store/use-project-view";
+import { useUserPermissions } from "@/hooks/store/user";
+import { useAppRouter } from "@/hooks/use-app-router";
+// plane web imports
+import { CommonProjectBreadcrumbs } from "@/components/breadcrumbs/common";
+import { useProjectCrumbProps } from "@/components/breadcrumbs/use-project-crumb-props";
+
+export const ProjectViewIssuesHeader = observer(function ProjectViewIssuesHeader() {
+  // refs
+  const parentRef = useRef(null);
+  // router
+  const router = useAppRouter();
+  const { workspaceSlug, projectId, viewId: routerViewId } = useParams();
+  const projectCrumb = useProjectCrumbProps(workspaceSlug?.toString(), projectId?.toString());
+  const viewId = routerViewId ? routerViewId.toString() : undefined;
+  // plane hooks
+  const { t } = useTranslation();
+  // store hooks
+  const {
+    issues: { getGroupIssueCount },
+    issuesFilter: { issueFilters, updateFilters },
+  } = useIssues(EIssuesStoreType.PROJECT_VIEW);
+  const { toggleCreateIssueModal } = useCommandPalette();
+  const { allowPermissions } = useUserPermissions();
+
+  const { currentProjectDetails, loader } = useProject();
+  const { projectViewIds, getViewById } = useProjectView();
+
+  const activeLayout = issueFilters?.displayFilters?.layout;
+
+  const handleLayoutChange = useCallback(
+    (layout: EIssueLayoutTypes) => {
+      if (!workspaceSlug || !projectId || !viewId) return;
+      updateFilters(
+        workspaceSlug.toString(),
+        projectId.toString(),
+        EIssueFilterType.DISPLAY_FILTERS,
+        { layout: layout },
+        viewId.toString()
+      );
+    },
+    [workspaceSlug, projectId, viewId, updateFilters]
+  );
+
+  const handleDisplayFilters = useCallback(
+    (updatedDisplayFilter: Partial<IIssueDisplayFilterOptions>) => {
+      if (!workspaceSlug || !projectId || !viewId) return;
+      updateFilters(
+        workspaceSlug.toString(),
+        projectId.toString(),
+        EIssueFilterType.DISPLAY_FILTERS,
+        updatedDisplayFilter,
+        viewId.toString()
+      );
+    },
+    [workspaceSlug, projectId, viewId, updateFilters]
+  );
+
+  const handleDisplayProperties = useCallback(
+    (property: Partial<IIssueDisplayProperties>) => {
+      if (!workspaceSlug || !projectId || !viewId) return;
+      updateFilters(
+        workspaceSlug.toString(),
+        projectId.toString(),
+        EIssueFilterType.DISPLAY_PROPERTIES,
+        property,
+        viewId.toString()
+      );
+    },
+    [workspaceSlug, projectId, viewId, updateFilters]
+  );
+
+  const viewDetails = viewId ? getViewById(viewId.toString()) : null;
+  const workItemsCount = getGroupIssueCount(undefined, undefined, false);
+  const publishLink = getPublishViewLink(viewDetails?.anchor);
+
+  const canUserCreateIssue = allowPermissions(
+    [EUserPermissions.ADMIN, EUserPermissions.MEMBER],
+    EUserPermissionsLevel.PROJECT
+  );
+
+  if (!viewDetails) return;
+
+  const switcherOptions = (projectViewIds ?? [])
+    .map<BreadcrumbNavigationItem | undefined>((id) => {
+      const _view = id === viewId ? viewDetails : getViewById(id);
+      if (!_view) return;
+      return {
+        key: _view.id,
+        label: _view.name,
+        content: <SwitcherLabel logo_props={_view.logo_props} name={_view.name} LabelIcon={ViewsOutline} />,
+      };
+    })
+    .filter((option) => option !== undefined);
+
+  return (
+    <Header>
+      <Header.LeftItem>
+        <Breadcrumbs isLoading={loader === "init-loader"}>
+          <CommonProjectBreadcrumbs
+            workspaceSlug={workspaceSlug?.toString()}
+            projectId={projectId?.toString()}
+            {...projectCrumb}
+          />
+          <Breadcrumbs.Item
+            component={
+              <BreadcrumbLink
+                label="Views"
+                href={`/${workspaceSlug}/projects/${projectId}/views/`}
+                icon={<ViewsOutline className="h-4 w-4 text-tertiary" />}
+              />
+            }
+          />
+          <Breadcrumbs.Item
+            component={
+              <BreadcrumbNavigationSelect
+                selectedItemKey={viewId ?? ""}
+                navigationItems={switcherOptions}
+                onChange={(value: string) => {
+                  router.push(`/${workspaceSlug}/projects/${projectId}/views/${value}`);
+                }}
+                label={viewDetails?.name}
+                icon={<SwitcherIcon logo_props={viewDetails.logo_props} LabelIcon={ViewsOutline} size={16} />}
+                placeholder={t("views")}
+                searchPlaceholder={t("common.search.label")}
+                emptyMessage={t("common.search.no_matches_found")}
+                suffix={
+                  workItemsCount && workItemsCount > 0 ? (
+                    <Tooltip label={`${workItemsCount} ${t("issue.label", { count: workItemsCount })}`} side="bottom">
+                      <Badge variant="brand" size="xs" label={String(workItemsCount)} />
+                    </Tooltip>
+                  ) : null
+                }
+                isLast
+              />
+            }
+            isLast
+          />
+        </Breadcrumbs>
+
+        {viewDetails?.access === EViewAccess.PRIVATE ? (
+          <div className="cursor-default text-tertiary">
+            <Tooltip label={"Private"}>
+              <LockOutline className="h-4 w-4" />
+            </Tooltip>
+          </div>
+        ) : (
+          <></>
+        )}
+        {viewDetails.is_locked && (
+          <Badge variant="neutral" size="sm" startIcon={<Icon icon={LockOutline} />} label={t("common.locked")} />
+        )}
+      </Header.LeftItem>
+      <Header.RightItem className="items-center">
+        {viewDetails.anchor && publishLink && (
+          <a href={publishLink} target="_blank" rel="noopener noreferrer" className="inline-flex shrink-0 items-center">
+            <Badge
+              variant="success"
+              size="sm"
+              startIcon={<span className="size-1.5 shrink-0 rounded-full bg-success-primary" />}
+              label={t("common.live")}
+            />
+          </a>
+        )}
+        <>
+          {!viewDetails.is_locked && (
+            <LayoutSelection
+              layouts={[
+                EIssueLayoutTypes.LIST,
+                EIssueLayoutTypes.KANBAN,
+                EIssueLayoutTypes.CALENDAR,
+                EIssueLayoutTypes.SPREADSHEET,
+                EIssueLayoutTypes.GANTT,
+              ]}
+              onChange={(layout) => handleLayoutChange(layout)}
+              selectedLayout={activeLayout}
+            />
+          )}
+          {viewId && <WorkItemFiltersToggle entityType={EIssuesStoreType.PROJECT_VIEW} entityId={viewId} />}
+          {!viewDetails.is_locked && (
+            <FiltersDropdown
+              title={t("common.display")}
+              placement="bottom-end"
+              menuButton={
+                <IconButtonElement variant="secondary" size="md" render={<span />}>
+                  <PreferencesOutline className="size-4" />
+                </IconButtonElement>
+              }
+            >
+              <DisplayFiltersSelection
+                layoutDisplayFiltersOptions={
+                  activeLayout ? ISSUE_DISPLAY_FILTERS_BY_PAGE.issues.layoutOptions[activeLayout] : undefined
+                }
+                displayFilters={issueFilters?.displayFilters ?? {}}
+                handleDisplayFiltersUpdate={handleDisplayFilters}
+                displayProperties={issueFilters?.displayProperties ?? {}}
+                handleDisplayPropertiesUpdate={handleDisplayProperties}
+                cycleViewDisabled={!currentProjectDetails?.cycle_view}
+                moduleViewDisabled={!currentProjectDetails?.module_view}
+              />
+            </FiltersDropdown>
+          )}
+        </>
+        {canUserCreateIssue && (
+          <Button
+            variant="primary"
+            size="md"
+            stretch="auto"
+            label="Add work item"
+            onClick={() => {
+              toggleCreateIssueModal(true, EIssuesStoreType.PROJECT_VIEW);
+            }}
+          />
+        )}
+        <div className="hidden md:block">
+          <ViewQuickActions
+            parentRef={parentRef}
+            customClassName="flex-shrink-0 flex items-center justify-center size-[26px] bg-layer-1/70 rounded-sm"
+            projectId={projectId.toString()}
+            view={viewDetails}
+            workspaceSlug={workspaceSlug.toString()}
+          />
+        </div>
+      </Header.RightItem>
+    </Header>
+  );
+});
