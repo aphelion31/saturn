@@ -1,0 +1,30 @@
+{
+  "name": "saturn-web",
+  "version": "1.5.0",
+  "private": true,
+  "description": "Plane React Router apps (web, admin, space) served by the Saturn binary",
+  "license": "AGPL-3.0",
+  "repository": "https://github.com/aphelion31/saturn.git",
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev --concurrency=18",
+    "start": "turbo run start",
+    "clean": "turbo run clean && rm -rf .turbo && rm -rf .next && rm -rf node_modules && rm -rf dist",
+    "fix": "turbo run fix",
+    "fix:format": "turbo run fix:format",
+    "fix:lint": "turbo run fix:lint",
+    "check": "turbo run check",
+    "check:lint": "turbo run check:lint",
+    "check:format": "turbo run check:format",
+    "check:types": "turbo run check:types"
+  },
+  "devDependencies": {
+    "oxfmt": "catalog:",
+    "oxlint": "catalog:",
+    "turbo": "catalog:"
+  },
+  "engines": {
+    "node": ">=22.22.0"
+  },
+  "packageManager": "pnpm@11.10.0+sha512.0b7f8b98060031904c017e3a41eb187a16d40eeb829b95c4f8cb03681761fc4ab53dd219115b9b447f4dce1a05a214764461e7d3703392a9f32f9511ce8c86c8"
+}

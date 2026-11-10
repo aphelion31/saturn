@@ -1,0 +1,137 @@
+mod auth;
+mod common;
+mod session;
+mod web;
+mod workitems;
+
+// API areas. Each module owns its routes (full paths, trailing slash, as Plane's apps call them).
+mod assets;
+mod cycles;
+mod issues;
+mod modules;
+mod notifications;
+mod pages;
+mod projects;
+mod public;
+mod states;
+mod users;
+mod views;
+mod workspaces;
+
+use axum::{
+    Router, middleware,
+    routing::{any, get},
+};
+use common::{AppState, Config};
+use std::sync::Arc;
+
+const MIGRATIONS: &[(&str, &str)] = &[
+    ("0001_schema", include_str!("../migrations/0001_schema.sql")),
+    ("0002_defaults", include_str!("../migrations/0002_defaults.sql")),
+];
+
+pub fn app(state: AppState) -> Router {
+    let api = Router::new()
+        .merge(auth::routes())
+        .merge(users::routes())
+        .merge(workspaces::routes())
+        .merge(projects::routes())
+        .merge(states::routes())
+        .merge(issues::routes())
+        .merge(cycles::routes())
+        .merge(modules::routes())
+        .merge(views::routes())
+        .merge(pages::routes())
+        .merge(notifications::routes())
+        .merge(assets::routes())
+        .merge(public::routes())
+        .route("/api/{*rest}", any(web::not_implemented))
+        .route("/auth/{*rest}", any(web::not_implemented))
+        .layer(middleware::from_fn_with_state(state.clone(), web::origin_check));
+    Router::new()
+        .route("/health", get(web::health))
+        .merge(api)
+        .merge(web::spa_routes(&state))
+        .layer(middleware::from_fn(web::security_headers))
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+/// Apply migrations in order, once each. On an existing Plane database (tables already created by
+/// Django) the schema migration is recorded as applied and only Saturn's additions run.
+async fn migrate(db: &sqlx::PgPool) -> anyhow::Result<()> {
+    sqlx::query("CREATE TABLE IF NOT EXISTS saturn_migrations (name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())")
+        .execute(db)
+        .await?;
+    let plane_db: (bool,) = sqlx::query_as("SELECT to_regclass('public.issues') IS NOT NULL")
+        .fetch_one(db)
+        .await?;
+    if plane_db.0 {
+        sqlx::query("INSERT INTO saturn_migrations (name) VALUES ('0001_schema') ON CONFLICT DO NOTHING")
+            .execute(db)
+            .await?;
+    }
+    for (name, sql) in MIGRATIONS {
+        let done: (bool,) = sqlx::query_as("SELECT EXISTS (SELECT 1 FROM saturn_migrations WHERE name = $1)")
+            .bind(name)
+            .fetch_one(db)
+            .await?;
+        if done.0 {
+            continue;
+        }
+        tracing::info!("applying migration {name}");
+        let mut tx = db.begin().await?;
+        sqlx::raw_sql(sql).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO saturn_migrations (name) VALUES ($1)")
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+    }
+    auth::ensure_instance(db).await
+}
+
+fn env(k: &str, d: &str) -> String {
+    std::env::var(k).unwrap_or_else(|_| d.to_string())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(env("RUST_LOG", "info,tower_http=warn"))
+        .init();
+    let url = env("DATABASE_URL", "postgres://localhost/saturn");
+    let db = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(env("DB_POOL", "10").parse()?)
+        .connect(&url)
+        .await?;
+    migrate(&db).await?;
+
+    let web_url = env("WEB_URL", "http://localhost:3000");
+    let secret_key = std::env::var("SECRET_KEY").unwrap_or_else(|_| {
+        tracing::warn!("SECRET_KEY not set, using an insecure development key");
+        "saturn-insecure-dev-key".into()
+    });
+    let cfg = Config {
+        cookie_secure: web_url.starts_with("https://"),
+        web_url,
+        secret_key,
+        web_dir: env("WEB_DIR", "web/apps").into(),
+        storage_dir: env("STORAGE_DIR", "storage").into(),
+        file_size_limit: env("FILE_SIZE_LIMIT", "5242880").parse()?,
+    };
+    let state = AppState { db, cfg: Arc::new(cfg) };
+
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("migrate") => return Ok(()),
+        Some("seed") => return users::seed(&state, &args[2..]).await,
+        _ => {}
+    }
+
+    let addr = env("BIND", "0.0.0.0:3000");
+    tracing::info!("saturn listening on {addr}");
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app(state)).await?;
+    Ok(())
+}

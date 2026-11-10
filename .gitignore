@@ -1,0 +1,11 @@
+target/
+storage/
+web/node_modules/
+web/build/
+web/.react-router/
+.env
+web/**/node_modules/
+web/**/build/
+web/**/.react-router/
+web/**/.turbo/
+web/**/dist/
