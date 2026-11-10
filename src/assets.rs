@@ -1,8 +1,754 @@
-//! TODO: port from Plane. See WORKERS.md.
-use axum::Router;
+//! File uploads (Plane's `assets/v2`), stored on local disk under `STORAGE_DIR` instead of S3/MinIO.
+//!
+//! Plane's browser flow is kept: POST creates a `file_assets` row and returns `upload_data`
+//! (`url` + `fields`), the browser POSTs the file as multipart to `url` with those fields, then PATCHes
+//! the asset to mark it uploaded. Here `url` is Saturn's own upload endpoint and the only field is an
+//! HMAC token bound to the asset id, so nobody can write to an asset they did not create.
+use axum::{
+    Json, Router,
+    body::Body,
+    extract::{DefaultBodyLimit, Multipart, Path, State},
+    http::{HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use hmac::{Hmac, Mac};
+use serde_json::{Value, json};
+use sha2::Sha256;
+use uuid::Uuid;
 
-use crate::common::AppState;
+use crate::common::*;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/api/assets/v2/workspaces/{slug}/", post(create_workspace_asset))
+        .route(
+            "/api/assets/v2/workspaces/{slug}/{asset_id}/",
+            get(download_workspace_asset).patch(mark_uploaded).delete(delete_asset),
+        )
+        .route(
+            "/api/assets/v2/workspaces/{slug}/projects/{project_id}/",
+            post(create_project_asset),
+        )
+        .route(
+            "/api/assets/v2/workspaces/{slug}/projects/{project_id}/{asset_id}/",
+            get(download_project_asset)
+                .patch(mark_project_uploaded)
+                .delete(delete_project_asset),
+        )
+        .route("/api/assets/v2/user-assets/", post(create_user_asset))
+        .route(
+            "/api/assets/v2/user-assets/{asset_id}/",
+            axum::routing::patch(mark_user_uploaded).delete(delete_user_asset),
+        )
+        .route("/api/assets/v2/static/{asset_id}/", get(static_asset))
+        .route(
+            "/api/assets/v2/upload/{asset_id}/",
+            // The multipart body is capped again against FILE_SIZE_LIMIT inside the handler.
+            post(upload).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
+        .route(
+            "/api/assets/v2/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/attachments/",
+            get(list_attachments).post(create_attachment),
+        )
+        .route(
+            "/api/assets/v2/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/attachments/{asset_id}/",
+            get(download_attachment)
+                .patch(mark_attachment_uploaded)
+                .delete(delete_attachment),
+        )
+}
+
+const ENTITY_TYPES: &[&str] = &[
+    "ISSUE_ATTACHMENT",
+    "ISSUE_DESCRIPTION",
+    "COMMENT_DESCRIPTION",
+    "PAGE_DESCRIPTION",
+    "USER_COVER",
+    "USER_AVATAR",
+    "WORKSPACE_LOGO",
+    "PROJECT_COVER",
+    "DRAFT_ISSUE_ATTACHMENT",
+    "DRAFT_ISSUE_DESCRIPTION",
+];
+const IMAGE_TYPES: &[&str] = &["image/jpeg", "image/png", "image/webp", "image/jpg", "image/gif"];
+/// Entity types readable through the public static endpoint (avatars, covers, logos), as in Plane.
+const STATIC_TYPES: &[&str] = &["USER_AVATAR", "USER_COVER", "WORKSPACE_LOGO", "PROJECT_COVER"];
+
+/// Plane's `sanitize_filename`: no directories, no control characters, no traversal.
+fn sanitize_filename(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim().trim_start_matches('.').replace("..", "_");
+    if cleaned.is_empty() {
+        "unnamed".into()
+    } else {
+        cleaned.chars().take(200).collect()
+    }
+}
+
+fn token(secret: &str, asset_id: Uuid) -> String {
+    let mut m = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac key");
+    m.update(b"saturn-asset-upload:");
+    m.update(asset_id.as_bytes());
+    hex::encode(m.finalize().into_bytes())
+}
+
+fn upload_response(asset_id: Uuid, secret: &str) -> Value {
+    json!({
+        "upload_data": {
+            "url": format!("/api/assets/v2/upload/{asset_id}/"),
+            "fields": {"token": token(secret, asset_id)},
+        },
+        "asset_id": asset_id,
+        "asset_url": format!("/api/assets/v2/static/{asset_id}/"),
+    })
+}
+
+struct NewAsset<'a> {
+    workspace_id: Uuid,
+    user_id: Uuid,
+    entity_type: &'a str,
+    project_id: Option<Uuid>,
+    issue_id: Option<Uuid>,
+    target_user_id: Option<Uuid>,
+    page_id: Option<Uuid>,
+    comment_id: Option<Uuid>,
+    images_only: bool,
+}
+
+/// Validate the body and insert the `file_assets` row. Returns Plane's presign response.
+async fn insert_asset(st: &AppState, a: NewAsset<'_>, b: &Value) -> ApiResult {
+    if !ENTITY_TYPES.contains(&a.entity_type) {
+        return Err(ApiError::bad_body(
+            json!({"error": "Invalid entity type.", "status": false}),
+        ));
+    }
+    let name = sanitize_filename(s(b, "name").unwrap_or("unnamed"));
+    let typ = s(b, "type").unwrap_or("image/jpeg");
+    if a.images_only && !IMAGE_TYPES.contains(&typ) {
+        return Err(ApiError::bad_body(json!({
+            "error": "Invalid file type. Only JPEG, PNG, WebP, JPG and GIF files are allowed.", "status": false
+        })));
+    }
+    let size = b
+        .get("size")
+        .and_then(Value::as_f64)
+        .unwrap_or(st.cfg.file_size_limit as f64);
+    let size = size.min(st.cfg.file_size_limit as f64);
+    let id = Uuid::new_v4();
+    let key = format!("{}/{}-{}", a.workspace_id, id.simple(), name);
+    sqlx::query(
+        "INSERT INTO file_assets (id, attributes, asset, size, workspace_id, created_by_id, updated_by_id, entity_type,
+                                  entity_identifier, project_id, issue_id, user_id, page_id, comment_id, is_uploaded)
+         VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8, $9, $10, $11, $12, $13, false)",
+    )
+    .bind(id)
+    .bind(json!({"name": name, "type": typ, "size": size}))
+    .bind(&key)
+    .bind(size)
+    .bind(a.workspace_id)
+    .bind(a.user_id)
+    .bind(a.entity_type)
+    .bind(s(b, "entity_identifier"))
+    .bind(a.project_id)
+    .bind(a.issue_id)
+    .bind(a.target_user_id)
+    .bind(a.page_id)
+    .bind(a.comment_id)
+    .execute(&st.db)
+    .await?;
+    Ok(Json(upload_response(id, &st.cfg.secret_key)))
+}
+
+fn entity_ids(entity_type: &str, b: &Value) -> (Option<Uuid>, Option<Uuid>, Option<Uuid>, Option<Uuid>) {
+    let id = uuid_of(b, "entity_identifier");
+    match entity_type {
+        "ISSUE_ATTACHMENT" | "ISSUE_DESCRIPTION" => (id, None, None, None),
+        "USER_AVATAR" | "USER_COVER" => (None, id, None, None),
+        "PAGE_DESCRIPTION" => (None, None, id, None),
+        "COMMENT_DESCRIPTION" => (None, None, None, id),
+        _ => (None, None, None, None),
+    }
+}
+
+async fn create_workspace_asset(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(slug): Path<String>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    let entity_type = s(&b, "entity_type").unwrap_or("");
+    if entity_type == "WORKSPACE_LOGO" && !ws.is_admin() {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            json!({"error": "Only workspace admins can upload a workspace logo."}),
+        ));
+    }
+    let project_id = if entity_type == "PROJECT_COVER" {
+        uuid_of(&b, "entity_identifier")
+    } else {
+        None
+    };
+    let (issue_id, target_user_id, page_id, comment_id) = entity_ids(entity_type, &b);
+    insert_asset(
+        &st,
+        NewAsset {
+            workspace_id: ws.workspace_id,
+            user_id: user.id,
+            entity_type,
+            project_id,
+            issue_id,
+            target_user_id,
+            page_id,
+            comment_id,
+            images_only: true,
+        },
+        &b,
+    )
+    .await
+}
+
+async fn create_project_asset(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let entity_type = s(&b, "entity_type").unwrap_or("");
+    let (issue_id, _, page_id, comment_id) = entity_ids(entity_type, &b);
+    insert_asset(
+        &st,
+        NewAsset {
+            workspace_id: p.workspace_id(),
+            user_id: user.id,
+            entity_type,
+            project_id: Some(project_id),
+            issue_id,
+            target_user_id: None,
+            page_id,
+            comment_id,
+            images_only: false,
+        },
+        &b,
+    )
+    .await
+}
+
+async fn create_user_asset(State(st): State<AppState>, user: CurrentUser, Json(b): Json<Value>) -> ApiResult {
+    let entity_type = s(&b, "entity_type").unwrap_or("");
+    if !matches!(entity_type, "USER_AVATAR" | "USER_COVER") {
+        return Err(ApiError::bad_body(
+            json!({"error": "Invalid entity type.", "status": false}),
+        ));
+    }
+    // User assets are not tied to a workspace in Plane; file them under the user id on disk.
+    let name = sanitize_filename(s(&b, "name").unwrap_or("unnamed"));
+    let typ = s(&b, "type").unwrap_or("image/jpeg");
+    if !IMAGE_TYPES.contains(&typ) {
+        return Err(ApiError::bad_body(json!({
+            "error": "Invalid file type. Only JPEG, PNG, WebP, JPG and GIF files are allowed.", "status": false
+        })));
+    }
+    let size = b
+        .get("size")
+        .and_then(Value::as_f64)
+        .unwrap_or(st.cfg.file_size_limit as f64)
+        .min(st.cfg.file_size_limit as f64);
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO file_assets (id, attributes, asset, size, user_id, created_by_id, updated_by_id, entity_type, is_uploaded)
+         VALUES ($1, $2, $3, $4, $5, $5, $5, $6, false)",
+    )
+    .bind(id)
+    .bind(json!({"name": name, "type": typ, "size": size}))
+    .bind(format!("users/{}/{}-{}", user.id, id.simple(), name))
+    .bind(size)
+    .bind(user.id)
+    .bind(entity_type)
+    .execute(&st.db)
+    .await?;
+    Ok(Json(upload_response(id, &st.cfg.secret_key)))
+}
+
+/// Multipart upload target. Verifies the HMAC token, enforces `FILE_SIZE_LIMIT`, writes the file
+/// to `STORAGE_DIR/<asset key from the database>`. The client never chooses the path.
+async fn upload(State(st): State<AppState>, Path(asset_id): Path<Uuid>, mut form: Multipart) -> ApiResult<StatusCode> {
+    let row: Option<(String, bool)> =
+        sqlx::query_as("SELECT asset, is_uploaded FROM file_assets WHERE id = $1 AND deleted_at IS NULL")
+            .bind(asset_id)
+            .fetch_optional(&st.db)
+            .await?;
+    let (key, uploaded) = row.ok_or_else(ApiError::not_found)?;
+    if uploaded {
+        return Err(ApiError::bad("Asset already uploaded"));
+    }
+    let want = token(&st.cfg.secret_key, asset_id);
+    let mut token_ok = false;
+    let mut data: Option<Vec<u8>> = None;
+    while let Some(field) = form
+        .next_field()
+        .await
+        .map_err(|_| ApiError::bad("Invalid multipart body"))?
+    {
+        match field.name() {
+            Some("token") => {
+                let got = field.text().await.map_err(|_| ApiError::bad("Invalid token field"))?;
+                token_ok =
+                    got.len() == want.len() && got.bytes().zip(want.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0;
+            }
+            Some("file") => {
+                if !token_ok {
+                    return Err(ApiError::forbidden());
+                }
+                let mut buf = Vec::new();
+                let mut field = field;
+                while let Some(chunk) = field.chunk().await.map_err(|_| ApiError::bad("Upload interrupted"))? {
+                    if buf.len() + chunk.len() > st.cfg.file_size_limit as usize {
+                        return Err(ApiError::bad("File size exceeds the allowed limit"));
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+                data = Some(buf);
+            }
+            _ => {}
+        }
+    }
+    if !token_ok {
+        return Err(ApiError::forbidden());
+    }
+    let data = data.ok_or_else(|| ApiError::bad("Missing file field"))?;
+    let path = disk_path(&st, &key)?;
+    if let Some(dir) = path.parent() {
+        tokio::fs::create_dir_all(dir).await.map_err(io_err)?;
+    }
+    tokio::fs::write(&path, &data).await.map_err(io_err)?;
+    sqlx::query("UPDATE file_assets SET size = $2, updated_at = now() WHERE id = $1")
+        .bind(asset_id)
+        .bind(data.len() as f64)
+        .execute(&st.db)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn io_err(e: std::io::Error) -> ApiError {
+    tracing::error!("storage error: {e}");
+    ApiError(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "Storage error"}))
+}
+
+/// Resolve a stored key under STORAGE_DIR, refusing anything that could escape it.
+fn disk_path(st: &AppState, key: &str) -> Result<std::path::PathBuf, ApiError> {
+    if key.contains("..") || key.starts_with('/') || key.contains('\\') {
+        return Err(ApiError::bad("Invalid asset key"));
+    }
+    Ok(st.cfg.storage_dir.join(key))
+}
+
+/// Stream a stored file. Images from the allowlist render inline; anything else downloads, so
+/// uploaded HTML or SVG can never execute on Saturn's origin.
+async fn serve(st: &AppState, key: &str, attrs: &Value, force_download: bool) -> Result<Response, ApiError> {
+    let bytes = tokio::fs::read(disk_path(st, key)?)
+        .await
+        .map_err(|_| ApiError::not_found())?;
+    let typ = attrs.get("type").and_then(Value::as_str).unwrap_or("");
+    let name = sanitize_filename(attrs.get("name").and_then(Value::as_str).unwrap_or("file"));
+    let inline = !force_download && IMAGE_TYPES.contains(&typ);
+    let mut res = Body::from(bytes).into_response();
+    let h = res.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(if inline { typ } else { "application/octet-stream" })
+            .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+    );
+    let disp = format!(
+        "{}; filename=\"{}\"",
+        if inline { "inline" } else { "attachment" },
+        name.replace('"', "")
+    );
+    if let Ok(v) = HeaderValue::from_str(&disp) {
+        h.insert(header::CONTENT_DISPOSITION, v);
+    }
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=3600"));
+    Ok(res)
+}
+
+/// Avatars, covers and logos. Plane serves these to anyone who has the link; Saturn requires a
+/// signed-in user, which every page that shows them already has.
+async fn static_asset(
+    State(st): State<AppState>,
+    _user: CurrentUser,
+    Path(asset_id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let row: Option<(String, Value, String)> = sqlx::query_as(
+        "SELECT asset, attributes, entity_type FROM file_assets WHERE id = $1 AND is_uploaded AND deleted_at IS NULL",
+    )
+    .bind(asset_id)
+    .fetch_optional(&st.db)
+    .await?;
+    let (key, attrs, entity_type) = row.ok_or_else(ApiError::not_found)?;
+    if !STATIC_TYPES.contains(&entity_type.as_str()) {
+        return Err(ApiError::bad_body(
+            json!({"error": "Invalid entity type.", "status": false}),
+        ));
+    }
+    serve(&st, &key, &attrs, false).await
+}
+
+/// Load an asset in this workspace the caller may modify (creator, or workspace admin).
+async fn owned_asset(
+    st: &AppState,
+    ws: &WorkspaceCtx,
+    asset_id: Uuid,
+    project_id: Option<Uuid>,
+) -> Result<(String, String, Uuid), ApiError> {
+    let row: Option<(String, String, Option<Uuid>)> = sqlx::query_as(
+        "SELECT asset, entity_type, created_by_id FROM file_assets
+         WHERE id = $1 AND workspace_id = $2 AND ($3::uuid IS NULL OR project_id = $3) AND deleted_at IS NULL",
+    )
+    .bind(asset_id)
+    .bind(ws.workspace_id)
+    .bind(project_id)
+    .fetch_optional(&st.db)
+    .await?;
+    let (key, entity_type, creator) = row.ok_or_else(ApiError::not_found)?;
+    if creator != Some(ws.user_id) && !ws.is_admin() {
+        return Err(ApiError::forbidden());
+    }
+    Ok((key, entity_type, asset_id))
+}
+
+async fn set_uploaded(st: &AppState, asset_id: Uuid, entity_type: &str, b: &Value) -> Result<(), ApiError> {
+    sqlx::query("UPDATE file_assets SET is_uploaded = true, attributes = COALESCE($2, attributes), updated_at = now() WHERE id = $1")
+        .bind(asset_id)
+        .bind(b.get("attributes"))
+        .execute(&st.db)
+        .await?;
+    // Point the owning entity at the new asset, as Plane's entity_asset_save does.
+    let sql = match entity_type {
+        "WORKSPACE_LOGO" => {
+            "UPDATE workspaces w SET logo_asset_id = f.id, logo = '' FROM file_assets f WHERE f.id = $1 AND w.id = f.workspace_id"
+        }
+        "PROJECT_COVER" => {
+            "UPDATE projects p SET cover_image_asset_id = f.id, cover_image = '' FROM file_assets f WHERE f.id = $1 AND p.id = f.project_id"
+        }
+        "USER_AVATAR" => {
+            "UPDATE users u SET avatar_asset_id = f.id, avatar = '' FROM file_assets f WHERE f.id = $1 AND u.id = f.user_id"
+        }
+        "USER_COVER" => {
+            "UPDATE users u SET cover_image_asset_id = f.id, cover_image = NULL FROM file_assets f WHERE f.id = $1 AND u.id = f.user_id"
+        }
+        _ => return Ok(()),
+    };
+    sqlx::query(sql).bind(asset_id).execute(&st.db).await?;
+    Ok(())
+}
+
+async fn soft_delete(st: &AppState, asset_id: Uuid, entity_type: &str) -> Result<(), ApiError> {
+    sqlx::query("UPDATE file_assets SET is_deleted = true, deleted_at = now() WHERE id = $1")
+        .bind(asset_id)
+        .execute(&st.db)
+        .await?;
+    let sql = match entity_type {
+        "WORKSPACE_LOGO" => "UPDATE workspaces SET logo_asset_id = NULL WHERE logo_asset_id = $1",
+        "PROJECT_COVER" => "UPDATE projects SET cover_image_asset_id = NULL WHERE cover_image_asset_id = $1",
+        "USER_AVATAR" => "UPDATE users SET avatar_asset_id = NULL WHERE avatar_asset_id = $1",
+        "USER_COVER" => "UPDATE users SET cover_image_asset_id = NULL WHERE cover_image_asset_id = $1",
+        _ => return Ok(()),
+    };
+    sqlx::query(sql).bind(asset_id).execute(&st.db).await?;
+    Ok(())
+}
+
+async fn mark_uploaded(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, asset_id)): Path<(String, Uuid)>,
+    body: Option<Json<Value>>,
+) -> ApiResult<StatusCode> {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    let (_, entity_type, id) = owned_asset(&st, &ws, asset_id, None).await?;
+    set_uploaded(&st, id, &entity_type, &body.map(|b| b.0).unwrap_or_default()).await?;
+    no_content()
+}
+
+async fn delete_asset(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, asset_id)): Path<(String, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    let (_, entity_type, id) = owned_asset(&st, &ws, asset_id, None).await?;
+    soft_delete(&st, id, &entity_type).await?;
+    no_content()
+}
+
+/// Members of the workspace may read its assets; project-scoped assets need project membership.
+async fn readable_asset(
+    st: &AppState,
+    user: &CurrentUser,
+    slug: &str,
+    asset_id: Uuid,
+    project_id: Option<Uuid>,
+) -> Result<(String, Value), ApiError> {
+    let ws = require_workspace(&st.db, user, slug).await?;
+    let row: Option<(String, Value, Option<Uuid>)> = sqlx::query_as(
+        "SELECT asset, attributes, project_id FROM file_assets
+         WHERE id = $1 AND workspace_id = $2 AND ($3::uuid IS NULL OR project_id = $3) AND is_uploaded AND deleted_at IS NULL",
+    )
+    .bind(asset_id)
+    .bind(ws.workspace_id)
+    .bind(project_id)
+    .fetch_optional(&st.db)
+    .await?;
+    let (key, attrs, pid) = row.ok_or_else(ApiError::not_found)?;
+    if let Some(pid) = pid {
+        require_project(&st.db, user, slug, pid).await?;
+    }
+    Ok((key, attrs))
+}
+
+async fn download_workspace_asset(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, asset_id)): Path<(String, Uuid)>,
+) -> Result<Response, ApiError> {
+    let (key, attrs) = readable_asset(&st, &user, &slug, asset_id, None).await?;
+    serve(&st, &key, &attrs, false).await
+}
+
+async fn download_project_asset(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, asset_id)): Path<(String, Uuid, Uuid)>,
+) -> Result<Response, ApiError> {
+    let (key, attrs) = readable_asset(&st, &user, &slug, asset_id, Some(project_id)).await?;
+    serve(&st, &key, &attrs, false).await
+}
+
+async fn mark_project_uploaded(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, asset_id)): Path<(String, Uuid, Uuid)>,
+    body: Option<Json<Value>>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    let (_, entity_type, id) = owned_asset(&st, &p.ws, asset_id, Some(project_id)).await?;
+    set_uploaded(&st, id, &entity_type, &body.map(|b| b.0).unwrap_or_default()).await?;
+    no_content()
+}
+
+async fn delete_project_asset(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, asset_id)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    let (_, entity_type, id) = owned_asset(&st, &p.ws, asset_id, Some(project_id)).await?;
+    soft_delete(&st, id, &entity_type).await?;
+    no_content()
+}
+
+async fn user_owned(st: &AppState, user: &CurrentUser, asset_id: Uuid) -> Result<String, ApiError> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT entity_type FROM file_assets WHERE id = $1 AND user_id = $2 AND entity_type IN ('USER_AVATAR', 'USER_COVER')
+         AND deleted_at IS NULL",
+    )
+    .bind(asset_id)
+    .bind(user.id)
+    .fetch_optional(&st.db)
+    .await?;
+    row.map(|(t,)| t).ok_or_else(ApiError::not_found)
+}
+
+async fn mark_user_uploaded(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(asset_id): Path<Uuid>,
+    body: Option<Json<Value>>,
+) -> ApiResult<StatusCode> {
+    let entity_type = user_owned(&st, &user, asset_id).await?;
+    set_uploaded(&st, asset_id, &entity_type, &body.map(|b| b.0).unwrap_or_default()).await?;
+    no_content()
+}
+
+async fn delete_user_asset(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(asset_id): Path<Uuid>,
+) -> ApiResult<StatusCode> {
+    let entity_type = user_owned(&st, &user, asset_id).await?;
+    soft_delete(&st, asset_id, &entity_type).await?;
+    no_content()
+}
+
+// --- issue attachments ---
+
+const ATTACHMENT_JSON: &str = "jsonb_build_object('id', f.id, 'attributes', f.attributes, 'asset', f.asset,
+    'asset_url', '/api/assets/v2/workspaces/' || w.slug || '/projects/' || f.project_id || '/issues/' || f.issue_id || '/attachments/' || f.id || '/',
+    'issue_id', f.issue_id, 'project_id', f.project_id, 'workspace_id', f.workspace_id, 'size', f.size,
+    'created_at', f.created_at, 'updated_at', f.updated_at, 'created_by', f.created_by_id, 'updated_by', f.updated_by_id)";
+
+/// The issue must belong to this project (and be visible to a restricted guest).
+async fn issue_ctx(
+    st: &AppState,
+    user: &CurrentUser,
+    slug: &str,
+    project_id: Uuid,
+    issue_id: Uuid,
+) -> Result<ProjectCtx, ApiError> {
+    let p = require_project(&st.db, user, slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let ok: (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM issues WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL
+                        AND (NOT $4 OR created_by_id = $5))",
+    )
+    .bind(issue_id)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .bind(p.restricted_guest())
+    .bind(user.id)
+    .fetch_one(&st.db)
+    .await?;
+    if !ok.0 {
+        return Err(ApiError::not_found());
+    }
+    Ok(p)
+}
+
+async fn list_attachments(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult {
+    let p = issue_ctx(&st, &user, &slug, project_id, issue_id).await?;
+    json_rows(
+        sqlx::query_scalar(&format!(
+            "SELECT {ATTACHMENT_JSON} FROM file_assets f JOIN workspaces w ON w.id = f.workspace_id
+             WHERE f.issue_id = $1 AND f.project_id = $2 AND f.workspace_id = $3 AND f.entity_type = 'ISSUE_ATTACHMENT'
+               AND f.is_uploaded AND f.deleted_at IS NULL ORDER BY f.created_at DESC"
+        ))
+        .bind(issue_id)
+        .bind(project_id)
+        .bind(p.workspace_id()),
+        &st.db,
+    )
+    .await
+}
+
+async fn create_attachment(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id)): Path<(String, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = issue_ctx(&st, &user, &slug, project_id, issue_id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let mut v = insert_asset(
+        &st,
+        NewAsset {
+            workspace_id: p.workspace_id(),
+            user_id: user.id,
+            entity_type: "ISSUE_ATTACHMENT",
+            project_id: Some(project_id),
+            issue_id: Some(issue_id),
+            target_user_id: None,
+            page_id: None,
+            comment_id: None,
+            images_only: false,
+        },
+        &b,
+    )
+    .await?
+    .0;
+    let id = v["asset_id"]
+        .as_str()
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(ApiError::not_found)?;
+    let attachment: Value = sqlx::query_scalar(&format!(
+        "SELECT {ATTACHMENT_JSON} FROM file_assets f JOIN workspaces w ON w.id = f.workspace_id WHERE f.id = $1"
+    ))
+    .bind(id)
+    .fetch_one(&st.db)
+    .await?;
+    v["attachment"] = attachment;
+    Ok(Json(v))
+}
+
+async fn download_attachment(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id, asset_id)): Path<(String, Uuid, Uuid, Uuid)>,
+) -> Result<Response, ApiError> {
+    let p = issue_ctx(&st, &user, &slug, project_id, issue_id).await?;
+    let row: Option<(String, Value)> = sqlx::query_as(
+        "SELECT asset, attributes FROM file_assets WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $4
+         AND is_uploaded AND deleted_at IS NULL",
+    )
+    .bind(asset_id)
+    .bind(issue_id)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?;
+    let (key, attrs) = row.ok_or_else(ApiError::not_found)?;
+    serve(&st, &key, &attrs, true).await
+}
+
+async fn mark_attachment_uploaded(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id, asset_id)): Path<(String, Uuid, Uuid, Uuid)>,
+    body: Option<Json<Value>>,
+) -> ApiResult<StatusCode> {
+    let p = issue_ctx(&st, &user, &slug, project_id, issue_id).await?;
+    let (_, entity_type, id) = owned_asset(&st, &p.ws, asset_id, Some(project_id)).await?;
+    set_uploaded(&st, id, &entity_type, &body.map(|b| b.0).unwrap_or_default()).await?;
+    no_content()
+}
+
+async fn delete_attachment(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id, asset_id)): Path<(String, Uuid, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = issue_ctx(&st, &user, &slug, project_id, issue_id).await?;
+    let (_, entity_type, id) = owned_asset(&st, &p.ws, asset_id, Some(project_id)).await?;
+    soft_delete(&st, id, &entity_type).await?;
+    no_content()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filenames_cannot_escape() {
+        assert_eq!(sanitize_filename("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_filename("a\\b\\..\\c.png"), "c.png");
+        assert_eq!(sanitize_filename("..hidden"), "hidden");
+        assert_eq!(sanitize_filename("my file<script>.png"), "my file_script_.png");
+        assert_eq!(sanitize_filename(""), "unnamed");
+    }
+
+    #[test]
+    fn tokens_are_per_asset() {
+        let a = Uuid::new_v4();
+        assert_eq!(token("k", a), token("k", a));
+        assert_ne!(token("k", a), token("k", Uuid::new_v4()));
+        assert_ne!(token("k", a), token("other", a));
+    }
 }
