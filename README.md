@@ -108,6 +108,7 @@ Details: [commit](docs/github/01.GIT-COMMIT.md), [branch](docs/github/02.GIT-BRA
 ```bash
 cargo test                                  # unit tests (Django session and password compatibility, helpers)
 BASE=http://127.0.0.1:3000 tools/smoke.sh   # API smoke test against a running, seeded server
+BASE=http://127.0.0.1:3000 node tools/e2e.mjs  # Plane web app in headless Chromium, lists failing API calls
 scripts/build-web.sh                        # frontend builds
 ```
 
