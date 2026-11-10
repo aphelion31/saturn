@@ -23,6 +23,8 @@ so Plane's unchanged React apps in `web/apps/*` work against the Saturn binary. 
   - Status codes as Plane: create usually `201` (`created(v)`), delete `204` (`no_content()`).
   - Delete = soft delete: `UPDATE ... SET deleted_at = now()`.
   - PATCH with many optional columns: `crate::users::patch_sets(&body, FIELDS, n)` with a fixed whitelist.
+- Every stored rich-text HTML (`description_html`, `comment_html`, page HTML) goes through
+  `sanitize_html(&html)?` first (Plane's nh3 allowlist); `description_stripped` = `strip_tags(&clean)`.
 - Runtime `sqlx::query`/`query_as`/`query_scalar` only, never the `query!` macros. Bind every value.
 - Types: ids are `uuid` (`Uuid`), roles `smallint` (`i16`), timestamps `timestamptz` (use `chrono::DateTime<Utc>`
   or let Postgres put them into JSON), `sort_order` is `float8` (`f64`).
@@ -32,7 +34,7 @@ so Plane's unchanged React apps in `web/apps/*` work against the Saturn binary. 
   alias `i` (start from `workitems::ACTIVE` for normal lists) and `base.and("i.created_by_id = {}", ...)` for
   restricted guests. Single work-item JSON: `workitems::ITEM_JSON`. Do not reimplement grouping.
 - Helpers: `common::{AppState, ApiError, ApiResult, CurrentUser, MaybeUser, require_workspace, require_project,
-  ADMIN, MEMBER, GUEST, json_rows, json_row, created, no_content, s, uuid_of, strip_tags}`,
+  ADMIN, MEMBER, GUEST, json_rows, json_row, created, no_content, s, uuid_of, strip_tags, sanitize_html}`,
   `users::{USER_LITE_JSON, patch_sets}`, `states::{STATE_JSON, slugify}`.
 - Ponytail: smallest correct implementation. Skip Celery side effects (emails, webhooks, activity fan-out) unless
   the UI reads the result; mark skipped bits with `// ponytail: ...`. Do write `issue_activities` rows where the
