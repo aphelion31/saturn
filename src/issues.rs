@@ -54,11 +54,26 @@ fn optional_date(body: &Value, field: &str) -> Result<Option<chrono::NaiveDate>,
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/api/workspaces/{slug}/draft-issues/", get(draft_list).post(draft_create))
+        .route("/api/workspaces/{slug}/draft-issues/{draft_id}/", get(draft_detail).patch(draft_update).delete(draft_delete))
+        .route("/api/workspaces/{slug}/draft-to-issue/{draft_id}/", axum::routing::post(draft_convert))
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/issues/",
             get(list).post(create),
         )
         .route("/api/workspaces/{slug}/projects/{project_id}/issues/list/", get(list))
+        .route("/api/workspaces/{slug}/projects/{project_id}/issues-detail/", get(list))
+        .route("/api/workspaces/{slug}/projects/{project_id}/deleted-issues/", get(deleted_issues))
+        .route("/api/workspaces/{slug}/projects/{project_id}/issue-dates/", axum::routing::post(issue_dates))
+        .route("/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-attachments/{attachment_id}/", axum::routing::delete(legacy_attachment_delete))
+        .route("/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/meta/", get(issue_meta))
+        .route("/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-attachments/", get(legacy_attachments))
+        .route("/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/versions/", get(issue_versions))
+        .route("/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/versions/{version_id}/", get(issue_version))
+        .route("/api/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/description-versions/", get(description_versions))
+        .route("/api/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/description-versions/{version_id}/", get(description_version))
+        .route("/api/workspaces/{slug}/projects/{project_id}/intake-work-items/{issue_id}/description-versions/", get(description_versions))
+        .route("/api/workspaces/{slug}/projects/{project_id}/intake-work-items/{issue_id}/description-versions/{version_id}/", get(description_version))
         .route("/api/workspaces/{slug}/projects/{project_id}/v2/issues/", get(list))
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/archived-issues/",
@@ -160,6 +175,516 @@ pub fn routes() -> Router<AppState> {
 
 type IssuePath = (String, Uuid, Uuid);
 type CommentPath = (String, Uuid, Uuid, Uuid);
+
+const DRAFT_JSON: &str = "jsonb_build_object('id',d.id,'name',d.name,'state_id',d.state_id,'sort_order',d.sort_order,'completed_at',d.completed_at,'estimate_point',d.estimate_point_id,'priority',d.priority,'start_date',d.start_date,'target_date',d.target_date,'project_id',d.project_id,'parent_id',d.parent_id,'cycle_id',(SELECT c.cycle_id FROM draft_issue_cycles c WHERE c.draft_issue_id=d.id AND c.workspace_id=d.workspace_id AND c.deleted_at IS NULL LIMIT 1),'module_ids',COALESCE((SELECT jsonb_agg(m.module_id) FROM draft_issue_modules m WHERE m.draft_issue_id=d.id AND m.workspace_id=d.workspace_id AND m.deleted_at IS NULL),'[]'::jsonb),'label_ids',COALESCE((SELECT jsonb_agg(l.label_id) FROM draft_issue_labels l WHERE l.draft_issue_id=d.id AND l.workspace_id=d.workspace_id AND l.deleted_at IS NULL),'[]'::jsonb),'assignee_ids',COALESCE((SELECT jsonb_agg(a.assignee_id) FROM draft_issue_assignees a WHERE a.draft_issue_id=d.id AND a.workspace_id=d.workspace_id AND a.deleted_at IS NULL),'[]'::jsonb),'created_at',d.created_at,'updated_at',d.updated_at,'created_by',d.created_by_id,'updated_by',d.updated_by_id,'type_id',d.type_id,'description_html',d.description_html)";
+
+async fn draft_list(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(slug): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER, GUEST])?;
+    let size = q
+        .get("per_page")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(1000)
+        .clamp(1, 1000);
+    let page = q
+        .get("cursor")
+        .and_then(|s| s.split(':').nth(1))
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0)
+        .clamp(0, i64::MAX / size);
+    let total: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM draft_issues WHERE workspace_id=$1 AND created_by_id=$2 AND deleted_at IS NULL",
+    )
+    .bind(ws.workspace_id)
+    .bind(user.id)
+    .fetch_one(&st.db)
+    .await?;
+    let results: Vec<Value> = sqlx::query_scalar(&format!("SELECT {DRAFT_JSON} FROM draft_issues d WHERE d.workspace_id=$1 AND d.created_by_id=$2 AND d.deleted_at IS NULL ORDER BY d.created_at DESC,d.id DESC LIMIT $3 OFFSET $4")).bind(ws.workspace_id).bind(user.id).bind(size).bind(page*size).fetch_all(&st.db).await?;
+    Ok(Json(
+        serde_json::json!({"grouped_by":null,"sub_grouped_by":null,"total_count":total,"next_cursor":format!("{size}:{}:0",page+1),"prev_cursor":format!("{size}:{}:1",page-1),"next_page_results":page.saturating_add(1).saturating_mul(size)<total,"prev_page_results":page>0,"count":results.len(),"total_pages":(total+size-1)/size,"total_results":total,"extra_stats":null,"results":results}),
+    ))
+}
+
+async fn draft_detail(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, id)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER, GUEST])?;
+    json_row(sqlx::query_scalar(&format!("SELECT {DRAFT_JSON} FROM draft_issues d WHERE d.workspace_id=$1 AND d.created_by_id=$2 AND d.id=$3 AND d.deleted_at IS NULL")).bind(ws.workspace_id).bind(user.id).bind(id),&st.db).await
+}
+
+async fn draft_save(
+    st: &AppState,
+    user: &CurrentUser,
+    slug: &str,
+    id: Option<Uuid>,
+    mut body: Value,
+) -> Result<Value, ApiError> {
+    let ws = require_workspace(&st.db, user, slug).await?;
+    ws.require(&[ADMIN, MEMBER, GUEST])?;
+    if body.as_object().is_none_or(|fields| {
+        fields.keys().any(|key| {
+            ![
+                "project_id",
+                "name",
+                "description_html",
+                "description_json",
+                "priority",
+                "start_date",
+                "target_date",
+                "sort_order",
+                "state_id",
+                "parent_id",
+                "estimate_point",
+                "type_id",
+                "assignee_ids",
+                "label_ids",
+                "module_ids",
+                "cycle_id",
+            ]
+            .contains(&key.as_str())
+        })
+    }) {
+        return Err(ApiError::bad("Unsupported draft field"));
+    }
+    let existing: Option<Option<Uuid>> = if let Some(id) = id {
+        Some(sqlx::query_scalar("SELECT project_id FROM draft_issues WHERE id=$1 AND workspace_id=$2 AND created_by_id=$3 AND deleted_at IS NULL").bind(id).bind(ws.workspace_id).bind(user.id).fetch_optional(&st.db).await?.ok_or_else(ApiError::not_found)?)
+    } else {
+        None
+    };
+    let supplied = optional_uuid(&body, "project_id")?;
+    let project = existing.unwrap_or(supplied);
+    if existing.is_some() && body.get("project_id").is_some() && supplied != project {
+        return Err(ApiError::bad("Draft project cannot be changed"));
+    }
+    if let Some(project) = project {
+        require_project(&st.db, user, slug, project)
+            .await?
+            .require(&[ADMIN, MEMBER])?;
+    }
+    if let Some(html) = body.get("description_html") {
+        let clean = sanitize_html(html.as_str().ok_or_else(|| ApiError::bad("Invalid description_html"))?)?;
+        body["description_stripped"] = Value::String(strip_tags(&clean));
+        body["description_html"] = Value::String(clean);
+    }
+    if let Some(name) = body.get("name") {
+        if !name.is_null() && name.as_str().is_none_or(|s| s.chars().count() > 255) {
+            return Err(ApiError::bad("Invalid name"));
+        }
+    }
+    if let Some(priority) = body.get("priority") {
+        if !priority
+            .as_str()
+            .is_some_and(|p| ["none", "urgent", "high", "medium", "low"].contains(&p))
+        {
+            return Err(ApiError::bad("Invalid priority"));
+        }
+    }
+    let start = optional_date(&body, "start_date")?;
+    let target = optional_date(&body, "target_date")?;
+    if start.zip(target).is_some_and(|(a, b)| a > b) {
+        return Err(ApiError::bad("Start date cannot exceed target date"));
+    }
+    let mut tx = st.db.begin().await?;
+    for (field, sql) in [
+        (
+            "state_id",
+            "SELECT EXISTS(SELECT 1 FROM states WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL)",
+        ),
+        (
+            "parent_id",
+            "SELECT EXISTS(SELECT 1 FROM issues WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL)",
+        ),
+        (
+            "estimate_point",
+            "SELECT EXISTS(SELECT 1 FROM estimate_points WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL)",
+        ),
+        (
+            "type_id",
+            "SELECT EXISTS(SELECT 1 FROM issue_types WHERE id=$1 AND $2::uuid IS NOT NULL AND workspace_id=$3 AND deleted_at IS NULL)",
+        ),
+    ] {
+        if let Some(value) = optional_uuid(&body, field)? {
+            let valid: bool = sqlx::query_scalar(sql)
+                .bind(value)
+                .bind(project)
+                .bind(ws.workspace_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            if !valid {
+                return Err(ApiError::bad("Invalid related object"));
+            }
+        }
+    }
+    let id = if let Some(id) = id {
+        id
+    } else {
+        sqlx::query_scalar("INSERT INTO draft_issues (workspace_id,project_id,created_by_id,updated_by_id) VALUES ($1,$2,$3,$3) RETURNING id").bind(ws.workspace_id).bind(project).bind(user.id).fetch_one(&mut *tx).await?
+    };
+    let fields = [
+        ("name", "text"),
+        ("description_html", "text"),
+        ("description_stripped", "text"),
+        ("description_json", "jsonb"),
+        ("priority", "text"),
+        ("start_date", "date"),
+        ("target_date", "date"),
+        ("sort_order", "float8"),
+        ("state_id", "uuid"),
+        ("parent_id", "uuid"),
+        ("type_id", "uuid"),
+    ];
+    let mut sets = crate::users::patch_sets(&body, &fields, 4);
+    if body.get("estimate_point").is_some() {
+        sets.push("estimate_point_id=($4::jsonb->>'estimate_point')::uuid".into());
+    }
+    sets.push("updated_at=now()".into());
+    sets.push("updated_by_id=$2".into());
+    sqlx::query(&format!(
+        "UPDATE draft_issues SET {} WHERE id=$1 AND created_by_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+        sets.join(",")
+    ))
+    .bind(id)
+    .bind(user.id)
+    .bind(ws.workspace_id)
+    .bind(&body)
+    .execute(&mut *tx)
+    .await?;
+    let dates: (Option<chrono::NaiveDate>,Option<chrono::NaiveDate>)=sqlx::query_as("SELECT start_date,target_date FROM draft_issues WHERE id=$1 AND workspace_id=$2 AND created_by_id=$3 AND deleted_at IS NULL").bind(id).bind(ws.workspace_id).bind(user.id).fetch_one(&mut *tx).await?;
+    if dates.0.zip(dates.1).is_some_and(|(a, b)| a > b) {
+        return Err(ApiError::bad("Start date cannot exceed target date"));
+    }
+    for (field, table, column, check) in [
+        (
+            "assignee_ids",
+            "draft_issue_assignees",
+            "assignee_id",
+            "SELECT EXISTS(SELECT 1 FROM project_members WHERE member_id=$1 AND project_id=$2 AND workspace_id=$3 AND is_active AND role>=15 AND deleted_at IS NULL)",
+        ),
+        (
+            "label_ids",
+            "draft_issue_labels",
+            "label_id",
+            "SELECT EXISTS(SELECT 1 FROM labels WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL)",
+        ),
+        (
+            "module_ids",
+            "draft_issue_modules",
+            "module_id",
+            "SELECT EXISTS(SELECT 1 FROM modules WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL)",
+        ),
+        (
+            "cycle_id",
+            "draft_issue_cycles",
+            "cycle_id",
+            "SELECT EXISTS(SELECT 1 FROM cycles WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL)",
+        ),
+    ] {
+        if body.get(field).is_none() {
+            continue;
+        }
+        let values = if field == "cycle_id" {
+            optional_uuid(&body, field)?.into_iter().collect()
+        } else {
+            uuid_list(&body, field)?
+        };
+        sqlx::query(&format!(
+            "UPDATE {table} SET deleted_at=now() WHERE draft_issue_id=$1 AND workspace_id=$2 AND deleted_at IS NULL"
+        ))
+        .bind(id)
+        .bind(ws.workspace_id)
+        .execute(&mut *tx)
+        .await?;
+        let mut seen = std::collections::HashSet::new();
+        for value in values {
+            let valid: bool = sqlx::query_scalar(check)
+                .bind(value)
+                .bind(project)
+                .bind(ws.workspace_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            if !valid || !seen.insert(value) {
+                return Err(ApiError::bad("Invalid or duplicate related object"));
+            }
+            sqlx::query(&format!("INSERT INTO {table} (draft_issue_id,workspace_id,project_id,{column},created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$5,$5)")).bind(id).bind(ws.workspace_id).bind(project).bind(value).bind(user.id).execute(&mut *tx).await?;
+        }
+    }
+    let result=sqlx::query_scalar(&format!("SELECT {DRAFT_JSON} FROM draft_issues d WHERE d.id=$1 AND d.workspace_id=$2 AND d.created_by_id=$3 AND d.deleted_at IS NULL")).bind(id).bind(ws.workspace_id).bind(user.id).fetch_one(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+async fn draft_create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(slug): Path<String>,
+    Json(body): Json<Value>,
+) -> ApiResult<(axum::http::StatusCode, Json<Value>)> {
+    created(draft_save(&st, &user, &slug, None, body).await?)
+}
+async fn draft_update(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, id)): Path<(String, Uuid)>,
+    Json(body): Json<Value>,
+) -> ApiResult<axum::http::StatusCode> {
+    draft_save(&st, &user, &slug, Some(id), body).await?;
+    no_content()
+}
+async fn draft_delete(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, id)): Path<(String, Uuid)>,
+) -> ApiResult<axum::http::StatusCode> {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER, GUEST])?;
+    let n=sqlx::query("UPDATE draft_issues SET deleted_at=now() WHERE id=$1 AND workspace_id=$2 AND created_by_id=$3 AND deleted_at IS NULL").bind(id).bind(ws.workspace_id).bind(user.id).execute(&st.db).await?.rows_affected();
+    if n == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
+}
+
+async fn draft_convert(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, id)): Path<(String, Uuid)>,
+    Json(body): Json<Value>,
+) -> ApiResult<(axum::http::StatusCode, Json<Value>)> {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER])?;
+    let mut tx = st.db.begin().await?;
+    let draft:Value=sqlx::query_scalar(&format!("SELECT {DRAFT_JSON} FROM draft_issues d WHERE d.id=$1 AND d.workspace_id=$2 AND d.created_by_id=$3 AND d.deleted_at IS NULL FOR UPDATE")).bind(id).bind(ws.workspace_id).bind(user.id).fetch_optional(&mut *tx).await?.ok_or_else(ApiError::not_found)?;
+    let project =
+        uuid_of(&draft, "project_id").ok_or_else(|| ApiError::bad("Project is required to create an issue."))?;
+    let p = require_project(&st.db, &user, &slug, project).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let mut input = serde_json::Map::new();
+    for key in [
+        "name",
+        "state_id",
+        "assignee_ids",
+        "label_ids",
+        "priority",
+        "description_html",
+        "parent_id",
+        "start_date",
+        "target_date",
+        "estimate_point",
+        "sort_order",
+        "cycle_id",
+        "module_ids",
+        "type_id",
+    ] {
+        if let Some(v) = body.get(key).or_else(|| draft.get(key)) {
+            if !v.is_null() {
+                input.insert(key.into(), v.clone());
+            }
+        }
+    }
+    let result = create_issue(&mut tx, &user, &p, &Value::Object(input)).await?;
+    let issue = uuid_of(&result, "id").ok_or_else(|| ApiError::bad("Missing issue id"))?;
+    sqlx::query("UPDATE issues SET description_json=(SELECT description_json FROM draft_issues WHERE id=$2 AND workspace_id=$3 AND created_by_id=$5 AND deleted_at IS NULL) WHERE id=$1 AND workspace_id=$3 AND project_id=$4 AND deleted_at IS NULL")
+        .bind(issue).bind(id).bind(ws.workspace_id).bind(project).bind(user.id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE file_assets SET issue_id=$1,draft_issue_id=NULL,entity_type='ISSUE_DESCRIPTION' WHERE draft_issue_id=$2 AND workspace_id=$3 AND project_id=$4 AND deleted_at IS NULL").bind(issue).bind(id).bind(ws.workspace_id).bind(project).execute(&mut *tx).await?;
+    sqlx::query("UPDATE draft_issues SET deleted_at=now() WHERE id=$1 AND workspace_id=$2 AND created_by_id=$3 AND deleted_at IS NULL").bind(id).bind(ws.workspace_id).bind(user.id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    created(result)
+}
+
+async fn issue_dates(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project)): Path<(String, Uuid)>,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let updates = body
+        .get("updates")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError::bad("Invalid updates"))?;
+    let mut tx = st.db.begin().await?;
+    for update in updates {
+        let id = optional_uuid(update, "id")?.ok_or_else(|| ApiError::bad("Invalid issue id"))?;
+        let start = optional_date(update, "start_date")?;
+        let target = optional_date(update, "target_date")?;
+        let dates: Option<(Option<chrono::NaiveDate>, Option<chrono::NaiveDate>)> = sqlx::query_as("SELECT start_date,target_date FROM issues WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL FOR UPDATE").bind(id).bind(project).bind(p.workspace_id()).fetch_optional(&mut *tx).await?;
+        if let Some((old_start, old_target)) = dates {
+            if start
+                .or(old_start)
+                .zip(target.or(old_target))
+                .is_some_and(|(a, b)| a > b)
+            {
+                return Err(ApiError::bad_body(
+                    serde_json::json!({"message":"Start date cannot exceed target date"}),
+                ));
+            }
+            sqlx::query("UPDATE issues SET start_date=COALESCE($4,start_date),target_date=COALESCE($5,target_date),updated_at=now(),updated_by_id=$6 WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL").bind(id).bind(project).bind(p.workspace_id()).bind(start).bind(target).bind(user.id).execute(&mut *tx).await?;
+        }
+    }
+    // ponytail: asynchronous activity fan-out is omitted until a shared activity helper is available.
+    tx.commit().await?;
+    Ok(Json(serde_json::json!({"message":"Issues updated successfully"})))
+}
+
+async fn legacy_attachment_delete(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, issue, id)): Path<CommentPath>,
+) -> ApiResult<axum::http::StatusCode> {
+    let p = visible_issue(&st, &user, &slug, project, issue).await?;
+    let owner: Option<Option<Uuid>> = sqlx::query_scalar("SELECT created_by_id FROM file_assets WHERE id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND entity_type='ISSUE_ATTACHMENT' AND deleted_at IS NULL").bind(id).bind(issue).bind(project).bind(p.workspace_id()).fetch_optional(&st.db).await?;
+    if owner.ok_or_else(ApiError::not_found)? != Some(user.id) {
+        p.require(&[ADMIN])?;
+    }
+    sqlx::query("UPDATE file_assets SET deleted_at=now(),is_deleted=true WHERE id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND deleted_at IS NULL").bind(id).bind(issue).bind(project).bind(p.workspace_id()).execute(&st.db).await?;
+    no_content()
+}
+
+async fn issue_meta(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, issue)): Path<IssuePath>,
+) -> ApiResult {
+    let p = visible_issue(&st, &user, &slug, project, issue).await?;
+    json_row(sqlx::query_scalar("SELECT jsonb_build_object('sequence_id',i.sequence_id,'project_identifier',p.identifier) FROM issues i JOIN projects p ON p.id=i.project_id AND p.workspace_id=i.workspace_id WHERE i.id=$1 AND i.project_id=$2 AND i.workspace_id=$3 AND i.deleted_at IS NULL AND p.deleted_at IS NULL").bind(issue).bind(project).bind(p.workspace_id()), &st.db).await
+}
+
+async fn deleted_issues(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project)): Path<(String, Uuid)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let after = q
+        .get("updated_at__gt")
+        .map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|d| d.to_utc())
+                .map_err(|_| ApiError::bad("Invalid updated_at__gt"))
+        })
+        .transpose()?;
+    json_rows(sqlx::query_scalar("SELECT to_jsonb(id) FROM issues WHERE workspace_id=$1 AND project_id=$2 AND (deleted_at IS NOT NULL OR archived_at IS NOT NULL) AND ($3::timestamptz IS NULL OR updated_at>$3) AND (NOT $4 OR created_by_id=$5) ORDER BY created_at DESC").bind(p.workspace_id()).bind(project).bind(after).bind(p.restricted_guest()).bind(user.id), &st.db).await
+}
+
+async fn legacy_attachments(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, issue)): Path<IssuePath>,
+) -> ApiResult {
+    let p = visible_issue(&st, &user, &slug, project, issue).await?;
+    json_rows(sqlx::query_scalar("SELECT (to_jsonb(f)-'workspace_id'-'project_id'-'issue_id'-'created_by_id'-'updated_by_id'-'comment_id'-'page_id'-'user_id'-'draft_issue_id') || jsonb_build_object('workspace',f.workspace_id,'project',f.project_id,'issue',f.issue_id,'created_by',f.created_by_id,'updated_by',f.updated_by_id,'comment',f.comment_id,'page',f.page_id,'user',f.user_id,'draft_issue',f.draft_issue_id,'asset_url','/api/assets/v2/workspaces/' || $4 || '/projects/' || f.project_id || '/issues/' || f.issue_id || '/attachments/' || f.id || '/') FROM file_assets f WHERE f.workspace_id=$1 AND f.project_id=$2 AND f.issue_id=$3 AND f.entity_type='ISSUE_ATTACHMENT' AND f.deleted_at IS NULL ORDER BY f.created_at DESC").bind(p.workspace_id()).bind(project).bind(issue).bind(slug), &st.db).await
+}
+
+const VERSION_SUMMARY: &str = "jsonb_build_object('id',v.id,'workspace',v.workspace_id,'project',v.project_id,'issue',v.issue_id,'last_saved_at',v.last_saved_at,'owned_by',v.owned_by_id,'created_at',v.created_at,'updated_at',v.updated_at,'created_by',v.created_by_id,'updated_by',v.updated_by_id)";
+
+async fn versions(
+    st: AppState,
+    user: CurrentUser,
+    (slug, project, issue): IssuePath,
+    q: HashMap<String, String>,
+    description: bool,
+) -> ApiResult {
+    let p = visible_issue(&st, &user, &slug, project, issue).await?;
+    let (size, page) = if let Some(cursor) = q.get("cursor") {
+        let parts: Vec<_> = cursor.split(':').collect();
+        if parts.len() != 3 {
+            return Err(ApiError::bad("Invalid cursor"));
+        }
+        let size = parts[0]
+            .parse::<i64>()
+            .map_err(|_| ApiError::bad("Invalid cursor"))?
+            .clamp(1, 1000);
+        let page = parts[1]
+            .parse::<i64>()
+            .map_err(|_| ApiError::bad("Invalid cursor"))?
+            .max(0);
+        parts[2].parse::<i64>().map_err(|_| ApiError::bad("Invalid cursor"))?;
+        (size, page)
+    } else {
+        (1000, 0)
+    };
+    let offset = page.checked_mul(size).ok_or_else(|| ApiError::bad("Invalid cursor"))?;
+    let table = if description {
+        "issue_description_versions"
+    } else {
+        "issue_versions"
+    };
+    let total: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table} v WHERE v.workspace_id=$1 AND v.project_id=$2 AND v.issue_id=$3 AND v.deleted_at IS NULL")).bind(p.workspace_id()).bind(project).bind(issue).fetch_one(&st.db).await?;
+    let results: Vec<Value> = sqlx::query_scalar(&format!("SELECT {VERSION_SUMMARY} FROM {table} v WHERE v.workspace_id=$1 AND v.project_id=$2 AND v.issue_id=$3 AND v.deleted_at IS NULL ORDER BY v.created_at DESC,v.id DESC LIMIT $4 OFFSET $5")).bind(p.workspace_id()).bind(project).bind(issue).bind(size).bind(offset).fetch_all(&st.db).await?;
+    let next = offset.saturating_add(size) < total;
+    Ok(Json(
+        serde_json::json!({"prev_cursor":format!("{size}:{}:0",page-1),"cursor":format!("{size}:{page}:0"),"next_cursor":if next { Some(format!("{size}:{}:0",page+1)) } else { None },"prev_page_results":page>0,"next_page_results":next,"page_count":results.len(),"total_results":total,"total_pages":(total+size-1)/size,"results":results}),
+    ))
+}
+
+async fn issue_versions(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(path): Path<IssuePath>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    versions(st, user, path, q, false).await
+}
+async fn description_versions(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(path): Path<IssuePath>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    versions(st, user, path, q, true).await
+}
+
+async fn version(
+    st: AppState,
+    user: CurrentUser,
+    (slug, project, issue, id): CommentPath,
+    description: bool,
+) -> ApiResult {
+    let p = visible_issue(&st, &user, &slug, project, issue).await?;
+    let table = if description {
+        "issue_description_versions"
+    } else {
+        "issue_versions"
+    };
+    let excluded = if description {
+        "'deleted_at'"
+    } else {
+        "'deleted_at'-'properties'-'activity_id'"
+    };
+    let sql = format!(
+        "SELECT (to_jsonb(v)-{excluded}-'workspace_id'-'project_id'-'issue_id'-'owned_by_id'-'created_by_id'-'updated_by_id') || {VERSION_SUMMARY} FROM {table} v WHERE v.workspace_id=$1 AND v.project_id=$2 AND v.issue_id=$3 AND v.id=$4 AND v.deleted_at IS NULL"
+    );
+    json_row(
+        sqlx::query_scalar(&sql)
+            .bind(p.workspace_id())
+            .bind(project)
+            .bind(issue)
+            .bind(id),
+        &st.db,
+    )
+    .await
+}
+async fn issue_version(State(st): State<AppState>, user: CurrentUser, Path(path): Path<CommentPath>) -> ApiResult {
+    version(st, user, path, false).await
+}
+async fn description_version(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(path): Path<CommentPath>,
+) -> ApiResult {
+    version(st, user, path, true).await
+}
 
 async fn search_issues(
     State(st): State<AppState>,
@@ -1208,6 +1733,20 @@ async fn create(
 ) -> ApiResult<(axum::http::StatusCode, Json<Value>)> {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER])?;
+    let mut tx = st.db.begin().await?;
+    let result = create_issue(&mut tx, &user, &p, &body).await?;
+    tx.commit().await?;
+    created(result)
+}
+
+async fn create_issue(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user: &CurrentUser,
+    p: &ProjectCtx,
+    body: &Value,
+) -> Result<Value, ApiError> {
+    let project_id = p.project_id;
+    let tx = &mut **tx;
     let name = s(&body, "name")
         .filter(|n| !n.trim().is_empty() && n.chars().count() <= 255)
         .ok_or_else(|| ApiError::bad("A name of at most 255 characters is required"))?;
@@ -1240,7 +1779,6 @@ async fn create(
     } else {
         None
     };
-    let mut tx = st.db.begin().await?;
     let assignees = uuid_list(&body, "assignee_ids")?;
     let labels = uuid_list(&body, "label_ids")?;
     let modules = uuid_list(&body, "module_ids")?;
@@ -1365,8 +1903,7 @@ async fn create(
     .bind(p.workspace_id())
     .fetch_one(&mut *tx)
     .await?;
-    tx.commit().await?;
-    created(result)
+    Ok(result)
 }
 
 async fn archived_list(
