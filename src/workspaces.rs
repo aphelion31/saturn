@@ -1214,12 +1214,57 @@ async fn user_stats(
     .bind(ws.workspace_id)
     .fetch_one(&st.db)
     .await?;
+    // Plane's profile overview maps over state_distribution, so a missing key crashes the page.
+    const ASSIGNED: &str = "EXISTS (SELECT 1 FROM issue_assignees a WHERE a.issue_id = i.id AND a.assignee_id = $2
+        AND a.deleted_at IS NULL)";
+    const BASE: &str = "i.workspace_id = $3 AND i.deleted_at IS NULL AND i.archived_at IS NULL AND NOT i.is_draft";
+    let dist: (Value, Value) = sqlx::query_as(&format!(
+        "SELECT
+           COALESCE((SELECT jsonb_agg(jsonb_build_object('state_group', g, 'state_count', n) ORDER BY g)
+             FROM (SELECT s.\"group\" AS g, count(*) AS n FROM issues i JOIN states s ON s.id = i.state_id
+                   WHERE {BASE} AND {VISIBLE_ISSUE} AND {ASSIGNED} GROUP BY s.\"group\") x), '[]'::jsonb),
+           COALESCE((SELECT jsonb_agg(jsonb_build_object('priority', p, 'priority_count', n)
+                 ORDER BY array_position(ARRAY['urgent','high','medium','low','none'], p))
+             FROM (SELECT i.priority AS p, count(*) AS n FROM issues i
+                   WHERE {BASE} AND {VISIBLE_ISSUE} AND {ASSIGNED} GROUP BY i.priority) x), '[]'::jsonb)"
+    ))
+    .bind(user.id)
+    .bind(target)
+    .bind(ws.workspace_id)
+    .fetch_one(&st.db)
+    .await?;
+    let cycles = |when: &'static str| {
+        format!(
+            "SELECT COALESCE(jsonb_agg(DISTINCT jsonb_build_object('cycle__name', c.name, 'cycle__id', c.id,
+                 'cycle__project_id', c.project_id)), '[]'::jsonb)
+             FROM cycle_issues ci JOIN cycles c ON c.id = ci.cycle_id AND c.project_id = ci.project_id
+             JOIN issues i ON i.id = ci.issue_id
+             WHERE {BASE} AND ci.deleted_at IS NULL AND c.deleted_at IS NULL AND {VISIBLE_ISSUE} AND {ASSIGNED}
+               AND {when}"
+        )
+    };
+    let present: Value = sqlx::query_scalar(&cycles("c.start_date < now() AND c.end_date > now()"))
+        .bind(user.id)
+        .bind(target)
+        .bind(ws.workspace_id)
+        .fetch_one(&st.db)
+        .await?;
+    let upcoming: Value = sqlx::query_scalar(&cycles("c.start_date > now()"))
+        .bind(user.id)
+        .bind(target)
+        .bind(ws.workspace_id)
+        .fetch_one(&st.db)
+        .await?;
     Ok(Json(json!({
+        "state_distribution": dist.0,
+        "priority_distribution": dist.1,
         "created_issues": counts.0,
         "assigned_issues": counts.1,
         "completed_issues": counts.2,
         "pending_issues": counts.3,
         "subscribed_issues": counts.4,
+        "present_cycles": present,
+        "upcoming_cycles": upcoming,
     })))
 }
 
