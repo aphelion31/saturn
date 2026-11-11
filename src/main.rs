@@ -2,6 +2,7 @@ mod api_v1;
 mod auth;
 mod common;
 mod instance;
+mod outbound;
 mod session;
 mod web;
 mod workitems;
