@@ -419,12 +419,25 @@ async fn member_remove(
             "User is a part of some projects where they are the only admin, they should either leave that project or promote another user to admin.",
         ));
     }
-    deactivate_member(&st.db, ws.workspace_id, target.0, target.1).await?;
+    deactivate_member(&st.db, ws.workspace_id, target.0, target.1, true).await?;
     no_content()
 }
 
-async fn deactivate_member(db: &sqlx::PgPool, workspace_id: Uuid, wm_id: Uuid, member: Uuid) -> Result<(), ApiError> {
+async fn deactivate_member(
+    db: &sqlx::PgPool,
+    workspace_id: Uuid,
+    wm_id: Uuid,
+    member: Uuid,
+    revoke: bool,
+) -> Result<(), ApiError> {
     let mut tx = db.begin().await?;
+    if revoke {
+        sqlx::query("UPDATE workspace_member_invites SET deleted_at = now() WHERE workspace_id = $1 AND deleted_at IS NULL AND lower(email) = (SELECT lower(email) FROM users WHERE id = $2)")
+            .bind(workspace_id)
+            .bind(member)
+            .execute(&mut *tx)
+            .await?;
+    }
     sqlx::query("UPDATE project_members SET is_active = false, updated_at = now() WHERE workspace_id = $1 AND member_id = $2 AND is_active")
         .bind(workspace_id)
         .bind(member)
@@ -467,7 +480,7 @@ async fn leave(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<S
     .bind(user.id)
     .fetch_one(&st.db)
     .await?;
-    deactivate_member(&st.db, ws.workspace_id, wm.0, user.id).await?;
+    deactivate_member(&st.db, ws.workspace_id, wm.0, user.id, false).await?;
     no_content()
 }
 

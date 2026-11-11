@@ -294,12 +294,13 @@ async fn update_profile(State(st): State<AppState>, user: CurrentUser, Json(b): 
     let mut sets = patch_sets(&b, PROFILE_FIELDS, 2);
     sets.push("updated_at = now()".into());
     let result: Value = sqlx::query_scalar(&format!(
-            "UPDATE profiles p SET {} WHERE p.user_id = $1 RETURNING {PROFILE_JSON}",
-            sets.join(", ")
-        ))
-        .bind(user.id)
-        .bind(&b)
-        .fetch_one(&mut *tx).await?;
+        "UPDATE profiles p SET {} WHERE p.user_id = $1 RETURNING {PROFILE_JSON}",
+        sets.join(", ")
+    ))
+    .bind(user.id)
+    .bind(&b)
+    .fetch_one(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(Json(result))
 }
