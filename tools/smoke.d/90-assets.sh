@@ -16,7 +16,7 @@ call DELETE "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/$ASSET/"
 
 # Plane #10128 & #9551: empty MIME (.txt) and .md attachment files accepted
 WS_ID=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "select id from workspaces where slug='$SLUG'")
-ISSUE_ID=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "select id from issues where workspace_id='$WS_ID' limit 1")
+ISSUE_ID=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "select id from issues where workspace_id='$WS_ID' and project_id='$PROJECT' and deleted_at is null limit 1")
 if [ -n "$ISSUE_ID" ]; then
   # Empty MIME type
   call POST "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE_ID/attachments/" '{"name":"notes.txt","type":"","size":5}'

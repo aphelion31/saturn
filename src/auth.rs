@@ -361,7 +361,8 @@ pub async fn create_user(
         .await?;
     sqlx::query(
         "INSERT INTO user_notification_preferences (user_id, property_change, state_change, comment, mention, issue_completed)
-         VALUES ($1, true, true, true, true, true)",
+         SELECT $1, true, true, true, true, true
+         WHERE NOT EXISTS (SELECT 1 FROM user_notification_preferences WHERE user_id = $1 AND deleted_at IS NULL)",
     )
     .bind(id)
     .execute(&mut *tx)

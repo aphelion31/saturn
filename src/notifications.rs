@@ -609,6 +609,45 @@ async fn mark_all_read(
     Ok(Json(json!({"message": "Successful"})))
 }
 
+/// Create an in-app notification without creating duplicates (Plane #9600).
+#[allow(dead_code)]
+pub async fn create_notification(
+    db: &sqlx::PgPool,
+    workspace_id: Uuid,
+    receiver_id: Uuid,
+    entity_name: &str,
+    entity_identifier: Uuid,
+    title: &str,
+    message_html: &str,
+    sender: &str,
+    triggered_by_id: Option<Uuid>,
+) -> Result<Option<Uuid>, ApiError> {
+    let id = Uuid::new_v4();
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        "INSERT INTO notifications (id, created_at, updated_at, workspace_id, receiver_id, entity_name,
+                                    entity_identifier, title, message_html, sender, triggered_by_id)
+         SELECT $1, now(), now(), $2, $3, $4, $5, $6, $7, $8, $9
+         WHERE NOT EXISTS (
+             SELECT 1 FROM notifications
+             WHERE workspace_id = $2 AND receiver_id = $3 AND entity_name = $4
+               AND entity_identifier = $5 AND sender = $8 AND deleted_at IS NULL
+         )
+         RETURNING id",
+    )
+    .bind(id)
+    .bind(workspace_id)
+    .bind(receiver_id)
+    .bind(entity_name)
+    .bind(entity_identifier)
+    .bind(title)
+    .bind(message_html)
+    .bind(sender)
+    .bind(triggered_by_id)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|(id,)| id))
+}
+
 // =========================================================================
 // 2. User Notification Preferences (/api/users/me/notification-preferences/)
 // =========================================================================
