@@ -392,6 +392,15 @@ async fn sign_in(st: AppState, headers: HeaderMap, f: AuthForm, app: App) -> Res
         .execute(&st.db)
         .await?;
     join_accepted_invites(&st, id, &email).await?;
+    let uagent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    sqlx::query("UPDATE users SET last_login_uagent = $2 WHERE id = $1")
+        .bind(id)
+        .bind(uagent)
+        .execute(&st.db)
+        .await?;
     let key = session::create(&st, id, false, device_info(&headers, &st, app)).await?;
     let path = if !next.is_empty() {
         next.clone()
@@ -689,6 +698,15 @@ async fn admin_sign_in(
     if !active || !session::check_password(&password, &hash) || !is_instance_admin(&st, id).await? {
         return Ok(back("ADMIN_AUTHENTICATION_FAILED"));
     }
+    let uagent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    sqlx::query("UPDATE users SET last_login_uagent = $2 WHERE id = $1")
+        .bind(id)
+        .bind(uagent)
+        .execute(&st.db)
+        .await?;
     let key = session::create(&st, id, true, device_info(&headers, &st, App::Admin)).await?;
     let to = format!("{}general/", base(&st, App::Admin));
     Ok(redirect_with_cookie(
