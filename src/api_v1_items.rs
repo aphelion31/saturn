@@ -92,6 +92,14 @@ pub fn routes() -> Router<AppState> {
             get(relation_list).post(relation_create),
         )
         .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/relations/remove/",
+            axum::routing::post(relation_remove),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/relations/remove/",
+            axum::routing::post(relation_remove),
+        )
+        .route(
             "/api/v1/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/attachments/",
             get(attachment_list),
         )
@@ -250,6 +258,38 @@ async fn relation_create(
     }
     tx.commit().await?;
     created(Value::Array(out))
+}
+
+async fn relation_remove(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id)): SubPath,
+    Json(b): Json<Value>,
+) -> ApiResult<StatusCode> {
+    let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let related_id = b
+        .get("related_issue")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| ApiError::bad("Invalid related_issue"))?;
+
+    let r = sqlx::query(
+        "UPDATE issue_relations SET deleted_at = now(), updated_at = now(), updated_by_id = $4
+         WHERE workspace_id = $1 AND deleted_at IS NULL
+           AND ((issue_id = $2 AND related_issue_id = $3) OR (issue_id = $3 AND related_issue_id = $2))",
+    )
+    .bind(p.workspace_id())
+    .bind(issue_id)
+    .bind(related_id)
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
+
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
 }
 
 // ---- attachments: list and delete. Upload stays on /api/assets/v2 (see gaps in report). ----
@@ -722,16 +762,51 @@ async fn list(
     State(st): State<AppState>,
     user: CurrentUser,
     Path((slug, project_id)): Path<(String, Uuid)>,
-    Query(q): Query<HashMap<String, String>>,
+    Query(mut q): Query<HashMap<String, String>>,
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER, GUEST])?;
+    if let Some(v) = q.get("per_page") {
+        let ok = v.parse::<usize>().ok().is_some_and(|n| (1..=1000).contains(&n));
+        if !ok {
+            return Err(ApiError::bad("Invalid per_page parameter."));
+        }
+    }
+    let requested_group_by = q.get("group_by").cloned();
+    if let Some(ref g) = requested_group_by {
+        let mapped = match g.as_str() {
+            "state" => "state_id",
+            "labels" | "label_ids" => "labels__id",
+            "assignees" | "assignee_ids" => "assignees__id",
+            "cycle" | "cycles" => "cycle_id",
+            "module" | "modules" | "module_ids" => "issue_module__module_id",
+            other => other,
+        };
+        q.insert("group_by".to_string(), mapped.to_string());
+    }
+    if let Some(sg) = q.get("sub_group_by").cloned() {
+        let mapped = match sg.as_str() {
+            "state" => "state_id",
+            "labels" | "label_ids" => "labels__id",
+            "assignees" | "assignee_ids" => "assignees__id",
+            "cycle" | "cycles" => "cycle_id",
+            "module" | "modules" | "module_ids" => "issue_module__module_id",
+            other => other,
+        };
+        q.insert("sub_group_by".to_string(), mapped.to_string());
+    }
     let mut base = Base::new(
         format!("i.project_id = $1 AND i.workspace_id = $2 AND {ACTIVE}"),
         vec![Arg::Uuid(project_id), Arg::Uuid(p.workspace_id())],
     );
     scoped(&p, &mut base);
-    workitems::list(&st.db, base, &q, Scope::Project(project_id)).await
+    let mut resp = workitems::list(&st.db, base, &q, Scope::Project(project_id)).await?;
+    if let Some(orig) = requested_group_by {
+        if let Some(obj) = resp.0.as_object_mut() {
+            obj.insert("grouped_by".to_string(), json!(orig));
+        }
+    }
+    Ok(resp)
 }
 
 async fn retrieve(State(st): State<AppState>, user: CurrentUser, Path((slug, project_id, pk)): ItemPath) -> ApiResult {
@@ -782,14 +857,14 @@ async fn create(
     }
     let assignees = uuid_list(&b, "assignee_ids")?;
     let labels = uuid_list(&b, "label_ids")?;
-    let state = opt_uuid(&b, "state_id")?;
+    let state = opt_uuid(&b, "state_id")?.or(opt_uuid(&b, "state")?);
     let parent = opt_uuid(&b, "parent_id")?;
     let estimate = opt_uuid(&b, "estimate_point")?;
 
     let mut tx = st.db.begin().await?;
     // Default state when none given, same rule as issues.rs (non-triage, default first).
-    let state: Uuid = sqlx::query_scalar(
-        "SELECT id FROM states WHERE project_id = $1 AND workspace_id = $2 AND deleted_at IS NULL
+    let (state, state_group): (Uuid, String) = sqlx::query_as(
+        "SELECT id, \"group\" FROM states WHERE project_id = $1 AND workspace_id = $2 AND deleted_at IS NULL
          AND NOT is_triage AND ($3::uuid IS NULL OR id = $3) ORDER BY \"default\" DESC, sequence LIMIT 1",
     )
     .bind(project_id)
@@ -798,6 +873,26 @@ async fn create(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| ApiError::bad("Invalid or missing project state"))?;
+    let archived_at: Option<chrono::DateTime<chrono::Utc>> = match b.get("archived_at") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            if !["completed", "cancelled"].contains(&state_group.as_str()) {
+                return Err(ApiError::bad("Only completed or cancelled work items can be archived"));
+            }
+            Some(parse_dt(v)?)
+        }
+    };
+    let completed_at: Option<chrono::DateTime<chrono::Utc>> = match b.get("completed_at") {
+        Some(v) if !v.is_null() => Some(parse_dt(v)?),
+        Some(_) => None,
+        None => {
+            if ["completed", "cancelled"].contains(&state_group.as_str()) {
+                Some(chrono::Utc::now())
+            } else {
+                None
+            }
+        }
+    };
     if let Some(parent) = parent {
         let ok: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM issues WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL)",
@@ -829,11 +924,10 @@ async fn create(
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO issues (name, project_id, workspace_id, state_id, sequence_id, created_by_id, updated_by_id,
             sort_order, completed_at, priority, description_html, description_stripped, parent_id, start_date,
-            target_date, estimate_point_id)
+            target_date, estimate_point_id, archived_at)
          VALUES ($1,$2,$3,$4,$5,$6,$6,
             COALESCE((SELECT MAX(sort_order)+10000 FROM issues WHERE project_id=$2 AND workspace_id=$3 AND state_id=$4 AND deleted_at IS NULL), 65535),
-            CASE WHEN (SELECT \"group\" FROM states WHERE id=$4) IN ('completed','cancelled') THEN now() ELSE NULL END,
-            $7, $8, $9, $10, $11, $12, $13)
+            $7, $8, $9, $10, $11, $12, $13, $14, $15)
          RETURNING id",
     )
     .bind(name)
@@ -842,6 +936,7 @@ async fn create(
     .bind(state)
     .bind(sequence)
     .bind(user.id)
+    .bind(completed_at)
     .bind(priority)
     .bind(&html)
     .bind(strip_tags(&html))
@@ -849,6 +944,7 @@ async fn create(
     .bind(start)
     .bind(target)
     .bind(estimate)
+    .bind(archived_at)
     .fetch_one(&mut *tx)
     .await?;
     sqlx::query("INSERT INTO issue_sequences (issue_id, project_id, workspace_id, sequence, created_by_id, updated_by_id) VALUES ($1,$2,$3,$4,$5,$5)")
@@ -937,18 +1033,96 @@ async fn update(
         Some(_) => return Err(ApiError::bad_body(json!({"description_html": ["Invalid HTML."]}))),
     };
     let mut tx = st.db.begin().await?;
-    let exists: bool = sqlx::query_scalar(&format!(
-        "SELECT EXISTS (SELECT 1 FROM issues i WHERE i.id = $1 AND i.project_id = $2 AND i.workspace_id = $3 AND i.deleted_at IS NULL AND {ACTIVE} AND (NOT $4 OR i.created_by_id = $5))"
-    ))
+    let old: Option<(Option<chrono::NaiveDate>, Option<chrono::NaiveDate>, Option<Uuid>)> = sqlx::query_as(
+        "SELECT i.start_date, i.target_date, i.state_id FROM issues i WHERE i.id = $1 AND i.project_id = $2 AND i.workspace_id = $3 AND i.deleted_at IS NULL AND NOT i.is_draft AND (NOT $4 OR i.created_by_id = $5) FOR UPDATE"
+    )
     .bind(pk)
     .bind(project_id)
     .bind(p.workspace_id())
     .bind(p.restricted_guest())
     .bind(user.id)
-    .fetch_one(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
-    if !exists {
-        return Err(ApiError::not_found());
+    let (old_start, old_target, old_state_id) = old.ok_or_else(ApiError::not_found)?;
+
+    let target_state_id = if b.get("state_id").is_some() || b.get("state").is_some() {
+        opt_uuid(&b, "state_id")?.or(opt_uuid(&b, "state")?)
+    } else {
+        old_state_id
+    };
+    let state_group: Option<String> = match target_state_id {
+        Some(sid) => {
+            let grp: Option<String> = sqlx::query_scalar("SELECT \"group\" FROM states WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL")
+                .bind(sid).bind(project_id).bind(p.workspace_id()).fetch_optional(&mut *tx).await?;
+            if (b.get("state_id").is_some() || b.get("state").is_some()) && grp.is_none() {
+                return Err(ApiError::bad("Invalid state_id"));
+            }
+            grp
+        }
+        None => None,
+    };
+
+    if let Some(archived_val) = b.get("archived_at") {
+        if archived_val.is_null() {
+            sqlx::query("UPDATE issues SET archived_at = NULL, updated_at = now(), updated_by_id = $4 WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL")
+                .bind(pk).bind(project_id).bind(p.workspace_id()).bind(user.id).execute(&mut *tx).await?;
+        } else {
+            let eligible = state_group
+                .as_deref()
+                .is_some_and(|g| ["completed", "cancelled"].contains(&g));
+            if !eligible {
+                return Err(ApiError::bad("Only completed or cancelled work items can be archived"));
+            }
+            let dt = parse_dt(archived_val)?;
+            sqlx::query("UPDATE issues SET archived_at = $4, updated_at = now(), updated_by_id = $5 WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL")
+                .bind(pk).bind(project_id).bind(p.workspace_id()).bind(dt).bind(user.id).execute(&mut *tx).await?;
+        }
+    }
+    if let Some(comp_val) = b.get("completed_at") {
+        if comp_val.is_null() {
+            sqlx::query("UPDATE issues SET completed_at = NULL, updated_at = now(), updated_by_id = $4 WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL")
+                .bind(pk).bind(project_id).bind(p.workspace_id()).bind(user.id).execute(&mut *tx).await?;
+        } else {
+            let dt = parse_dt(comp_val)?;
+            sqlx::query("UPDATE issues SET completed_at = $4, updated_at = now(), updated_by_id = $5 WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL")
+                .bind(pk).bind(project_id).bind(p.workspace_id()).bind(dt).bind(user.id).execute(&mut *tx).await?;
+        }
+    } else if (b.get("state_id").is_some() || b.get("state").is_some()) && target_state_id != old_state_id {
+        let is_done = state_group
+            .as_deref()
+            .is_some_and(|g| ["completed", "cancelled"].contains(&g));
+        sqlx::query("UPDATE issues SET completed_at = CASE WHEN $4 THEN now() ELSE NULL END WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL")
+            .bind(pk).bind(project_id).bind(p.workspace_id()).bind(is_done).execute(&mut *tx).await?;
+    }
+    if (b.get("state_id").is_some() || b.get("state").is_some()) && target_state_id != old_state_id {
+        if let Some(sid) = target_state_id {
+            sqlx::query("UPDATE issues SET state_id = $4, updated_at = now(), updated_by_id = $5 WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL")
+                .bind(pk).bind(project_id).bind(p.workspace_id()).bind(sid).bind(user.id).execute(&mut *tx).await?;
+        }
+    }
+
+    let has_start = b.get("start_date").is_some();
+    let has_target = b.get("target_date").is_some();
+    let start_val = if has_start {
+        opt_date(&b, "start_date")?
+    } else {
+        old_start
+    };
+    let target_val = if has_target {
+        opt_date(&b, "target_date")?
+    } else {
+        old_target
+    };
+    if start_val.zip(target_val).is_some_and(|(s, t)| s > t) {
+        return Err(ApiError::bad("Start date cannot exceed target date"));
+    }
+    if has_start {
+        sqlx::query("UPDATE issues SET start_date = $4, updated_at = now(), updated_by_id = $5 WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL")
+            .bind(pk).bind(project_id).bind(p.workspace_id()).bind(start_val).bind(user.id).execute(&mut *tx).await?;
+    }
+    if has_target {
+        sqlx::query("UPDATE issues SET target_date = $4, updated_at = now(), updated_by_id = $5 WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL")
+            .bind(pk).bind(project_id).bind(p.workspace_id()).bind(target_val).bind(user.id).execute(&mut *tx).await?;
     }
     sqlx::query(
         "UPDATE issues SET name = COALESCE($4, name), priority = COALESCE($5, priority),
@@ -968,7 +1142,7 @@ async fn update(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    retrieve(State(st), user, Path((slug, project_id, pk))).await
+    Ok(Json(read_item(&st, &p, pk).await?))
 }
 
 /// Soft delete. Only admins or the creator, as Plane.
@@ -1035,6 +1209,17 @@ fn opt_date(b: &Value, k: &str) -> Result<Option<chrono::NaiveDate>, ApiError> {
                 )
             }),
     }
+}
+
+fn parse_dt(v: &Value) -> Result<chrono::DateTime<chrono::Utc>, ApiError> {
+    let s = v.as_str().ok_or_else(|| ApiError::bad("Invalid datetime"))?;
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&chrono::Utc));
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Ok(d.and_hms_opt(0, 0, 0).expect("valid midnight").and_utc());
+    }
+    Err(ApiError::bad("Invalid datetime"))
 }
 
 // ---- lookup and search ----
