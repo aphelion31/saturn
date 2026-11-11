@@ -135,7 +135,12 @@ async fn insert_asset(st: &AppState, a: NewAsset<'_>, b: &Value) -> ApiResult {
         ));
     }
     let name = sanitize_filename(s(b, "name").unwrap_or("unnamed"));
-    let typ = s(b, "type").unwrap_or("image/jpeg");
+    let raw_typ = s(b, "type").unwrap_or("").trim();
+    let typ = if raw_typ.is_empty() {
+        if a.images_only { "image/jpeg" } else { "application/octet-stream" }
+    } else {
+        raw_typ
+    };
     if a.images_only && !IMAGE_TYPES.contains(&typ) {
         return Err(ApiError::bad_body(json!({
             "error": "Invalid file type. Only JPEG, PNG, WebP, JPG and GIF files are allowed.", "status": false
