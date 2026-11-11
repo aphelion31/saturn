@@ -92,6 +92,14 @@ pub fn routes() -> Router<AppState> {
             get(relation_list).post(relation_create),
         )
         .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/relations/remove/",
+            axum::routing::post(relation_remove),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/relations/remove/",
+            axum::routing::post(relation_remove),
+        )
+        .route(
             "/api/v1/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/attachments/",
             get(attachment_list),
         )
@@ -250,6 +258,38 @@ async fn relation_create(
     }
     tx.commit().await?;
     created(Value::Array(out))
+}
+
+async fn relation_remove(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id)): SubPath,
+    Json(b): Json<Value>,
+) -> ApiResult<StatusCode> {
+    let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let related_id = b
+        .get("related_issue")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| ApiError::bad("Invalid related_issue"))?;
+
+    let r = sqlx::query(
+        "UPDATE issue_relations SET deleted_at = now(), updated_at = now(), updated_by_id = $4
+         WHERE workspace_id = $1 AND deleted_at IS NULL
+           AND ((issue_id = $2 AND related_issue_id = $3) OR (issue_id = $3 AND related_issue_id = $2))",
+    )
+    .bind(p.workspace_id())
+    .bind(issue_id)
+    .bind(related_id)
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
+
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
 }
 
 // ---- attachments: list and delete. Upload stays on /api/assets/v2 (see gaps in report). ----

@@ -51,6 +51,14 @@ v1 GET "$V1/$ITEM/relations/"
 jq -e '.blocking | length == 1' <<<"$body" >/dev/null
 v1 GET "$V1/$PEER/relations/"
 jq -e '.blocked_by | length == 1' <<<"$body" >/dev/null
+# 9585: remove relation endpoint -> 204
+c=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "X-Api-Key: $TOKEN" -H 'content-type: application/json' -d "{\"related_issue\":\"$PEER\"}" "$BASE$V1/$ITEM/relations/remove/")
+[[ "$c" == "204" ]] || { echo "✖ relations/remove -> $c" >&2; exit 1; }
+v1 GET "$V1/$ITEM/relations/"
+jq -e '.blocking | length == 0' <<<"$body" >/dev/null
+# 9585: removing non-existent relation -> 404
+c=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "X-Api-Key: $TOKEN" -H 'content-type: application/json' -d "{\"related_issue\":\"$PEER\"}" "$BASE$V1/$ITEM/relations/remove/")
+[[ "$c" == "404" ]] || { echo "✖ non-existent relations/remove -> $c" >&2; exit 1; }
 v1 GET "$V1/$ITEM/attachments/"
 jq -e 'type == "array"' <<<"$body" >/dev/null
 v1 DELETE "$V1/$PEER/"
