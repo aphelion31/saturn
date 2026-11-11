@@ -4,7 +4,7 @@
  * See the LICENSE file for details.
  */
 
-import { cloneDeep, set } from "lodash-es";
+import { cloneDeep, set, sortBy } from "lodash-es";
 import { action, makeObservable, observable, runInAction, computed } from "mobx";
 // plane imports
 import { EUserPermissions, API_BASE_URL } from "@plane/constants";
@@ -274,10 +274,15 @@ export class UserStore implements IUserStore {
     const { workspaceSlug } = this.store.router;
 
     const allWorkspaceProjectRoles = this.permission.getProjectRolesByWorkspaceSlug(workspaceSlug || "");
+    // archived projects cannot take new work items; order follows the sidebar (sort_order)
+    const sidebarOrder = sortBy(
+      Object.values(this.store.projectRoot.project.projectMap ?? {}).filter((p) => !p.archived_at),
+      "sort_order"
+    ).map((p) => p.id);
 
     const userPermissions =
       (allWorkspaceProjectRoles &&
-        Object.keys(allWorkspaceProjectRoles)
+        sidebarOrder
           .filter((key) => allWorkspaceProjectRoles[key] >= EUserPermissions.MEMBER)
           .reduce(
             (res: { [projectId: string]: number }, key: string) => ((res[key] = allWorkspaceProjectRoles[key]), res),
