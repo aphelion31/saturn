@@ -1179,7 +1179,7 @@ async fn instance_info(State(st): State<AppState>) -> ApiResult {
         "github_app_name": config_value(&st, "GITHUB_APP_NAME", "").await,
         "slack_client_id": null,
         "has_unsplash_configured": !config_value(&st, "UNSPLASH_ACCESS_KEY", "").await.is_empty(),
-        "has_llm_configured": false,
+        "has_llm_configured": !crate::outbound::config(&st, "LLM_API_KEY", "").await.is_empty(),
         "file_size_limit": st.cfg.file_size_limit as f64,
         "is_smtp_configured": crate::outbound::smtp(&st).await.is_some(),
         "admin_base_url": "",

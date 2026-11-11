@@ -32,15 +32,7 @@ pub fn routes() -> Router<AppState> {
             get(list_exporters).post(create_export),
         )
         .route(
-            "/api/workspaces/{slug}/export-issues",
-            get(list_exporters).post(create_export),
-        )
-        .route(
             "/api/workspaces/{slug}/export-issues/{token}/download/",
-            get(download_export),
-        )
-        .route(
-            "/api/workspaces/{slug}/export-issues/{token}/download",
             get(download_export),
         )
         // 4. Export analytics
@@ -48,10 +40,6 @@ pub fn routes() -> Router<AppState> {
         // 5. User activity CSV export
         .route(
             "/api/workspaces/{slug}/user-activity/{user_id}/export/",
-            get(user_activity_export_get).post(user_activity_export_post),
-        )
-        .route(
-            "/api/workspaces/{slug}/user-activity/{user_id}/export",
             get(user_activity_export_get).post(user_activity_export_post),
         )
 }
@@ -72,28 +60,33 @@ async fn unsplash_proxy(State(st): State<AppState>, _user: CurrentUser, Query(q)
     let page = q.get("page").map(String::as_str).unwrap_or("1");
     let per_page = q.get("per_page").map(String::as_str).unwrap_or("20");
 
+    // Key goes in the Authorization header (Unsplash accepts `Client-ID`), never in a URL that could be logged.
     let url = if !query.is_empty() {
         format!(
-            "https://api.unsplash.com/search/photos/?client_id={}&query={}&page={}&per_page={}",
-            urlencoding::encode(&key),
+            "https://api.unsplash.com/search/photos/?query={}&page={}&per_page={}",
             urlencoding::encode(query),
             urlencoding::encode(page),
             urlencoding::encode(per_page),
         )
     } else {
         format!(
-            "https://api.unsplash.com/photos/?client_id={}&page={}&per_page={}",
-            urlencoding::encode(&key),
+            "https://api.unsplash.com/photos/?page={}&per_page={}",
             urlencoding::encode(page),
             urlencoding::encode(per_page),
         )
     };
 
     let client = crate::outbound::http();
-    let resp = match client.get(&url).header("Content-Type", "application/json").send().await {
+    let resp = match client
+        .get(&url)
+        .header(header::AUTHORIZATION, format!("Client-ID {key}"))
+        .header("Content-Type", "application/json")
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!("unsplash request failed: {e}");
+            tracing::warn!("unsplash request failed: {}", e.without_url());
             return Ok((
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": "Failed to connect to Unsplash"})),
@@ -227,9 +220,8 @@ async fn call_llm(cfg: &LlmConfig, task: &str, prompt: &str) -> Result<String, S
         "gemini" => {
             let model = cfg.model.strip_prefix("gemini/").unwrap_or(&cfg.model);
             let url = format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
                 urlencoding::encode(model),
-                urlencoding::encode(&cfg.api_key)
             );
             let body = json!({
                 "contents": [
@@ -242,6 +234,7 @@ async fn call_llm(cfg: &LlmConfig, task: &str, prompt: &str) -> Result<String, S
             });
             let res = client
                 .post(&url)
+                .header("x-goog-api-key", &cfg.api_key)
                 .header("content-type", "application/json")
                 .json(&body)
                 .send()
