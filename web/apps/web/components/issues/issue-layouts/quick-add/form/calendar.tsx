@@ -34,6 +34,7 @@ export const CalendarQuickAddIssueForm = observer(function CalendarQuickAddIssue
           aria-invalid={hasError}
           data-invalid={hasError || undefined}
           type="text"
+          maxLength={255}
           autoComplete="off"
           placeholder={isEpic ? t("epic.title.label") : t("issue.title.label")}
           {...register("name", {

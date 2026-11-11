@@ -20,8 +20,8 @@ export const renderFormattedDate = (
   date: string | Date | undefined | null,
   formatToken: string = "MMM dd, yyyy"
 ): string | undefined => {
-  // Parse the date to check if it is valid
-  const parsedDate = getDate(date);
+  // Full ISO timestamps are parsed as instants so the date is shown in local time, matching renderFormattedTime
+  const parsedDate = typeof date === "string" && date.length > 10 ? new Date(date) : getDate(date);
   // return if undefined
   if (!parsedDate) return;
   // Check if the parsed date is valid before formatting

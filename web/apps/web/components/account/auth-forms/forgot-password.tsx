@@ -105,7 +105,7 @@ export const ForgotPasswordForm = observer(function ForgotPasswordForm() {
                 onChange={onChange}
                 ref={ref}
                 placeholder={t("auth.common.email.placeholder")}
-                autoComplete="off"
+                autoComplete="email"
                 disabled={resendTimerCode > 0}
               />
             )}

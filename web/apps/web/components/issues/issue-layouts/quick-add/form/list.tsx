@@ -35,6 +35,7 @@ export const ListQuickAddIssueForm = observer(function ListQuickAddIssueForm(pro
         <Input
           size="md"
           type="text"
+          maxLength={255}
           autoComplete="off"
           aria-label={isEpic ? t("epic.title.label") : t("issue.title.label")}
           aria-invalid={hasError}

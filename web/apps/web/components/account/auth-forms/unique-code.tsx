@@ -104,7 +104,7 @@ export function AuthUniqueCodeForm(props: TAuthUniqueCodeForm) {
         value={uniqueCodeFormData.email}
         onChange={(e) => handleFormChange("email", e.target.value)}
         placeholder={t("auth.common.email.placeholder")}
-        autoComplete="off"
+        autoComplete="email"
         disabled
         endIcon={
           uniqueCodeFormData.email.length > 0 && (
@@ -131,7 +131,7 @@ export function AuthUniqueCodeForm(props: TAuthUniqueCodeForm) {
           value={uniqueCodeFormData.code}
           onChange={(e) => handleFormChange("code", e.target.value)}
           placeholder={t("auth.common.unique_code.placeholder")}
-          autoComplete="off"
+          autoComplete="one-time-code"
           autoFocus
         />
         <div className="flex w-full items-center justify-between gap-2 px-1 pt-1 text-caption-sm-regular">
