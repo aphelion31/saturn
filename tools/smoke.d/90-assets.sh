@@ -12,6 +12,17 @@ call PATCH "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/$ASSET/" '{}'
 got=$(curl -s -b "$jar" "$BASE/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/$ASSET/")
 [[ "$got" == "hello saturn" ]] || { echo "✖ download returned: $got" >&2; exit 1; }
 echo "✔ download round trip"
+call GET "/api/assets/v2/workspaces/$SLUG/check/$ASSET/"
+jq -e '.exists == true' <<<"$body" >/dev/null
+for url in "/api/assets/v2/workspaces/$SLUG/download/$ASSET/" "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/download/$ASSET/"; do
+  got=$(curl -s -b "$jar" "$BASE$url")
+  [[ "$got" == "hello saturn" ]] || { echo "✖ forced download failed" >&2; exit 1; }
+done
+call POST "/api/assets/v2/workspaces/$SLUG/duplicate-assets/$ASSET/" '{"entity_type":"ISSUE_DESCRIPTION"}'
+COPY=$(field '.asset_id')
+call POST "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/$PROJECT/bulk/" "{\"asset_ids\":[\"$COPY\"]}"
+call DELETE "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/$ASSET/"
+call POST "/api/assets/v2/workspaces/$SLUG/restore/$ASSET/" '{}'
 call DELETE "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/$ASSET/"
 
 # Plane #10128 & #9551: empty MIME (.txt) and .md attachment files accepted
@@ -49,3 +60,77 @@ if [ -n "$ISSUE_ID" ]; then
   echo "✔ description asset has valid project_id ($db_pid) and no None in asset_url"
   call DELETE "/api/assets/v2/workspaces/$SLUG/$DESC_ASSET/"
 fi
+
+# --- Legacy file-assets endpoints ---
+# User file-assets: upload multipart
+code=$(curl -s -b "$jar" -o /tmp/legacy_user_upload.json -w '%{http_code}' \
+  -F "entity_type=USER_AVATAR" -F "asset=@-;filename=avatar.png" "$BASE/api/users/file-assets/" <<< "user avatar data")
+[[ "$code" == 201 ]] || { echo "✖ POST /api/users/file-assets/ -> $code" >&2; exit 1; }
+echo "✔ POST /api/users/file-assets/ -> $code"
+U_ASSET=$(jq -r '.id' /tmp/legacy_user_upload.json)
+U_KEY=$(jq -r '.asset' /tmp/legacy_user_upload.json)
+
+# User file-assets: list
+call GET "/api/users/file-assets/"
+jq -e --arg id "$U_ASSET" 'any(.[]; .id == $id)' <<<"$body" >/dev/null
+echo "✔ GET /api/users/file-assets/ lists created asset"
+
+# User file-assets: retrieve by pk
+call GET "/api/users/file-assets/$U_ASSET/"
+[[ "$(field '.id')" == "$U_ASSET" ]] || { echo "✖ GET /api/users/file-assets/{pk}/ failed" >&2; exit 1; }
+echo "✔ GET /api/users/file-assets/{pk}/ -> 200"
+
+# Workspace file-assets: POST upload
+code=$(curl -s -b "$jar" -o /tmp/legacy_ws_upload.json -w '%{http_code}' \
+  -F "entity_type=ISSUE_ATTACHMENT" -F "project_id=$PROJECT" -F "asset=@-;filename=legacy_doc.pdf" \
+  "$BASE/api/workspaces/$SLUG/file-assets/" <<< "workspace pdf data")
+[[ "$code" == 201 ]] || { echo "✖ POST /api/workspaces/{slug}/file-assets/ -> $code" >&2; exit 1; }
+echo "✔ POST /api/workspaces/{slug}/file-assets/ -> $code"
+WS_ASSET=$(jq -r '.id' /tmp/legacy_ws_upload.json)
+WS_FULL_KEY=$(jq -r '.asset' /tmp/legacy_ws_upload.json)
+# Extract asset_key part (after workspace_id/)
+WS_ASSET_KEY="${WS_FULL_KEY#*/}"
+
+# Workspace file-assets: GET list by slug
+call GET "/api/workspaces/$SLUG/file-assets/"
+jq -e --arg id "$WS_ASSET" 'any(.[]; .id == $id)' <<<"$body" >/dev/null
+echo "✔ GET /api/workspaces/{slug}/file-assets/ lists created asset"
+
+# Workspace file-assets: GET by workspace_id and asset_key
+call GET "/api/workspaces/file-assets/$WS_ID/$WS_ASSET_KEY/"
+jq -e --arg id "$WS_ASSET" '.data | any(.[]; .id == $id)' <<<"$body" >/dev/null
+echo "✔ GET /api/workspaces/file-assets/{workspace_id}/{asset_key}/ -> 200"
+
+# Workspace file-assets: DELETE and restore
+call DELETE "/api/workspaces/file-assets/$WS_ID/$WS_ASSET_KEY/"
+call POST "/api/workspaces/file-assets/$WS_ID/$WS_ASSET_KEY/restore/"
+
+# Plane #10216: asset id with query string stripped
+call GET "/api/workspaces/file-assets/$WS_ID/$WS_ASSET_KEY?size=medium/"
+jq -e --arg id "$WS_ASSET" '.data | any(.[]; .id == $id)' <<<"$body" >/dev/null
+echo "✔ Plane #10216: asset key with query string resolves correctly"
+
+call DELETE "/api/workspaces/file-assets/$WS_ID/$WS_ASSET_KEY/"
+echo "✔ DELETE and restore /api/workspaces/file-assets/{workspace_id}/{asset_key}/ -> ok"
+
+# User file-assets: DELETE own
+call DELETE "/api/users/file-assets/$U_ASSET/"
+echo "✔ DELETE /api/users/file-assets/{pk}/ -> 204"
+
+# Plane #10216: POST on /api/workspaces/file-assets/{workspace_id}/{asset_key}/ is 405 Method Not Allowed
+code=$(curl -s -b "$jar" -o /dev/null -w '%{http_code}' -X POST "$BASE/api/workspaces/file-assets/$WS_ID/$WS_ASSET_KEY/")
+[[ "$code" == 405 ]] || { echo "✖ POST on workspace_id/asset_key route -> $code (expected 405)" >&2; exit 1; }
+echo "✔ Plane #10216: POST on workspace_id/asset_key route -> 405"
+
+# Plane #10212: legacy file-asset POST fields are read-only (forged project/issue/is_uploaded ignored)
+code=$(curl -s -b "$jar" -o /tmp/forged_upload.json -w '%{http_code}' \
+  -F "project_id=$PROJECT" -F "is_uploaded=true" -F "asset=@-;filename=forged.png" \
+  "$BASE/api/workspaces/$SLUG/file-assets/" <<< "forged file")
+[[ "$code" == 201 ]] || { echo "✖ POST forged upload -> $code" >&2; exit 1; }
+FORGED_ID=$(jq -r '.id' /tmp/forged_upload.json)
+forged_pid=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "select project_id from file_assets where id='$FORGED_ID'")
+[[ -z "$forged_pid" ]] || { echo "✖ forged project_id was not ignored: $forged_pid" >&2; exit 1; }
+FORGED_KEY=$(jq -r '.asset' /tmp/forged_upload.json)
+call DELETE "/api/workspaces/file-assets/$WS_ID/${FORGED_KEY#*/}/"
+echo "✔ Plane #10212: legacy file-asset POST forged identity fields ignored"
+
