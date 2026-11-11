@@ -74,7 +74,7 @@ async fn user_delete(
     assets::delete_user_asset(State(st), user, Path(id)).await
 }
 
-const MIME: &[&str] = &[
+pub(crate) const MIME: &[&str] = &[
     "image/jpeg",
     "image/png",
     "image/gif",

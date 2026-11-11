@@ -101,19 +101,23 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/api/v1/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/attachments/",
-            get(attachment_list),
-        )
-        .route(
-            "/api/v1/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/attachments/{pk}/",
-            axum::routing::delete(attachment_delete),
+            get(attachment_list).post(attachment_create),
         )
         .route(
             "/api/v1/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-attachments/",
-            get(attachment_list),
+            get(attachment_list).post(attachment_create),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/attachments/{pk}/",
+            get(attachment_retrieve)
+                .patch(attachment_confirm)
+                .delete(attachment_delete),
         )
         .route(
             "/api/v1/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-attachments/{pk}/",
-            axum::routing::delete(attachment_delete),
+            get(attachment_retrieve)
+                .patch(attachment_confirm)
+                .delete(attachment_delete),
         )
 }
 
@@ -319,6 +323,147 @@ async fn attachment_list(
         &st.db,
     )
     .await
+}
+
+/// Plane IssueAttachmentListCreateAPIEndpoint.post: validate, insert pending row, return presign.
+/// Plane's S3 presign is replaced by Saturn's own upload URL (see `assets::upload_response`).
+async fn attachment_create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id)): SubPath,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let name = s(&b, "name")
+        .map(crate::assets::sanitize_filename)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| ApiError::bad("Invalid request."))?;
+    // Plane accepts size as a number or numeric string; non-positive values are rejected.
+    let size = match b.get("size") {
+        Some(Value::String(v)) => v.parse::<f64>().ok(),
+        Some(v) => v.as_f64(),
+        None => None,
+    }
+    .filter(|n| n.is_finite() && *n > 0.0)
+    .ok_or_else(|| ApiError::bad("Invalid request."))?
+    .min(st.cfg.file_size_limit as f64);
+    let typ = s(&b, "type")
+        .filter(|v| crate::api_v1_assets::MIME.contains(v))
+        .ok_or_else(|| ApiError::bad("Invalid file type."))?;
+    let ext_id = s(&b, "external_id").filter(|v| !v.is_empty());
+    let ext_source = s(&b, "external_source").filter(|v| !v.is_empty());
+    if let (Some(e), Some(source)) = (ext_id, ext_source) {
+        let existing: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM file_assets WHERE project_id = $1 AND workspace_id = $2 AND external_id = $3
+               AND external_source = $4 AND issue_id = $5 AND entity_type = 'ISSUE_ATTACHMENT' AND deleted_at IS NULL
+             LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(p.workspace_id())
+        .bind(e)
+        .bind(source)
+        .bind(issue_id)
+        .fetch_optional(&st.db)
+        .await?;
+        if let Some(id) = existing {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                json!({"error": "Issue with the same external id and external source already exists", "id": id}),
+            ));
+        }
+    }
+    let id = Uuid::new_v4();
+    let key = format!("{}/{}-{}", p.workspace_id(), id.simple(), name);
+    sqlx::query(
+        "INSERT INTO file_assets (id, attributes, asset, size, workspace_id, project_id, issue_id, created_by_id,
+           updated_by_id, external_id, external_source, entity_type, is_uploaded, is_deleted, is_archived,
+           created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10, 'ISSUE_ATTACHMENT', false, false, false, now(), now())",
+    )
+    .bind(id)
+    .bind(json!({"name": name, "type": typ, "size": size}))
+    .bind(&key)
+    .bind(size)
+    .bind(p.workspace_id())
+    .bind(project_id)
+    .bind(issue_id)
+    .bind(user.id)
+    .bind(ext_id)
+    .bind(ext_source)
+    .execute(&st.db)
+    .await?;
+    let attachment: Value = sqlx::query_scalar(&format!("SELECT {ATTACHMENT_V1} FROM file_assets f WHERE f.id = $1"))
+        .bind(id)
+        .fetch_one(&st.db)
+        .await?;
+    let mut v = crate::assets::upload_response(id, &st.cfg.secret_key);
+    v["attachment"] = attachment;
+    Ok(Json(v))
+}
+
+/// Plane IssueAttachmentDetailAPIEndpoint.get: uploaded attachment only, else 400.
+async fn attachment_retrieve(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id, pk)): Path<(String, Uuid, Uuid, Uuid)>,
+) -> ApiResult {
+    let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
+    let row: Option<(bool, Value)> = sqlx::query_as(
+        "SELECT f.is_uploaded, jsonb_build_object('id', f.id, 'attributes', f.attributes, 'asset', f.asset, 'size', f.size)
+         FROM file_assets f WHERE f.id = $1 AND f.issue_id = $2 AND f.project_id = $3 AND f.workspace_id = $4
+           AND f.entity_type = 'ISSUE_ATTACHMENT' AND f.deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(issue_id)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?;
+    let (uploaded, _) = row.as_ref().ok_or_else(ApiError::not_found)?;
+    if !uploaded {
+        return Err(ApiError::bad("The asset is not uploaded."));
+    }
+    let attachment: Value = sqlx::query_scalar(&format!("SELECT {ATTACHMENT_V1} FROM file_assets f WHERE f.id = $1"))
+        .bind(pk)
+        .fetch_one(&st.db)
+        .await?;
+    Ok(Json(attachment))
+}
+
+/// Plane IssueAttachmentDetailAPIEndpoint.patch: creator or admin marks uploaded, 204.
+async fn attachment_confirm(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id, pk)): Path<(String, Uuid, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let owner: Option<Option<Uuid>> = sqlx::query_scalar(
+        "SELECT created_by_id FROM file_assets WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $4
+           AND entity_type = 'ISSUE_ATTACHMENT' AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(issue_id)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?;
+    if owner.ok_or_else(ApiError::not_found)? != Some(user.id) {
+        p.require(&[ADMIN])?;
+    }
+    sqlx::query(
+        "UPDATE file_assets SET is_uploaded = true, updated_at = now(), updated_by_id = $5
+         WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(issue_id)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
+    no_content()
 }
 
 /// Plane IssueAttachmentDetailAPIEndpoint.delete: uploader or admin, soft delete, 204.
