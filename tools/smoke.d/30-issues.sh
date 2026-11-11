@@ -5,6 +5,9 @@ call GET "/api/workspaces/$SLUG/projects/$PROJECT/issues/list/"
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/v2/issues/"
 call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/" '{"name":"Smoke issue"}'
 ISSUE=$(field '.id')
+call PATCH "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/" '{"start_date":"2030-01-01","target_date":"2030-01-20"}'
+call PATCH "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/" '{"target_date":"2030-01-10"}'
+[[ "$(field '.target_date')" == '2030-01-10' ]]
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/"
 call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/" '{"name":"Smoke related issue"}'
 RELATED=$(field '.id')

@@ -1610,6 +1610,8 @@ async fn update(
             "state_id",
             "assignee_ids",
             "label_ids",
+            "start_date",
+            "target_date",
         ]
         .contains(&k.as_str())
     }) {
@@ -1631,6 +1633,33 @@ async fn update(
     let old: Option<Value> = sqlx::query_scalar("SELECT to_jsonb(i) FROM issues i WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL FOR UPDATE")
         .bind(issue_id).bind(project_id).bind(p.workspace_id()).fetch_optional(&mut *tx).await?;
     let old = old.ok_or_else(ApiError::not_found)?;
+    let start = optional_date(&body, "start_date")?;
+    let target = optional_date(&body, "target_date")?;
+    let old_start = old
+        .get("start_date")
+        .and_then(Value::as_str)
+        .and_then(|v| chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d").ok());
+    let old_target = old
+        .get("target_date")
+        .and_then(Value::as_str)
+        .and_then(|v| chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d").ok());
+    let start = if body.get("start_date").is_some() {
+        start
+    } else {
+        old_start
+    };
+    let target = if body.get("target_date").is_some() {
+        target
+    } else {
+        old_target
+    };
+    if start.zip(target).is_some_and(|(a, b)| a > b) {
+        return Err(ApiError::bad("Start date cannot exceed target date"));
+    }
+    if body.get("start_date").is_some() || body.get("target_date").is_some() {
+        sqlx::query("UPDATE issues SET start_date=$4,target_date=$5 WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL")
+            .bind(issue_id).bind(project_id).bind(p.workspace_id()).bind(start).bind(target).execute(&mut *tx).await?;
+    }
     if body.get("state_id").is_some() {
         let state = optional_uuid(&body, "state_id")?.ok_or_else(|| ApiError::bad("Invalid state_id"))?;
         let result = sqlx::query("UPDATE issues SET state_id=$4,completed_at=CASE WHEN (SELECT \"group\" FROM states WHERE id=$4 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL) IN ('completed','cancelled') THEN now() ELSE NULL END WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND EXISTS (SELECT 1 FROM states WHERE id=$4 AND project_id=$2 AND workspace_id=$3 AND NOT is_triage AND deleted_at IS NULL)")
