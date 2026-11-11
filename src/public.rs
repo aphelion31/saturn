@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::{delete, get},
+    routing::{delete, get, post},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -75,10 +75,43 @@ pub fn routes() -> Router<AppState> {
             "/api/public/anchor/{anchor}/intakes/{intake_id}/inbox-issues/",
             get(intake_issues_list).post(intake_issue_create),
         )
+        .route(
+            "/api/public/anchor/{anchor}/intakes/{intake_id}/intake-issues/{pk}/",
+            get(public_intake_issue_retrieve)
+                .patch(public_intake_issue_patch)
+                .delete(public_intake_issue_delete),
+        )
+        .route(
+            "/api/public/anchor/{anchor}/intakes/{intake_id}/inbox-issues/{pk}/",
+            get(public_intake_issue_retrieve)
+                .patch(public_intake_issue_patch)
+                .delete(public_intake_issue_delete),
+        )
+        // Public assets v2
+        .route("/api/public/assets/v2/anchor/{anchor}/", post(public_create_asset))
+        .route(
+            "/api/public/assets/v2/anchor/{anchor}/{asset_id}/",
+            get(public_download_asset)
+                .patch(public_mark_uploaded)
+                .delete(public_delete_asset),
+        )
+        .route(
+            "/api/public/assets/v2/anchor/{anchor}/restore/{asset_id}/",
+            post(public_restore_asset),
+        )
+        .route(
+            "/api/public/assets/v2/anchor/{anchor}/{entity_id}/bulk/",
+            post(public_bulk_assets),
+        )
         // Workspace project anchor reverse-lookup
         .route(
             "/api/public/workspaces/{slug}/projects/{project_id}/anchor/",
             get(workspace_project_anchor),
+        )
+        // Workspace published project boards
+        .route(
+            "/api/public/workspaces/{slug}/project-boards/",
+            get(public_workspace_project_boards),
         )
 }
 
@@ -142,11 +175,7 @@ async fn issue_in_board_scope(db: &sqlx::PgPool, b: &BoardCtx, issue_id: Uuid) -
 }
 
 /// GET /api/public/anchor/{anchor}/settings/
-async fn settings(
-    State(st): State<AppState>,
-    _user: MaybeUser,
-    Path(anchor): Path<String>,
-) -> ApiResult {
+async fn settings(State(st): State<AppState>, _user: MaybeUser, Path(anchor): Path<String>) -> ApiResult {
     let row: Option<(Value,)> = sqlx::query_as(
         "SELECT jsonb_build_object(
             'id', b.id,
@@ -200,11 +229,7 @@ async fn settings(
 }
 
 /// GET /api/public/anchor/{anchor}/meta/
-async fn meta(
-    State(st): State<AppState>,
-    _user: MaybeUser,
-    Path(anchor): Path<String>,
-) -> ApiResult {
+async fn meta(State(st): State<AppState>, _user: MaybeUser, Path(anchor): Path<String>) -> ApiResult {
     let b = require_anchor(&st.db, &anchor).await?;
     let row: Option<(Value,)> = sqlx::query_as(
         "SELECT jsonb_build_object(
@@ -230,11 +255,7 @@ async fn meta(
 }
 
 /// GET /api/public/anchor/{anchor}/project-members/ and /members/
-async fn project_members(
-    State(st): State<AppState>,
-    _user: MaybeUser,
-    Path(anchor): Path<String>,
-) -> ApiResult {
+async fn project_members(State(st): State<AppState>, _user: MaybeUser, Path(anchor): Path<String>) -> ApiResult {
     let b = require_anchor(&st.db, &anchor).await?;
     let members: Value = sqlx::query_scalar(
         "SELECT COALESCE(jsonb_agg(jsonb_build_object(
@@ -257,11 +278,7 @@ async fn project_members(
 }
 
 /// GET /api/public/anchor/{anchor}/states/
-async fn states(
-    State(st): State<AppState>,
-    _user: MaybeUser,
-    Path(anchor): Path<String>,
-) -> ApiResult {
+async fn states(State(st): State<AppState>, _user: MaybeUser, Path(anchor): Path<String>) -> ApiResult {
     let b = require_anchor(&st.db, &anchor).await?;
     let rows: Value = sqlx::query_scalar(
         "SELECT COALESCE(jsonb_agg(jsonb_build_object(
@@ -284,11 +301,7 @@ async fn states(
 }
 
 /// GET /api/public/anchor/{anchor}/labels/
-async fn labels(
-    State(st): State<AppState>,
-    _user: MaybeUser,
-    Path(anchor): Path<String>,
-) -> ApiResult {
+async fn labels(State(st): State<AppState>, _user: MaybeUser, Path(anchor): Path<String>) -> ApiResult {
     let b = require_anchor(&st.db, &anchor).await?;
     let rows: Value = sqlx::query_scalar(
         "SELECT COALESCE(jsonb_agg(jsonb_build_object(
@@ -310,11 +323,7 @@ async fn labels(
 }
 
 /// GET /api/public/anchor/{anchor}/cycles/
-async fn cycles(
-    State(st): State<AppState>,
-    _user: MaybeUser,
-    Path(anchor): Path<String>,
-) -> ApiResult {
+async fn cycles(State(st): State<AppState>, _user: MaybeUser, Path(anchor): Path<String>) -> ApiResult {
     let b = require_anchor(&st.db, &anchor).await?;
     let rows: Value = sqlx::query_scalar(
         "SELECT COALESCE(jsonb_agg(jsonb_build_object(
@@ -334,11 +343,7 @@ async fn cycles(
 }
 
 /// GET /api/public/anchor/{anchor}/modules/
-async fn modules(
-    State(st): State<AppState>,
-    _user: MaybeUser,
-    Path(anchor): Path<String>,
-) -> ApiResult {
+async fn modules(State(st): State<AppState>, _user: MaybeUser, Path(anchor): Path<String>) -> ApiResult {
     let b = require_anchor(&st.db, &anchor).await?;
     let rows: Value = sqlx::query_scalar(
         "SELECT COALESCE(jsonb_agg(jsonb_build_object(
@@ -1304,12 +1309,11 @@ async fn intake_issue_create(
         }
     };
 
-    let seq: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(max(sequence), 0) + 1 FROM issue_sequences WHERE project_id = $1",
-    )
-    .bind(b.project_id)
-    .fetch_one(&mut *tx)
-    .await?;
+    let seq: i64 =
+        sqlx::query_scalar("SELECT COALESCE(max(sequence), 0) + 1 FROM issue_sequences WHERE project_id = $1")
+            .bind(b.project_id)
+            .fetch_one(&mut *tx)
+            .await?;
 
     let issue_id = Uuid::new_v4();
     let raw_desc_html = body.issue.description_html.unwrap_or_else(|| "<p></p>".to_string());
@@ -1439,4 +1443,496 @@ async fn workspace_project_anchor(
 
     let (val,) = row.ok_or_else(ApiError::not_found)?;
     Ok(Json(val))
+}
+
+// --- Group 3 public assets, intake issues pk, and project boards ---
+
+async fn public_create_asset(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(anchor): Path<String>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let b_ctx = require_anchor(&st.db, &anchor).await?;
+    if !b_ctx.is_comments_enabled {
+        return Err(ApiError::bad("Comments are not enabled for this project"));
+    }
+    let entity_type = s(&b, "entity_type").unwrap_or("");
+    if entity_type != "COMMENT_DESCRIPTION" {
+        return Err(ApiError::bad_body(
+            json!({"error": "Invalid entity type.", "status": false}),
+        ));
+    }
+    let name = crate::assets::sanitize_filename(s(&b, "name").unwrap_or("unnamed"));
+    let typ = s(&b, "type").unwrap_or("image/jpeg");
+    if !crate::assets::IMAGE_TYPES.contains(&typ) {
+        return Err(ApiError::bad_body(json!({
+            "error": "Invalid file type. Only JPEG, PNG, WebP, JPG and GIF files are allowed.", "status": false
+        })));
+    }
+    let raw_size = b
+        .get("size")
+        .and_then(Value::as_f64)
+        .unwrap_or(st.cfg.file_size_limit as f64);
+    let size = raw_size.clamp(1.0, st.cfg.file_size_limit as f64);
+
+    let entity_identifier = s(&b, "entity_identifier").filter(|s| !s.trim().is_empty());
+    let comment_id = if let Some(eid) = entity_identifier {
+        let cid = Uuid::parse_str(eid).map_err(|_| ApiError::not_found())?;
+        let ok: (bool,) = sqlx::query_as(
+            "SELECT EXISTS (
+                SELECT 1 FROM issue_comments
+                WHERE id = $1 AND project_id = $2 AND workspace_id = $3
+                  AND access = 'EXTERNAL' AND actor_id = $4 AND deleted_at IS NULL
+            )",
+        )
+        .bind(cid)
+        .bind(b_ctx.project_id)
+        .bind(b_ctx.workspace_id)
+        .bind(user.id)
+        .fetch_one(&st.db)
+        .await?;
+        if !ok.0 {
+            return Err(ApiError::not_found());
+        }
+        Some(cid)
+    } else {
+        None
+    };
+
+    let id = Uuid::new_v4();
+    let key = format!("{}/{}-{}", b_ctx.workspace_id, id.simple(), name);
+    sqlx::query(
+        "INSERT INTO file_assets (id, attributes, asset, size, workspace_id, created_by_id, updated_by_id,
+                                  entity_type, project_id, comment_id, is_uploaded)
+         VALUES ($1, $2, $3, $4, $5, $6, $6, 'COMMENT_DESCRIPTION', $7, $8, false)",
+    )
+    .bind(id)
+    .bind(json!({"name": name, "type": typ, "size": size}))
+    .bind(&key)
+    .bind(size)
+    .bind(b_ctx.workspace_id)
+    .bind(user.id)
+    .bind(b_ctx.project_id)
+    .bind(comment_id)
+    .execute(&st.db)
+    .await?;
+
+    Ok(Json(json!({
+        "upload_data": {
+            "url": format!("/api/assets/v2/upload/{id}/"),
+            "fields": {"token": crate::assets::token(&st.cfg.secret_key, id)},
+        },
+        "asset_id": id.to_string(),
+        "asset_url": format!("/api/public/assets/v2/anchor/{anchor}/{id}/"),
+    })))
+}
+
+async fn public_download_asset(
+    State(st): State<AppState>,
+    _user: MaybeUser,
+    Path((anchor, asset_id)): Path<(String, Uuid)>,
+) -> Result<axum::response::Response, ApiError> {
+    let b_ctx = require_anchor(&st.db, &anchor).await?;
+    let row: Option<(String, Value)> = sqlx::query_as(
+        "SELECT asset, attributes FROM file_assets
+         WHERE id = $1 AND workspace_id = $2 AND project_id = $3
+           AND entity_type IN ('ISSUE_DESCRIPTION', 'COMMENT_DESCRIPTION')
+           AND is_uploaded AND deleted_at IS NULL",
+    )
+    .bind(asset_id)
+    .bind(b_ctx.workspace_id)
+    .bind(b_ctx.project_id)
+    .fetch_optional(&st.db)
+    .await?;
+    let (key, attrs) = row.ok_or_else(ApiError::not_found)?;
+    crate::assets::serve(&st, &key, &attrs, false).await
+}
+
+async fn public_mark_uploaded(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((anchor, asset_id)): Path<(String, Uuid)>,
+    body: Option<Json<Value>>,
+) -> ApiResult<StatusCode> {
+    let b_ctx = require_anchor(&st.db, &anchor).await?;
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM file_assets
+         WHERE id = $1 AND workspace_id = $2 AND project_id = $3
+           AND created_by_id = $4 AND deleted_at IS NULL",
+    )
+    .bind(asset_id)
+    .bind(b_ctx.workspace_id)
+    .bind(b_ctx.project_id)
+    .bind(user.id)
+    .fetch_optional(&st.db)
+    .await?;
+    let (id,) = row.ok_or_else(ApiError::not_found)?;
+
+    let attrs = body.as_ref().and_then(|b| b.0.get("attributes")).cloned();
+    sqlx::query(
+        "UPDATE file_assets SET is_uploaded = true,
+                attributes = COALESCE($2, attributes),
+                updated_at = now()
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(attrs)
+    .execute(&st.db)
+    .await?;
+
+    no_content()
+}
+
+async fn public_delete_asset(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((anchor, asset_id)): Path<(String, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let b_ctx = require_anchor(&st.db, &anchor).await?;
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM file_assets
+         WHERE id = $1 AND workspace_id = $2 AND project_id = $3
+           AND created_by_id = $4 AND deleted_at IS NULL",
+    )
+    .bind(asset_id)
+    .bind(b_ctx.workspace_id)
+    .bind(b_ctx.project_id)
+    .bind(user.id)
+    .fetch_optional(&st.db)
+    .await?;
+    let (id,) = row.ok_or_else(ApiError::not_found)?;
+
+    sqlx::query("UPDATE file_assets SET is_deleted = true, deleted_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(&st.db)
+        .await?;
+
+    no_content()
+}
+
+async fn public_restore_asset(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((anchor, asset_id)): Path<(String, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let b_ctx = require_anchor(&st.db, &anchor).await?;
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM file_assets
+         WHERE id = $1 AND workspace_id = $2 AND project_id = $3
+           AND created_by_id = $4",
+    )
+    .bind(asset_id)
+    .bind(b_ctx.workspace_id)
+    .bind(b_ctx.project_id)
+    .bind(user.id)
+    .fetch_optional(&st.db)
+    .await?;
+    let (id,) = row.ok_or_else(ApiError::not_found)?;
+
+    sqlx::query("UPDATE file_assets SET is_deleted = false, deleted_at = NULL, updated_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(&st.db)
+        .await?;
+
+    no_content()
+}
+
+async fn public_bulk_assets(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((anchor, entity_id)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult<StatusCode> {
+    let b_ctx = require_anchor(&st.db, &anchor).await?;
+    if !b_ctx.is_comments_enabled {
+        return Err(ApiError::bad("Comments are not enabled for this project"));
+    }
+    let comment_ok: (bool,) = sqlx::query_as(
+        "SELECT EXISTS (
+            SELECT 1 FROM issue_comments
+            WHERE id = $1 AND project_id = $2 AND workspace_id = $3
+              AND access = 'EXTERNAL' AND actor_id = $4 AND deleted_at IS NULL
+        )",
+    )
+    .bind(entity_id)
+    .bind(b_ctx.project_id)
+    .bind(b_ctx.workspace_id)
+    .bind(user.id)
+    .fetch_one(&st.db)
+    .await?;
+    if !comment_ok.0 {
+        return Err(ApiError::not_found());
+    }
+
+    let asset_ids: Vec<Uuid> = b
+        .get("asset_ids")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if asset_ids.is_empty() {
+        return Err(ApiError::bad("No asset ids provided."));
+    }
+
+    let exists: (bool,) = sqlx::query_as(
+        "SELECT EXISTS (
+            SELECT 1 FROM file_assets
+            WHERE id = ANY($1) AND workspace_id = $2 AND project_id = $3
+              AND created_by_id = $4 AND deleted_at IS NULL
+        )",
+    )
+    .bind(&asset_ids)
+    .bind(b_ctx.workspace_id)
+    .bind(b_ctx.project_id)
+    .bind(user.id)
+    .fetch_one(&st.db)
+    .await?;
+    if !exists.0 {
+        return Err(ApiError::not_found());
+    }
+
+    sqlx::query(
+        "UPDATE file_assets SET comment_id = $1, updated_at = now()
+         WHERE id = ANY($2) AND workspace_id = $3 AND project_id = $4 AND created_by_id = $5
+           AND entity_type = 'COMMENT_DESCRIPTION' AND deleted_at IS NULL",
+    )
+    .bind(entity_id)
+    .bind(&asset_ids)
+    .bind(b_ctx.workspace_id)
+    .bind(b_ctx.project_id)
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
+
+    no_content()
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+struct IntakeIssuePerm {
+    id: Uuid,
+    status: i32,
+    created_by_id: Option<Uuid>,
+    issue_id: Uuid,
+}
+
+async fn check_intake_issue_pk(
+    st: &AppState,
+    user: &CurrentUser,
+    anchor: &str,
+    intake_id: Uuid,
+    pk: Uuid,
+) -> Result<(BoardCtx, IntakeIssuePerm), ApiError> {
+    let b = require_anchor(&st.db, anchor).await?;
+    if b.intake_id != Some(intake_id) {
+        return Err(ApiError::bad("Intake does not belong to this Project Board"));
+    }
+    let row: Option<IntakeIssuePerm> = sqlx::query_as(
+        "SELECT id, status, created_by_id, issue_id FROM intake_issues
+         WHERE id = $1 AND intake_id = $2 AND project_id = $3 AND workspace_id = $4
+           AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(intake_id)
+    .bind(b.project_id)
+    .bind(b.workspace_id)
+    .fetch_optional(&st.db)
+    .await?;
+
+    let ii = row.ok_or_else(ApiError::not_found)?;
+    if ii.created_by_id != Some(user.id) {
+        return Err(ApiError::forbidden());
+    }
+    if ii.status != -2 {
+        return Err(ApiError::bad("Intake issue is not pending"));
+    }
+    Ok((b, ii))
+}
+
+async fn public_intake_issue_retrieve(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((anchor, intake_id, pk)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult {
+    let (_, ii) = check_intake_issue_pk(&st, &user, &anchor, intake_id, pk).await?;
+    let out: (Value,) = sqlx::query_as(
+        "SELECT jsonb_build_object(
+            'id', i.id,
+            'name', i.name,
+            'description_html', i.description_html,
+            'description_json', i.description_json,
+            'priority', i.priority,
+            'sequence_id', i.sequence_id,
+            'project_id', i.project_id,
+            'created_at', i.created_at,
+            'bridge_id', ii.id,
+            'issue_intake', jsonb_build_array(jsonb_build_object(
+                'id', ii.id,
+                'status', ii.status,
+                'duplicate_to', ii.duplicate_to_id,
+                'snoozed_till', ii.snoozed_till,
+                'source', ii.source
+            )),
+            'state_detail', (SELECT jsonb_build_object('id', s.id, 'name', s.name, 'color', s.color, 'group', s.group)
+                             FROM states s WHERE s.id = i.state_id),
+            'project_detail', (SELECT jsonb_build_object('id', p.id, 'name', p.name, 'identifier', p.identifier)
+                               FROM projects p WHERE p.id = i.project_id)
+        )
+        FROM intake_issues ii
+        JOIN issues i ON i.id = ii.issue_id
+        WHERE ii.id = $1",
+    )
+    .bind(ii.id)
+    .fetch_one(&st.db)
+    .await?;
+
+    Ok(Json(out.0))
+}
+
+async fn public_intake_issue_patch(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((anchor, intake_id, pk)): Path<(String, Uuid, Uuid)>,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    let (b, ii) = check_intake_issue_pk(&st, &user, &anchor, intake_id, pk).await?;
+    let issue_obj = body.get("issue").unwrap_or(&body);
+    let name = s(issue_obj, "name");
+    if let Some(n) = name {
+        if n.trim().is_empty() {
+            return Err(ApiError::bad("Name is required"));
+        }
+        if n.chars().count() > 255 {
+            return Err(ApiError::bad("Name must be at most 255 characters"));
+        }
+    }
+    let priority = s(issue_obj, "priority");
+    if let Some(p) = priority {
+        if !["low", "medium", "high", "urgent", "none"].contains(&p) {
+            return Err(ApiError::bad("Invalid priority"));
+        }
+    }
+    let desc_html = if let Some(raw_html) = s(issue_obj, "description_html") {
+        Some(sanitize_html(raw_html)?)
+    } else {
+        None
+    };
+    let desc_stripped = desc_html.as_deref().map(strip_tags);
+    let desc_json = issue_obj.get("description_json").cloned();
+
+    sqlx::query(
+        "UPDATE issues SET
+            name = COALESCE($2, name),
+            description_html = COALESCE($3, description_html),
+            description_stripped = COALESCE($4, description_stripped),
+            description_json = COALESCE($5, description_json),
+            priority = COALESCE($6, priority),
+            updated_at = now()
+         WHERE id = $1 AND workspace_id = $7 AND project_id = $8 AND deleted_at IS NULL",
+    )
+    .bind(ii.issue_id)
+    .bind(name)
+    .bind(desc_html)
+    .bind(desc_stripped)
+    .bind(desc_json)
+    .bind(priority)
+    .bind(b.workspace_id)
+    .bind(b.project_id)
+    .execute(&st.db)
+    .await?;
+
+    let out: (Value,) = sqlx::query_as(
+        "SELECT jsonb_build_object(
+            'id', i.id,
+            'name', i.name,
+            'description_html', i.description_html,
+            'description_json', i.description_json,
+            'priority', i.priority,
+            'sequence_id', i.sequence_id,
+            'project_id', i.project_id,
+            'created_at', i.created_at,
+            'bridge_id', ii.id,
+            'issue_intake', jsonb_build_array(jsonb_build_object(
+                'id', ii.id,
+                'status', ii.status,
+                'duplicate_to', ii.duplicate_to_id,
+                'snoozed_till', ii.snoozed_till,
+                'source', ii.source
+            )),
+            'state_detail', (SELECT jsonb_build_object('id', s.id, 'name', s.name, 'color', s.color, 'group', s.group)
+                             FROM states s WHERE s.id = i.state_id),
+            'project_detail', (SELECT jsonb_build_object('id', p.id, 'name', p.name, 'identifier', p.identifier)
+                               FROM projects p WHERE p.id = i.project_id)
+        )
+        FROM intake_issues ii
+        JOIN issues i ON i.id = ii.issue_id
+        WHERE ii.id = $1",
+    )
+    .bind(ii.id)
+    .fetch_one(&st.db)
+    .await?;
+
+    Ok(Json(out.0))
+}
+
+async fn public_intake_issue_delete(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((anchor, intake_id, pk)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let (_, ii) = check_intake_issue_pk(&st, &user, &anchor, intake_id, pk).await?;
+    sqlx::query("UPDATE intake_issues SET deleted_at = now() WHERE id = $1")
+        .bind(ii.id)
+        .execute(&st.db)
+        .await?;
+    sqlx::query("UPDATE issues SET deleted_at = now() WHERE id = $1")
+        .bind(ii.issue_id)
+        .execute(&st.db)
+        .await?;
+    no_content()
+}
+
+/// GET /api/public/workspaces/{slug}/project-boards/
+async fn public_workspace_project_boards(
+    State(st): State<AppState>,
+    _user: MaybeUser,
+    Path(slug): Path<String>,
+) -> ApiResult {
+    let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM workspaces WHERE slug = $1 AND deleted_at IS NULL")
+        .bind(&slug)
+        .fetch_optional(&st.db)
+        .await?;
+    let (ws_id,) = exists.ok_or_else(ApiError::not_found)?;
+
+    let rows: Value = sqlx::query_scalar(
+        "SELECT COALESCE(jsonb_agg(jsonb_build_object(
+            'id', p.id,
+            'identifier', p.identifier,
+            'name', p.name,
+            'description', p.description,
+            'emoji', p.emoji,
+            'icon_prop', p.icon_prop,
+            'cover_image', p.cover_image
+        ) ORDER BY p.created_at DESC), '[]'::jsonb)
+        FROM projects p
+        WHERE p.workspace_id = $1
+          AND p.deleted_at IS NULL
+          AND p.archived_at IS NULL
+          AND EXISTS (
+              SELECT 1 FROM deploy_boards b
+              WHERE b.workspace_id = $1
+                AND b.project_id = p.id
+                AND b.entity_name = 'project'
+                AND b.deleted_at IS NULL
+                AND NOT b.is_disabled
+          )",
+    )
+    .bind(ws_id)
+    .fetch_one(&st.db)
+    .await?;
+
+    Ok(Json(rows))
 }

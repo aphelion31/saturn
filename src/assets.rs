@@ -113,12 +113,12 @@ const ENTITY_TYPES: &[&str] = &[
     "DRAFT_ISSUE_ATTACHMENT",
     "DRAFT_ISSUE_DESCRIPTION",
 ];
-const IMAGE_TYPES: &[&str] = &["image/jpeg", "image/png", "image/webp", "image/jpg", "image/gif"];
+pub(crate) const IMAGE_TYPES: &[&str] = &["image/jpeg", "image/png", "image/webp", "image/jpg", "image/gif"];
 /// Entity types readable through the public static endpoint (avatars, covers, logos), as in Plane.
 const STATIC_TYPES: &[&str] = &["USER_AVATAR", "USER_COVER", "WORKSPACE_LOGO", "PROJECT_COVER"];
 
 /// Plane's `sanitize_filename`: no directories, no control characters, no traversal.
-fn sanitize_filename(name: &str) -> String {
+pub(crate) fn sanitize_filename(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or("");
     let cleaned: String = base
         .chars()
@@ -139,7 +139,7 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
-fn token(secret: &str, asset_id: Uuid) -> String {
+pub(crate) fn token(secret: &str, asset_id: Uuid) -> String {
     let mut m = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac key");
     m.update(b"saturn-asset-upload:");
     m.update(asset_id.as_bytes());
@@ -425,7 +425,7 @@ fn io_err(e: std::io::Error) -> ApiError {
 /// Resolve a stored key under STORAGE_DIR, refusing anything that could escape it.
 /// Keys are server-generated (`{workspace}/{uuid}-{name}`); the lexical check blocks `..` and absolute
 /// paths, and an existing file must also canonicalize inside STORAGE_DIR, so a symlink can't leak out.
-fn disk_path(st: &AppState, key: &str) -> Result<std::path::PathBuf, ApiError> {
+pub(crate) fn disk_path(st: &AppState, key: &str) -> Result<std::path::PathBuf, ApiError> {
     if key.contains("..") || key.starts_with('/') || key.contains('\\') {
         return Err(ApiError::bad("Invalid asset key"));
     }
@@ -440,7 +440,7 @@ fn disk_path(st: &AppState, key: &str) -> Result<std::path::PathBuf, ApiError> {
 
 /// Stream a stored file. Images from the allowlist render inline; anything else downloads, so
 /// uploaded HTML or SVG can never execute on Saturn's origin.
-async fn serve(st: &AppState, key: &str, attrs: &Value, force_download: bool) -> Result<Response, ApiError> {
+pub(crate) async fn serve(st: &AppState, key: &str, attrs: &Value, force_download: bool) -> Result<Response, ApiError> {
     let bytes = tokio::fs::read(disk_path(st, key)?)
         .await
         .map_err(|_| ApiError::not_found())?;
