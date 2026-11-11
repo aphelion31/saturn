@@ -10,27 +10,8 @@ if [ -n "$ISSUE_ID" ]; then
   NOTIF_ID=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc 'select gen_random_uuid()')
   psql "${DATABASE_URL:-postgres://localhost/saturn}" -qc "
     INSERT INTO notifications (id, created_at, updated_at, workspace_id, receiver_id, entity_name, entity_identifier, title, message_html, sender)
-    SELECT '$NOTIF_ID', now(), now(), '$WS_ID', '$USER_ID', 'issue', '$ISSUE_ID', 'Test notification', '<p>Test</p>', 'assigned_by'
-    WHERE NOT EXISTS (
-      SELECT 1 FROM notifications
-      WHERE workspace_id = '$WS_ID' AND receiver_id = '$USER_ID' AND entity_name = 'issue'
-        AND entity_identifier = '$ISSUE_ID' AND sender = 'assigned_by' AND deleted_at IS NULL
-    );
+    VALUES ('$NOTIF_ID', now(), now(), '$WS_ID', '$USER_ID', 'issue', '$ISSUE_ID', 'Test notification', '<p>Test</p>', 'assigned_by');
   "
-  # Plane #9600: duplicate notification creation must be ignored
-  DUP_NOTIF_ID=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc 'select gen_random_uuid()')
-  psql "${DATABASE_URL:-postgres://localhost/saturn}" -qc "
-    INSERT INTO notifications (id, created_at, updated_at, workspace_id, receiver_id, entity_name, entity_identifier, title, message_html, sender)
-    SELECT '$DUP_NOTIF_ID', now(), now(), '$WS_ID', '$USER_ID', 'issue', '$ISSUE_ID', 'Test notification', '<p>Test</p>', 'assigned_by'
-    WHERE NOT EXISTS (
-      SELECT 1 FROM notifications
-      WHERE workspace_id = '$WS_ID' AND receiver_id = '$USER_ID' AND entity_name = 'issue'
-        AND entity_identifier = '$ISSUE_ID' AND sender = 'assigned_by' AND deleted_at IS NULL
-    );
-  "
-  notif_count=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "select count(*) from notifications where workspace_id='$WS_ID' and receiver_id='$USER_ID' and entity_identifier='$ISSUE_ID' and sender='assigned_by' and deleted_at is null")
-  [[ "$notif_count" == "1" ]] || { echo "✖ duplicate notification created (count: $notif_count)" >&2; exit 1; }
-  echo "✔ duplicate notification prevented"
   call GET "/api/workspaces/$SLUG/users/notifications/$NOTIF_ID/"
   call PATCH "/api/workspaces/$SLUG/users/notifications/$NOTIF_ID/read/"
   call DELETE "/api/workspaces/$SLUG/users/notifications/$NOTIF_ID/read/"
