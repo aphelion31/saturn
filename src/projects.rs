@@ -221,7 +221,11 @@ async fn join_projects(
         if network != 2 && !ws.is_admin() {
             return Err(ApiError::forbidden());
         }
-        sqlx::query("INSERT INTO project_members (workspace_id,project_id,member_id,role,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$3,$3) ON CONFLICT (project_id,member_id) WHERE deleted_at IS NULL DO UPDATE SET is_active=true,role=EXCLUDED.role,updated_at=now(),updated_by_id=EXCLUDED.updated_by_id WHERE NOT project_members.is_active").bind(ws.workspace_id).bind(id).bind(user.id).bind(ws.role).execute(&mut *tx).await?;
+        let revoked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM project_members WHERE workspace_id=$1 AND project_id=$2 AND member_id=$3 AND NOT is_active AND updated_by_id IS DISTINCT FROM member_id AND deleted_at IS NULL)").bind(ws.workspace_id).bind(id).bind(user.id).fetch_one(&mut *tx).await?;
+        if revoked {
+            return Err(ApiError::forbidden());
+        }
+        sqlx::query("INSERT INTO project_members (workspace_id,project_id,member_id,role,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$3,$3) ON CONFLICT (project_id,member_id) WHERE deleted_at IS NULL DO UPDATE SET is_active=true,role=EXCLUDED.role,updated_at=now(),updated_by_id=EXCLUDED.updated_by_id WHERE NOT project_members.is_active AND project_members.updated_by_id=project_members.member_id").bind(ws.workspace_id).bind(id).bind(user.id).bind(ws.role).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO project_user_properties (workspace_id,project_id,user_id,created_by_id,updated_by_id) VALUES ($1,$2,$3,$3,$3) ON CONFLICT DO NOTHING").bind(ws.workspace_id).bind(id).bind(user.id).execute(&mut *tx).await?;
     }
     tx.commit().await?;
