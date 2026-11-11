@@ -5,6 +5,11 @@ call POST "/api/workspaces/$SLUG/projects/$PROJECT/pages/" '{"name":"Smoke page"
 PAGE=$(field '.id')
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/pages/$PAGE/"
 call PATCH "/api/workspaces/$SLUG/projects/$PROJECT/pages/$PAGE/" '{"name":"Updated smoke page"}'
+call PATCH "/api/workspaces/$SLUG/projects/$PROJECT/pages/$PAGE/" '{"description_html":"<p>generic update</p>"}'
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/pages/$PAGE/versions/"
+PATCH_VERSION=$(field '.[0].id')
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/pages/$PAGE/versions/$PATCH_VERSION/"
+[[ "$(field '.description_html')" == '<p>generic update</p>' ]]
 call POST "/api/workspaces/$SLUG/projects/$PROJECT/favorite-pages/$PAGE/"
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/pages/$PAGE/"
 [[ "$(field '.is_favorite')" == true ]]
@@ -16,9 +21,9 @@ call POST "/api/workspaces/$SLUG/projects/$PROJECT/pages/$COPY/archive/"
 call DELETE "/api/workspaces/$SLUG/projects/$PROJECT/pages/$COPY/"
 call PATCH "/api/workspaces/$SLUG/projects/$PROJECT/pages/$PAGE/description/" '{"description_binary":"AQIDBA==","description_html":"<p>safe</p><script>alert(1)</script>"}'
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/pages/$PAGE/versions/"
-VERSION=$(field "[0]['id']")
+VERSION=$(field '.[0].id')
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/pages/$PAGE/versions/$VERSION/"
-[[ "$(field "['description_html']")" == '<p>safe</p>' ]]
+[[ "$(field '.description_html')" == '<p>safe</p>' ]]
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/pages/$PAGE/"
 [[ "$(field '.description_html')" == '<p>safe</p>' ]]
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/pages/$PAGE/description/"
