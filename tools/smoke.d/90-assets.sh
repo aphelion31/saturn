@@ -38,4 +38,14 @@ if [ -n "$ISSUE_ID" ]; then
   call PATCH "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE_ID/attachments/$MD_ASSET/" '{}'
   call DELETE "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE_ID/attachments/$MD_ASSET/"
   echo "✔ .md attachment accepted and deleted"
+
+  # Plane #9564: description image assets must not get asset_url with project None and must set project_id
+  call POST "/api/assets/v2/workspaces/$SLUG/" "{\"entity_type\":\"ISSUE_DESCRIPTION\",\"entity_identifier\":\"$ISSUE_ID\",\"name\":\"desc.png\",\"type\":\"image/png\",\"size\":10}"
+  DESC_ASSET=$(field '.asset_id')
+  DESC_URL=$(field '.asset_url')
+  [[ "$DESC_URL" != *"None"* ]] || { echo "✖ description asset_url contains None: $DESC_URL" >&2; exit 1; }
+  db_pid=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "select project_id from file_assets where id='$DESC_ASSET'")
+  [[ -n "$db_pid" && "$db_pid" != "" ]] || { echo "✖ description asset project_id is empty" >&2; exit 1; }
+  echo "✔ description asset has valid project_id ($db_pid) and no None in asset_url"
+  call DELETE "/api/assets/v2/workspaces/$SLUG/$DESC_ASSET/"
 fi
