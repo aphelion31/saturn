@@ -32,6 +32,7 @@ use std::sync::Arc;
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_schema", include_str!("../migrations/0001_schema.sql")),
     ("0002_defaults", include_str!("../migrations/0002_defaults.sql")),
+    ("0003_auth_tokens", include_str!("../migrations/0003_auth_tokens.sql")),
 ];
 
 pub fn app(state: AppState) -> Router {
