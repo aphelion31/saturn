@@ -218,7 +218,7 @@ async fn join_projects(
                 .bind(ws.workspace_id)
                 .fetch_one(&mut *tx)
                 .await?;
-        if network != 2 {
+        if network != 2 && !ws.is_admin() {
             return Err(ApiError::forbidden());
         }
         let revoked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM project_members WHERE workspace_id=$1 AND project_id=$2 AND member_id=$3 AND NOT is_active AND updated_by_id IS DISTINCT FROM member_id AND deleted_at IS NULL)").bind(ws.workspace_id).bind(id).bind(user.id).fetch_one(&mut *tx).await?;
