@@ -72,6 +72,27 @@ pub fn routes() -> Router<AppState> {
             "/api/workspaces/{slug}/home-preferences/{key}/",
             patch(home_pref_update),
         )
+        .route(
+            "/api/workspaces/{slug}/webhooks/",
+            get(webhooks_list).post(webhook_create),
+        )
+        .route(
+            "/api/workspaces/{slug}/webhooks/{pk}/",
+            get(webhook_retrieve).patch(webhook_update).delete(webhook_delete),
+        )
+        .route(
+            "/api/workspaces/{slug}/webhooks/{pk}/regenerate/",
+            post(webhook_regenerate),
+        )
+        .route("/api/workspaces/{slug}/webhook-logs/{webhook_id}/", get(webhook_logs))
+        .route(
+            "/api/workspaces/{slug}/workspace-themes/",
+            get(themes_list).post(theme_create),
+        )
+        .route(
+            "/api/workspaces/{slug}/workspace-themes/{pk}/",
+            get(theme_retrieve).patch(theme_update).delete(theme_delete),
+        )
 }
 
 /// WorkSpaceSerializer fields, with `total_members` (active, non-bot) and `logo_url`.
@@ -1382,4 +1403,383 @@ async fn home_pref_update(
     .await?;
     v.map(Json)
         .ok_or_else(|| ApiError::bad_body(json!({"detail": "Preference not found"})))
+}
+
+// --- webhooks (WebhookEndpoint, WebhookSecretRegenerateEndpoint, WebhookLogsEndpoint). Workspace ADMIN only ---
+
+/// WebhookSerializer fields. `secret_key` is added only on create and regenerate.
+const WEBHOOK_JSON: &str = "jsonb_build_object('id', w.id, 'url', w.url, 'is_active', w.is_active, 'project', w.project,
+    'issue', w.issue, 'module', w.module, 'cycle', w.cycle, 'issue_comment', w.issue_comment, 'is_internal', w.is_internal,
+    'version', w.version, 'created_at', w.created_at, 'updated_at', w.updated_at, 'workspace', w.workspace_id,
+    'created_by', w.created_by_id, 'updated_by', w.updated_by_id)";
+const WEBHOOK_FLAGS: &[&str] = &["is_active", "project", "issue", "module", "cycle", "issue_comment"];
+const WEBHOOK_PATCH_FIELDS: &[(&str, &str)] = &[
+    ("url", "text"),
+    ("is_active", "bool"),
+    ("project", "bool"),
+    ("issue", "bool"),
+    ("module", "bool"),
+    ("cycle", "bool"),
+    ("issue_comment", "bool"),
+];
+
+/// Plane: `"plane_wh_" + uuid4().hex`.
+fn new_webhook_secret() -> String {
+    format!("plane_wh_{}", Uuid::new_v4().simple())
+}
+
+fn flag(b: &Value, k: &str) -> Option<bool> {
+    b.get(k).and_then(Value::as_bool)
+}
+
+fn check_flags(b: &Value) -> Result<(), ApiError> {
+    let mut errs = serde_json::Map::new();
+    for k in WEBHOOK_FLAGS {
+        if let Some(v) = b.get(*k)
+            && !v.is_boolean()
+        {
+            errs.insert((*k).into(), json!(["Must be a valid boolean."]));
+        }
+    }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::bad_body(Value::Object(errs)))
+    }
+}
+
+/// Stand-in for Plane's `validate_url` (SSRF guard): http/https only, and the host must resolve
+/// to public addresses. Loopback, private, link-local and unspecified targets are refused.
+// ponytail: DNS is resolved once here; a rebinding race before delivery is not covered. Add when delivery is ported.
+async fn check_webhook_url(raw: &str) -> Result<(), ApiError> {
+    let bad = || ApiError::bad_body(json!({"url": ["Invalid or disallowed webhook URL."]}));
+    let u = url::Url::parse(raw).map_err(|_| bad())?;
+    if !matches!(u.scheme(), "http" | "https") {
+        return Err(bad());
+    }
+    let port = u.port_or_known_default().unwrap_or(443);
+    let ips: Vec<std::net::IpAddr> = match u.host().ok_or_else(bad)? {
+        url::Host::Ipv4(ip) => vec![ip.into()],
+        url::Host::Ipv6(ip) => vec![ip.into()],
+        url::Host::Domain(d) => tokio::net::lookup_host((d, port))
+            .await
+            .map_err(|_| bad())?
+            .map(|a| a.ip())
+            .collect(),
+    };
+    if ips.is_empty() || ips.iter().any(|ip| blocked_ip(*ip)) {
+        return Err(bad());
+    }
+    Ok(())
+}
+
+fn blocked_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+                || v4.octets()[0] == 0
+        }
+        std::net::IpAddr::V6(v6) => {
+            let seg = v6.segments()[0];
+            v6.is_loopback()
+                || v6.is_multicast()
+                || v6.is_unspecified()
+                || (seg & 0xfe00) == 0xfc00
+                || (seg & 0xffc0) == 0xfe80
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| blocked_ip(std::net::IpAddr::V4(v4)))
+        }
+    }
+}
+
+async fn webhooks_list(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN])?;
+    json_rows(
+        sqlx::query_scalar(&format!(
+            "SELECT {WEBHOOK_JSON} FROM webhooks w WHERE w.workspace_id = $1 AND w.deleted_at IS NULL ORDER BY w.created_at"
+        ))
+        .bind(ws.workspace_id),
+        &st.db,
+    )
+    .await
+}
+
+async fn webhook_create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(slug): Path<String>,
+    Json(b): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN])?;
+    let url = s(&b, "url").ok_or_else(|| ApiError::bad_body(json!({"url": ["This field is required."]})))?;
+    check_webhook_url(url).await?;
+    check_flags(&b)?;
+    let secret = new_webhook_secret();
+    let mut v: Value = sqlx::query_scalar(&format!(
+        "INSERT INTO webhooks AS w (workspace_id, url, secret_key, is_active, project, issue, module, cycle, issue_comment,
+            created_by_id, updated_by_id)
+         VALUES ($1, $2, $3, COALESCE($4, true), COALESCE($5, false), COALESCE($6, false), COALESCE($7, false),
+                 COALESCE($8, false), COALESCE($9, false), $10, $10)
+         RETURNING {WEBHOOK_JSON}"
+    ))
+    .bind(ws.workspace_id)
+    .bind(url)
+    .bind(&secret)
+    .bind(flag(&b, "is_active"))
+    .bind(flag(&b, "project"))
+    .bind(flag(&b, "issue"))
+    .bind(flag(&b, "module"))
+    .bind(flag(&b, "cycle"))
+    .bind(flag(&b, "issue_comment"))
+    .bind(user.id)
+    .fetch_one(&st.db)
+    .await?;
+    v["secret_key"] = json!(secret);
+    created(v)
+}
+
+async fn webhook_retrieve(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pk)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN])?;
+    json_row(
+        sqlx::query_scalar(&format!(
+            "SELECT {WEBHOOK_JSON} FROM webhooks w WHERE w.id = $1 AND w.workspace_id = $2 AND w.deleted_at IS NULL"
+        ))
+        .bind(pk)
+        .bind(ws.workspace_id),
+        &st.db,
+    )
+    .await
+}
+
+async fn webhook_update(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pk)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN])?;
+    if b.get("url").is_some() {
+        let url = s(&b, "url").ok_or_else(|| ApiError::bad_body(json!({"url": ["This field may not be null."]})))?;
+        check_webhook_url(url).await?;
+    }
+    check_flags(&b)?;
+    let mut sets = crate::users::patch_sets(&b, WEBHOOK_PATCH_FIELDS, 2);
+    sets.push("updated_at = now()".into());
+    sets.push("updated_by_id = $4".into());
+    json_row(
+        sqlx::query_scalar(&format!(
+            "UPDATE webhooks AS w SET {} WHERE w.id = $1 AND w.workspace_id = $3 AND w.deleted_at IS NULL
+             RETURNING {WEBHOOK_JSON}",
+            sets.join(", ")
+        ))
+        .bind(pk)
+        .bind(&b)
+        .bind(ws.workspace_id)
+        .bind(user.id),
+        &st.db,
+    )
+    .await
+}
+
+async fn webhook_delete(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pk)): Path<(String, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN])?;
+    let r = sqlx::query(
+        "UPDATE webhooks SET deleted_at = now(), updated_at = now(), updated_by_id = $3
+         WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(ws.workspace_id)
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
+}
+
+async fn webhook_regenerate(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pk)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN])?;
+    let secret = new_webhook_secret();
+    let v: Option<Value> = sqlx::query_scalar(&format!(
+        "UPDATE webhooks AS w SET secret_key = $3, updated_at = now(), updated_by_id = $4
+         WHERE w.id = $1 AND w.workspace_id = $2 AND w.deleted_at IS NULL RETURNING {WEBHOOK_JSON}"
+    ))
+    .bind(pk)
+    .bind(ws.workspace_id)
+    .bind(&secret)
+    .bind(user.id)
+    .fetch_optional(&st.db)
+    .await?;
+    let mut v = v.ok_or_else(ApiError::not_found)?;
+    v["secret_key"] = json!(secret);
+    Ok(Json(v))
+}
+
+async fn webhook_logs(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, webhook_id)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN])?;
+    // ponytail: delivery not ported, so this table stays empty until webhook delivery exists.
+    json_rows(
+        sqlx::query_scalar(
+            "SELECT jsonb_build_object('id', l.id, 'created_at', l.created_at, 'updated_at', l.updated_at,
+                'event_type', l.event_type, 'request_method', l.request_method, 'request_headers', l.request_headers,
+                'request_body', l.request_body, 'response_status', l.response_status, 'response_headers', l.response_headers,
+                'response_body', l.response_body, 'retry_count', l.retry_count, 'created_by', l.created_by_id,
+                'updated_by', l.updated_by_id, 'webhook', l.webhook, 'workspace', l.workspace_id)
+             FROM webhook_logs l
+             WHERE l.workspace_id = $1 AND l.webhook = $2 AND l.deleted_at IS NULL ORDER BY l.created_at DESC",
+        )
+        .bind(ws.workspace_id)
+        .bind(webhook_id),
+        &st.db,
+    )
+    .await
+}
+
+// --- workspace themes (WorkspaceThemeViewSet). Plane's WorkSpaceAdminPermission admits Admin and Member ---
+
+const THEME_JSON: &str = "jsonb_build_object('id', t.id, 'name', t.name, 'colors', t.colors, 'actor', t.actor_id,
+    'workspace', t.workspace_id, 'created_at', t.created_at, 'updated_at', t.updated_at,
+    'created_by', t.created_by_id, 'updated_by', t.updated_by_id)";
+
+/// Plane's `name` is varchar(300) and required.
+fn theme_name(b: &Value, required: bool) -> Result<Option<&str>, ApiError> {
+    match s(b, "name").map(str::trim) {
+        Some(n) if n.is_empty() => Err(ApiError::bad_body(json!({"name": ["This field may not be blank."]}))),
+        Some(n) if n.chars().count() > 300 => Err(ApiError::bad_body(
+            json!({"name": ["Ensure this field has no more than 300 characters."]}),
+        )),
+        Some(n) => Ok(Some(n)),
+        None if required => Err(ApiError::bad_body(json!({"name": ["This field is required."]}))),
+        None => Ok(None),
+    }
+}
+
+async fn themes_list(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER])?;
+    json_rows(
+        sqlx::query_scalar(&format!(
+            "SELECT {THEME_JSON} FROM workspace_themes t WHERE t.workspace_id = $1 AND t.deleted_at IS NULL ORDER BY t.created_at"
+        ))
+        .bind(ws.workspace_id),
+        &st.db,
+    )
+    .await
+}
+
+async fn theme_create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(slug): Path<String>,
+    Json(b): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER])?;
+    let name = theme_name(&b, true)?.unwrap_or_default();
+    let v: Value = sqlx::query_scalar(&format!(
+        "INSERT INTO workspace_themes AS t (workspace_id, name, colors, actor_id, created_by_id, updated_by_id)
+         VALUES ($1, $2, COALESCE($3::jsonb, '{{}}'::jsonb), $4, $4, $4) RETURNING {THEME_JSON}"
+    ))
+    .bind(ws.workspace_id)
+    .bind(name)
+    .bind(b.get("colors"))
+    .bind(user.id)
+    .fetch_one(&st.db)
+    .await?;
+    created(v)
+}
+
+async fn theme_retrieve(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pk)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER])?;
+    json_row(
+        sqlx::query_scalar(&format!(
+            "SELECT {THEME_JSON} FROM workspace_themes t WHERE t.id = $1 AND t.workspace_id = $2 AND t.deleted_at IS NULL"
+        ))
+        .bind(pk)
+        .bind(ws.workspace_id),
+        &st.db,
+    )
+    .await
+}
+
+async fn theme_update(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pk)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER])?;
+    let name = theme_name(&b, false)?;
+    json_row(
+        sqlx::query_scalar(&format!(
+            "UPDATE workspace_themes AS t SET name = COALESCE($3, t.name), colors = COALESCE($4::jsonb, t.colors),
+                updated_at = now(), updated_by_id = $2
+             WHERE t.id = $1 AND t.workspace_id = $5 AND t.deleted_at IS NULL RETURNING {THEME_JSON}"
+        ))
+        .bind(pk)
+        .bind(user.id)
+        .bind(name)
+        .bind(b.get("colors"))
+        .bind(ws.workspace_id),
+        &st.db,
+    )
+    .await
+}
+
+async fn theme_delete(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pk)): Path<(String, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER])?;
+    let r = sqlx::query(
+        "UPDATE workspace_themes SET deleted_at = now(), updated_at = now(), updated_by_id = $3
+         WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(ws.workspace_id)
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
 }
