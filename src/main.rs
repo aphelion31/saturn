@@ -7,6 +7,7 @@ mod web;
 mod workitems;
 
 // API areas. Each module owns its routes (full paths, trailing slash, as Plane's apps call them).
+mod analytics;
 mod assets;
 mod cycles;
 mod issues;
@@ -49,6 +50,7 @@ pub fn app(state: AppState) -> Router {
         .merge(notifications::routes())
         .merge(assets::routes())
         .merge(public::routes())
+        .merge(analytics::routes())
         .route("/api/{*rest}", any(web::not_implemented))
         .route("/auth/{*rest}", any(web::not_implemented))
         .layer(middleware::from_fn_with_state(state.clone(), web::origin_check));
