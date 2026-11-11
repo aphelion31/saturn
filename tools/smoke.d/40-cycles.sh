@@ -1,5 +1,11 @@
 # Cycles (src/cycles.rs)
 C="/api/workspaces/$SLUG/projects/$PROJECT/cycles"
+call POST "$C/" '{"name":"Completed cycle","start_date":"2000-01-01","end_date":"2000-01-10"}'
+OLD_CYCLE=$(field "['id']")
+call PATCH "$C/$OLD_CYCLE/" '{"sort_order":42,"name":"Smuggled"}'
+call GET "$C/$OLD_CYCLE/"
+[[ "$(field "['name']")" == 'Completed cycle' ]]
+call DELETE "$C/$OLD_CYCLE/"
 call POST "$C/" '{"name":"Smoke cycle '$RANDOM'","start_date":"2030-01-01","end_date":"2030-01-10"}'
 CYCLE=$(field '.id')
 call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/" '{"name":"Cycle issue"}'
