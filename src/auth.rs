@@ -10,8 +10,11 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
+use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::sync::OnceLock;
+use std::time::Instant;
 use uuid::Uuid;
 
 use crate::common::{ApiError, ApiResult, AppState, CurrentUser, MaybeUser};
@@ -65,8 +68,73 @@ fn code(name: &str) -> u32 {
         "ADMIN_AUTHENTICATION_FAILED" => 5175,
         "ADMIN_USER_ALREADY_EXIST" => 5180,
         "ADMIN_USER_DOES_NOT_EXIST" => 5185,
+        "RATE_LIMIT_EXCEEDED" => 5900,
         _ => 5999,
     }
+}
+
+struct Bucket {
+    tokens: f64,
+    last: Instant,
+}
+
+static AUTH_BUCKETS: OnceLock<DashMap<String, Bucket>> = OnceLock::new();
+
+fn rate_limit_max() -> Option<f64> {
+    match std::env::var("SATURN_RATE_LIMIT").as_deref() {
+        Ok("0") => None,
+        Ok(v) => v.parse::<f64>().ok().filter(|&n| n > 0.0).or(Some(10.0)),
+        Err(_) => Some(10.0),
+    }
+}
+
+fn client_ip(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
+        .unwrap_or("unknown")
+        .trim()
+        .to_string()
+}
+
+fn check_rate_limit(headers: &HeaderMap, scope: &str) -> bool {
+    let Some(cap) = rate_limit_max() else {
+        return true;
+    };
+    check_rate_limit_with_cap(AUTH_BUCKETS.get_or_init(DashMap::new), headers, scope, cap, Instant::now())
+}
+
+fn check_rate_limit_with_cap(
+    buckets: &DashMap<String, Bucket>,
+    headers: &HeaderMap,
+    scope: &str,
+    cap: f64,
+    now: Instant,
+) -> bool {
+    let key = format!("{scope}:{}", client_ip(headers));
+    if buckets.len() > 10_000 {
+        buckets.retain(|_, b| now.duration_since(b.last).as_secs_f64() < 120.0);
+    }
+    let mut entry = buckets.entry(key).or_insert_with(|| Bucket { tokens: cap, last: now });
+    let elapsed = now.duration_since(entry.last).as_secs_f64();
+    entry.tokens = (entry.tokens + elapsed * (cap / 60.0)).min(cap);
+    entry.last = now;
+    if entry.tokens >= 1.0 {
+        entry.tokens -= 1.0;
+        true
+    } else {
+        false
+    }
+}
+
+fn rate_limit_response() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({"error_code": code("RATE_LIMIT_EXCEEDED"), "error_message": "RATE_LIMIT_EXCEEDED"})),
+    )
+        .into_response()
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -313,7 +381,10 @@ struct EmailCheck {
     email: Option<String>,
 }
 
-async fn email_check(State(st): State<AppState>, Json(b): Json<EmailCheck>) -> Response {
+async fn email_check(State(st): State<AppState>, headers: HeaderMap, Json(b): Json<EmailCheck>) -> Response {
+    if !check_rate_limit(&headers, "email-check") {
+        return rate_limit_response();
+    }
     let fail = |n: &str| {
         (
             StatusCode::BAD_REQUEST,
@@ -353,6 +424,9 @@ struct AuthForm {
 }
 
 async fn sign_in(st: AppState, headers: HeaderMap, f: AuthForm, app: App) -> Result<Response, ApiError> {
+    if !check_rate_limit(&headers, "sign-in") {
+        return Ok(rate_limit_response());
+    }
     let next = safe_next(f.next_path.as_deref());
     if !setup_done(&st).await? {
         return Ok(err_redirect(&st, app, &next, "INSTANCE_NOT_CONFIGURED", None));
@@ -378,7 +452,13 @@ async fn sign_in(st: AppState, headers: HeaderMap, f: AuthForm, app: App) -> Res
     .fetch_optional(&st.db)
     .await?;
     let Some((id, hash, active, bot, logged_out_before)) = row else {
-        return Ok(err_redirect(&st, app, &next, "USER_DOES_NOT_EXIST", Some(&email)));
+        return Ok(err_redirect(
+            &st,
+            app,
+            &next,
+            "AUTHENTICATION_FAILED_SIGN_IN",
+            Some(&email),
+        ));
     };
     if bot || !session::check_password(&password, &hash) {
         return Ok(err_redirect(
@@ -430,6 +510,9 @@ async fn sign_in(st: AppState, headers: HeaderMap, f: AuthForm, app: App) -> Res
 }
 
 async fn sign_up(st: AppState, headers: HeaderMap, f: AuthForm, app: App) -> Result<Response, ApiError> {
+    if !check_rate_limit(&headers, "sign-up") {
+        return Ok(rate_limit_response());
+    }
     let next = safe_next(f.next_path.as_deref());
     if !setup_done(&st).await? {
         return Ok(err_redirect(&st, app, &next, "INSTANCE_NOT_CONFIGURED", None));
@@ -681,6 +764,9 @@ async fn admin_sign_in(
     headers: HeaderMap,
     Form(f): Form<AuthForm>,
 ) -> Result<Response, ApiError> {
+    if !check_rate_limit(&headers, "admin-sign-in") {
+        return Ok(rate_limit_response());
+    }
     let email = f.email.unwrap_or_default().trim().to_lowercase();
     let password = f.password.unwrap_or_default();
     let back = |n: &str| err_redirect(&st, App::Admin, "", n, Some(&email));
@@ -699,7 +785,7 @@ async fn admin_sign_in(
             .fetch_optional(&st.db)
             .await?;
     let Some((id, hash, active)) = row else {
-        return Ok(back("ADMIN_USER_DOES_NOT_EXIST"));
+        return Ok(back("ADMIN_AUTHENTICATION_FAILED"));
     };
     if !active || !session::check_password(&password, &hash) || !is_instance_admin(&st, id).await? {
         return Ok(back("ADMIN_AUTHENTICATION_FAILED"));
@@ -768,6 +854,25 @@ mod tests {
         assert_eq!(safe_next(Some("https://evil.com/x")), "/x");
         assert_eq!(safe_next(Some("/a/../b")), "");
         assert_eq!(safe_next(Some("relative")), "");
+    }
+
+    #[test]
+    fn rate_limiting_token_bucket() {
+        let buckets = DashMap::new();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "192.168.1.1".parse().unwrap());
+        let now = Instant::now();
+
+        for _ in 0..10 {
+            assert!(check_rate_limit_with_cap(&buckets, &headers, "test", 10.0, now));
+        }
+        // 11th request in the same instant should be rate-limited
+        assert!(!check_rate_limit_with_cap(&buckets, &headers, "test", 10.0, now));
+
+        // Different IP is not throttled
+        let mut headers2 = HeaderMap::new();
+        headers2.insert("x-forwarded-for", "192.168.1.2".parse().unwrap());
+        assert!(check_rate_limit_with_cap(&buckets, &headers2, "test", 10.0, now));
     }
 
     #[test]
