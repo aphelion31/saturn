@@ -47,6 +47,35 @@ pub fn routes() -> Router<AppState> {
             "/api/v1/workspaces/{slug}/projects/{project_id}/labels/{label_id}/",
             get(label).patch(update_label).delete(delete_label),
         )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/cycles-lite/",
+            get(cycle_list),
+        )
+}
+
+const CYCLE_JSON: &str = "(to_jsonb(c)-'workspace_id'-'project_id'-'owned_by_id'-'created_by_id'-'updated_by_id') || jsonb_build_object('workspace',c.workspace_id,'project',c.project_id,'owned_by',c.owned_by_id,'created_by',c.created_by_id,'updated_by',c.updated_by_id)";
+
+async fn cycle_list_impl(
+    st: AppState,
+    user: CurrentUser,
+    slug: String,
+    pid: Uuid,
+    q: HashMap<String, String>,
+    archived: bool,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let rows:Vec<Value>=sqlx::query_scalar(&format!("SELECT {CYCLE_JSON} FROM cycles c JOIN projects p ON p.id=c.project_id AND p.workspace_id=c.workspace_id WHERE c.project_id=$1 AND c.workspace_id=$2 AND c.deleted_at IS NULL AND (c.archived_at IS NOT NULL)=$3 AND p.deleted_at IS NULL AND p.archived_at IS NULL ORDER BY c.created_at DESC,c.id"))
+        .bind(pid).bind(p.workspace_id()).bind(archived).fetch_all(&st.db).await?;
+    paginate(rows, &q)
+}
+async fn cycle_list(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    cycle_list_impl(st, user, slug, pid, q, false).await
 }
 
 async fn set_archived(st: AppState, user: CurrentUser, slug: String, id: Uuid, archive: bool) -> ApiResult<StatusCode> {
