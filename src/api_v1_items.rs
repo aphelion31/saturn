@@ -87,6 +87,232 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/workspaces/{slug}/issues/search/", get(search))
         .route("/api/v1/workspaces/{slug}/work-items/{identifier}/", get(by_identifier))
         .route("/api/v1/workspaces/{slug}/issues/{identifier}/", get(by_identifier))
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/relations/",
+            get(relation_list).post(relation_create),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/attachments/",
+            get(attachment_list),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/attachments/{pk}/",
+            axum::routing::delete(attachment_delete),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-attachments/",
+            get(attachment_list),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-attachments/{pk}/",
+            axum::routing::delete(attachment_delete),
+        )
+}
+
+// ---- relations ----
+
+const RELATION_KEYS: [&str; 8] = [
+    "blocking",
+    "blocked_by",
+    "duplicate",
+    "relates_to",
+    "start_after",
+    "start_before",
+    "finish_after",
+    "finish_before",
+];
+
+/// Plane IssueRelationListCreateAPIEndpoint.get: relations grouped by type, `{project_id, issue_id}` entries.
+async fn relation_list(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id)): SubPath,
+) -> ApiResult {
+    let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
+    let rows: Vec<(String, Uuid, Uuid, Uuid, Uuid)> = sqlx::query_as(
+        "SELECT r.relation_type, r.issue_id, r.related_issue_id, i.project_id, o.project_id
+         FROM issue_relations r
+         JOIN issues i ON i.id = r.issue_id AND i.workspace_id = r.workspace_id
+         JOIN issues o ON o.id = r.related_issue_id AND o.workspace_id = r.workspace_id
+         WHERE r.workspace_id = $1 AND (r.issue_id = $2 OR r.related_issue_id = $2) AND r.deleted_at IS NULL
+           AND i.deleted_at IS NULL AND o.deleted_at IS NULL AND i.archived_at IS NULL AND o.archived_at IS NULL
+           AND NOT i.is_draft AND NOT o.is_draft
+           AND EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id = i.project_id AND pm.workspace_id = $1 AND pm.member_id = $3 AND pm.is_active AND pm.deleted_at IS NULL)
+           AND EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id = o.project_id AND pm.workspace_id = $1 AND pm.member_id = $3 AND pm.is_active AND pm.deleted_at IS NULL)
+           AND (NOT $4 OR (i.created_by_id = $3 AND o.created_by_id = $3))
+         ORDER BY r.created_at, r.id",
+    )
+    .bind(p.workspace_id())
+    .bind(issue_id)
+    .bind(user.id)
+    .bind(p.restricted_guest())
+    .fetch_all(&st.db)
+    .await?;
+    let mut out: serde_json::Map<String, Value> = RELATION_KEYS.iter().map(|k| (k.to_string(), json!([]))).collect();
+    let mut seen = std::collections::HashSet::new();
+    for (rt, a, b, pa, pb) in rows {
+        let from_url = a == issue_id;
+        let (other, other_project) = if from_url { (b, pb) } else { (a, pa) };
+        // Stored row is (issue_id, related_issue_id, type); Plane maps it per side of the URL issue.
+        let entries: Vec<(&str, bool)> = match rt.as_str() {
+            "blocked_by" => vec![if from_url {
+                ("blocked_by", true)
+            } else {
+                ("blocking", true)
+            }],
+            "start_before" => vec![if from_url {
+                ("start_before", true)
+            } else {
+                ("start_after", true)
+            }],
+            "finish_before" => vec![if from_url {
+                ("finish_before", true)
+            } else {
+                ("finish_after", true)
+            }],
+            "duplicate" => vec![("duplicate", true)],
+            "relates_to" => vec![("relates_to", true)],
+            _ => vec![],
+        };
+        for (k, _) in entries {
+            if matches!(k, "duplicate" | "relates_to") && !seen.insert((k, other)) {
+                continue;
+            }
+            if let Some(Value::Array(v)) = out.get_mut(k) {
+                v.push(json!({"project_id": other_project, "issue_id": other}));
+            }
+        }
+    }
+    Ok(Json(Value::Object(out)))
+}
+
+/// Plane IssueRelationListCreateAPIEndpoint.post: `{relation_type, issues: [...]}`, 201 with created rows.
+async fn relation_create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id)): SubPath,
+    Json(b): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let kind = s(&b, "relation_type")
+        .ok_or_else(|| ApiError::bad_body(json!({"relation_type": ["This field is required."]})))?;
+    // Plane get_actual_relation: blocking/start_after/finish_after store the reversed row.
+    let (stored, reverse) = match kind {
+        "blocking" => ("blocked_by", true),
+        "blocked_by" => ("blocked_by", false),
+        "start_after" => ("start_before", true),
+        "start_before" => ("start_before", false),
+        "finish_after" => ("finish_before", true),
+        "finish_before" => ("finish_before", false),
+        "duplicate" => ("duplicate", false),
+        "relates_to" => ("relates_to", false),
+        _ => return Err(ApiError::bad_body(json!({"relation_type": ["Invalid relation type."]}))),
+    };
+    let ids = uuid_list(&b, "issues")?;
+    if ids.is_empty() {
+        return Err(ApiError::bad_body(json!({"issues": ["This field is required."]})));
+    }
+    if ids.contains(&issue_id) {
+        return Err(ApiError::bad("Cannot relate an issue to itself"));
+    }
+    let mut tx = st.db.begin().await?;
+    let mut out = Vec::new();
+    for id in ids {
+        // Plane drops ids outside the workspace silently (Issue.issue_objects.filter by workspace).
+        let other: Option<Uuid> = sqlx::query_scalar(&format!(
+            "SELECT i.id FROM issues i WHERE i.id = $1 AND i.workspace_id = $2 AND {ACTIVE} AND (NOT $3 OR i.created_by_id = $4)"
+        ))
+        .bind(id)
+        .bind(p.workspace_id())
+        .bind(p.restricted_guest())
+        .bind(user.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(other) = other else { continue };
+        let (a, b_id) = if reverse { (other, issue_id) } else { (issue_id, other) };
+        let inserted: Option<Uuid> = sqlx::query_scalar(
+            "INSERT INTO issue_relations (workspace_id, project_id, issue_id, related_issue_id, relation_type, created_by_id, updated_by_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $6)
+             ON CONFLICT DO NOTHING RETURNING id",
+        )
+        .bind(p.workspace_id())
+        .bind(project_id)
+        .bind(a)
+        .bind(b_id)
+        .bind(stored)
+        .bind(user.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if inserted.is_some() {
+            out.push(json!({"issue_id": a, "related_issue_id": b_id, "relation_type": stored}));
+        }
+    }
+    tx.commit().await?;
+    created(Value::Array(out))
+}
+
+// ---- attachments: list and delete. Upload stays on /api/assets/v2 (see gaps in report). ----
+
+const ATTACHMENT_V1: &str = "jsonb_build_object(
+    'id', f.id, 'attributes', f.attributes, 'asset', f.asset, 'size', f.size,
+    'issue_id', f.issue_id, 'project_id', f.project_id, 'workspace_id', f.workspace_id,
+    'created_at', f.created_at, 'updated_at', f.updated_at,
+    'created_by', f.created_by_id, 'updated_by', f.updated_by_id)";
+
+/// Plane IssueAttachmentListCreateAPIEndpoint.get.
+async fn attachment_list(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id)): SubPath,
+) -> ApiResult {
+    let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
+    json_rows(
+        sqlx::query_scalar(&format!(
+            "SELECT {ATTACHMENT_V1} FROM file_assets f
+             WHERE f.issue_id = $1 AND f.project_id = $2 AND f.workspace_id = $3 AND f.entity_type = 'ISSUE_ATTACHMENT'
+               AND f.is_uploaded AND f.deleted_at IS NULL ORDER BY f.created_at DESC"
+        ))
+        .bind(issue_id)
+        .bind(project_id)
+        .bind(p.workspace_id()),
+        &st.db,
+    )
+    .await
+}
+
+/// Plane IssueAttachmentDetailAPIEndpoint.delete: uploader or admin, soft delete, 204.
+async fn attachment_delete(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id, pk)): Path<(String, Uuid, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
+    let owner: Option<Option<Uuid>> = sqlx::query_scalar(
+        "SELECT created_by_id FROM file_assets WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $4
+           AND entity_type = 'ISSUE_ATTACHMENT' AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(issue_id)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?;
+    if owner.ok_or_else(ApiError::not_found)? != Some(user.id) {
+        p.require(&[ADMIN])?;
+    }
+    sqlx::query(
+        "UPDATE file_assets SET deleted_at = now(), is_deleted = true, updated_at = now(), updated_by_id = $5
+         WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(issue_id)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
+    no_content()
 }
 
 type SubPath = Path<(String, Uuid, Uuid)>;
