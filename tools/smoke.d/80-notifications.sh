@@ -7,7 +7,7 @@ USER_ID=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "select id fr
 WS_ID=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "select id from workspaces where slug='$SLUG'")
 ISSUE_ID=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "select id from issues where workspace_id='$WS_ID' limit 1")
 if [ -n "$ISSUE_ID" ]; then
-  NOTIF_ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
+  NOTIF_ID=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc 'select gen_random_uuid()')
   psql "${DATABASE_URL:-postgres://localhost/saturn}" -qc "
     INSERT INTO notifications (id, created_at, updated_at, workspace_id, receiver_id, entity_name, entity_identifier, title, message_html, sender)
     VALUES ('$NOTIF_ID', now(), now(), '$WS_ID', '$USER_ID', 'issue', '$ISSUE_ID', 'Test notification', '<p>Test</p>', 'assigned_by');
@@ -26,7 +26,7 @@ call PATCH "/api/users/me/notification-preferences/" '{"mention":false}'
 
 # Stickies
 call POST "/api/workspaces/$SLUG/stickies/" '{"name":"Smoke Sticky","description_html":"<p>Sticky note</p>"}'
-STICKY_ID=$(field "['id']")
+STICKY_ID=$(field '.id')
 call GET "/api/workspaces/$SLUG/stickies/"
 call GET "/api/workspaces/$SLUG/stickies/$STICKY_ID/"
 call PATCH "/api/workspaces/$SLUG/stickies/$STICKY_ID/" '{"name":"Updated Sticky"}'
@@ -34,7 +34,7 @@ call DELETE "/api/workspaces/$SLUG/stickies/$STICKY_ID/"
 
 # Quick Links
 call POST "/api/workspaces/$SLUG/quick-links/" '{"title":"Test Link","url":"https://example.com"}'
-LINK_ID=$(field "['id']")
+LINK_ID=$(field '.id')
 call GET "/api/workspaces/$SLUG/quick-links/"
 call GET "/api/workspaces/$SLUG/quick-links/$LINK_ID/"
 call PATCH "/api/workspaces/$SLUG/quick-links/$LINK_ID/" '{"title":"Updated Link"}'

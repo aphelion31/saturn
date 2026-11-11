@@ -1,7 +1,7 @@
 # File uploads on local disk (src/assets.rs): presign, multipart upload, mark uploaded, download.
 call POST "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/" '{"name":"smoke.txt","type":"text/plain","size":12,"entity_type":"ISSUE_DESCRIPTION"}'
-ASSET=$(field "['asset_id']")
-TOKEN=$(field "['upload_data']['fields']['token']")
+ASSET=$(field '.asset_id')
+TOKEN=$(field '.upload_data.fields.token')
 code=$(curl -s -o /dev/null -w '%{http_code}' -F "token=$TOKEN" -F "file=@-;filename=smoke.txt" "$BASE/api/assets/v2/upload/$ASSET/" <<< "hello saturn")
 [[ "$code" == 204 ]] || { echo "✖ upload -> $code" >&2; exit 1; }
 echo "✔ POST /api/assets/v2/upload/{id}/ -> $code"

@@ -14,7 +14,7 @@ call GET "/api/public/anchor/$ANCHOR/issues/"
 PUB_ISSUE=$(psql "$DB" -Atc "select id from issues where project_id='$PROJECT' and deleted_at is null and archived_at is null and not is_draft limit 1")
 if [[ -n "$PUB_ISSUE" ]]; then
   call POST "/api/public/anchor/$ANCHOR/issues/$PUB_ISSUE/comments/" '{"comment_html":"<p>hi</p><script>alert(1)</script><img src=x onerror=alert(1)>"}'
-  html=$(field "['comment_html']")
+  html=$(field '.comment_html')
   [[ "$html" != *script* && "$html" != *onerror* ]] || { echo "✖ comment not sanitized: $html" >&2; exit 1; }
   echo "✔ public comment sanitized"
 fi
