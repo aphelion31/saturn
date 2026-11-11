@@ -56,6 +56,15 @@ CHILD=$(field '.id')
 child_body=$(curl -fsS -b "$MEMBER_JAR" "$BASE/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/issues/$CHILD/")
 [[ "$(jq -r '.parent_id' <<<"$child_body")" == "$REL_SOURCE" ]]
 curl -fsS -b "$MEMBER_JAR" "$BASE/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/issues/$REL_SOURCE/" >/dev/null
+member_draft=$(curl -fsS -b "$MEMBER_JAR" -X POST -H 'content-type: application/json' -d '{"name":"Private draft"}' "$BASE/api/workspaces/$SLUG/draft-issues/")
+MEMBER_DRAFT=$(jq -r '.id' <<<"$member_draft")
+curl -fsS -b "$MEMBER_JAR" -X PATCH -H 'content-type: application/json' -d '{"name":"Private draft updated"}' "$BASE/api/workspaces/$SLUG/draft-issues/$MEMBER_DRAFT/" >/dev/null
+curl -fsS -b "$MEMBER_JAR" "$BASE/api/workspaces/$SLUG/draft-issues/$MEMBER_DRAFT/" >/dev/null
+for method in GET PATCH DELETE; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' -b "$jar" -X "$method" -H 'content-type: application/json' -d '{}' "$BASE/api/workspaces/$SLUG/draft-issues/$MEMBER_DRAFT/")
+  [[ "$code" == 404 ]] || { echo "✖ non-owner draft $method -> $code" >&2; exit 1; }
+done
+curl -fsS -b "$MEMBER_JAR" -X DELETE "$BASE/api/workspaces/$SLUG/draft-issues/$MEMBER_DRAFT/" >/dev/null
 call PATCH "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/members/$MEMBERSHIP/" '{"role":5}'
 call PATCH "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/members/$MEMBERSHIP/" '{"role":15}'
 code=$(curl -s -o /dev/null -w '%{http_code}' -b "$MEMBER_JAR" -X PATCH -H 'content-type: application/json' -d '{"role":20}' "$BASE/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/members/$MEMBERSHIP/")
