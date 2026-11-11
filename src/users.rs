@@ -1,7 +1,8 @@
 //! `/api/users/me/*`: current user, profile, settings, onboarding. Also the `saturn seed` command.
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
+    http::StatusCode,
     routing::{get, patch},
 };
 use serde_json::{Value, json};
@@ -17,6 +18,92 @@ pub fn routes() -> Router<AppState> {
         .route("/api/users/me/instance-admin/", get(instance_admin))
         .route("/api/users/me/onboard/", patch(onboard))
         .route("/api/users/me/tour-completed/", patch(tour_completed))
+        .route("/api/users/api-tokens/", get(tokens_list).post(token_create))
+        .route("/api/users/api-tokens/{pk}/", get(token_retrieve).delete(token_delete))
+}
+
+// --- API tokens (ApiTokenEndpoint). Token is returned once, on create. ---
+
+/// APITokenReadSerializer fields (no `token`). `is_active` is computed from `expired_at`, as Plane does.
+const TOKEN_READ_JSON: &str = "jsonb_build_object('id', t.id, 'label', t.label, 'description', t.description,
+    'user', t.user_id, 'user_type', t.user_type, 'workspace', t.workspace_id, 'expired_at', t.expired_at,
+    'last_used', t.last_used, 'created_at', t.created_at, 'updated_at', t.updated_at,
+    'created_by', t.created_by_id, 'updated_by', t.updated_by_id,
+    'is_active', (t.expired_at IS NULL OR t.expired_at > now()))";
+
+async fn tokens_list(State(st): State<AppState>, user: CurrentUser) -> ApiResult {
+    json_rows(
+        sqlx::query_scalar(&format!(
+            "SELECT {TOKEN_READ_JSON} FROM api_tokens t WHERE t.user_id = $1 AND t.deleted_at IS NULL ORDER BY t.created_at"
+        ))
+        .bind(user.id),
+        &st.db,
+    )
+    .await
+}
+
+async fn token_create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Json(b): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let label = s(&b, "label")
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+    let expired_at = match s(&b, "expired_at") {
+        Some(raw) => Some(
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .map_err(|_| ApiError::bad_body(json!({"expired_at": ["Datetime has wrong format."]})))?
+                .with_timezone(&chrono::Utc),
+        ),
+        None => None,
+    };
+    // Plane: `"plane_api_" + uuid4().hex`. Token is stored in plaintext, as Plane does.
+    let token = format!("plane_api_{}", Uuid::new_v4().simple());
+    let mut v: Value = sqlx::query_scalar(&format!(
+        "INSERT INTO api_tokens AS t (token, label, description, user_id, user_type, expired_at, is_active,
+            created_by_id, updated_by_id)
+         VALUES ($1, $2, COALESCE($3, ''), $4,
+                 (SELECT CASE WHEN u.is_bot THEN 1 ELSE 0 END FROM users u WHERE u.id = $4), $5, true, $4, $4)
+         RETURNING {TOKEN_READ_JSON}"
+    ))
+    .bind(&token)
+    .bind(&label)
+    .bind(s(&b, "description"))
+    .bind(user.id)
+    .bind(expired_at)
+    .fetch_one(&st.db)
+    .await?;
+    v["token"] = json!(token);
+    created(v)
+}
+
+async fn token_retrieve(State(st): State<AppState>, user: CurrentUser, Path(pk): Path<Uuid>) -> ApiResult {
+    json_row(
+        sqlx::query_scalar(&format!(
+            "SELECT {TOKEN_READ_JSON} FROM api_tokens t WHERE t.id = $1 AND t.user_id = $2 AND t.deleted_at IS NULL"
+        ))
+        .bind(pk)
+        .bind(user.id),
+        &st.db,
+    )
+    .await
+}
+
+/// Soft delete. X-Api-Key auth in common.rs filters `deleted_at IS NULL`, so the key stops working at once.
+async fn token_delete(State(st): State<AppState>, user: CurrentUser, Path(pk): Path<Uuid>) -> ApiResult<StatusCode> {
+    let r = sqlx::query(
+        "UPDATE api_tokens SET deleted_at = now(), updated_at = now(), updated_by_id = $2
+         WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
 }
 
 /// UserMeSerializer fields.
