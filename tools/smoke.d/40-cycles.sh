@@ -10,6 +10,8 @@ call GET "$C/$CYCLE/progress/"
 call GET "$C/$CYCLE/user-properties/"
 call PATCH "$C/$CYCLE/user-properties/" '{"display_properties":{"state":false}}'
 call GET "$C/$CYCLE/analytics/"
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/issues/?updated_at__exact=1900-01-01"
+[[ "$(field "['total_count']")" == 0 ]]
 call POST "/api/workspaces/$SLUG/projects/$PROJECT/user-favorite-cycles/" '{"cycle":"'$CYCLE'"}'
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/user-favorite-cycles/"
 call DELETE "/api/workspaces/$SLUG/projects/$PROJECT/user-favorite-cycles/$CYCLE/"
