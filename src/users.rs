@@ -148,6 +148,18 @@ pub async fn validate_timezone(db: &sqlx::PgPool, body: &Value, field: &str) -> 
     Ok(())
 }
 
+/// `cover_image` like Plane's `URLField(max_length=800)`: an http(s) URL, or a Saturn asset path
+/// (`/api/assets/...`, Plane #9283). Rejects `javascript:` and other schemes the web app would render.
+fn valid_cover_image(v: &str) -> bool {
+    if v.len() > 800 || v.chars().any(char::is_control) {
+        return false;
+    }
+    if v.starts_with("/api/assets/") && !v.contains("..") {
+        return true;
+    }
+    url::Url::parse(v).is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
+}
+
 async fn update_me(State(st): State<AppState>, user: CurrentUser, Json(b): Json<Value>) -> ApiResult {
     validate_timezone(&st.db, &b, "user_timezone").await?;
     if let Some(dn) = s(&b, "display_name")
@@ -157,11 +169,27 @@ async fn update_me(State(st): State<AppState>, user: CurrentUser, Json(b): Json<
             json!({"display_name": ["This field may not be blank."]}),
         ));
     }
+    // cover_image: absent = keep, null or "" = clear (Plane's remove-cover payload), string = validated URL.
+    let cover = b.get("cover_image");
+    let clear_cover = matches!(cover, Some(Value::Null)) || cover.and_then(Value::as_str) == Some("");
+    let new_cover = match cover {
+        Some(Value::String(v)) if !v.is_empty() => {
+            if !valid_cover_image(v) {
+                return Err(ApiError::bad_body(json!({"cover_image": ["Enter a valid URL."]})));
+            }
+            Some(v.as_str())
+        }
+        None | Some(Value::Null) | Some(Value::String(_)) => None,
+        Some(_) => return Err(ApiError::bad_body(json!({"cover_image": ["Enter a valid URL."]}))),
+    };
     json_row(
         sqlx::query_scalar(&format!(
             "UPDATE users u SET first_name = COALESCE($2, first_name), last_name = COALESCE($3, last_name),
                 display_name = COALESCE($4, display_name), user_timezone = COALESCE($5, user_timezone),
-                avatar = COALESCE($6, avatar), cover_image = COALESCE($7, cover_image), updated_at = now()
+                avatar = COALESCE($6, avatar),
+                cover_image = CASE WHEN $8 THEN NULL ELSE COALESCE($7, cover_image) END,
+                cover_image_asset_id = CASE WHEN $8 THEN NULL ELSE cover_image_asset_id END,
+                updated_at = now()
              WHERE u.id = $1 RETURNING {USER_ME_JSON}"
         ))
         .bind(user.id)
@@ -170,7 +198,8 @@ async fn update_me(State(st): State<AppState>, user: CurrentUser, Json(b): Json<
         .bind(s(&b, "display_name"))
         .bind(s(&b, "user_timezone"))
         .bind(s(&b, "avatar"))
-        .bind(s(&b, "cover_image")),
+        .bind(new_cover)
+        .bind(clear_cover),
         &st.db,
     )
     .await
@@ -396,4 +425,33 @@ pub async fn seed(st: &AppState, args: &[String]) -> anyhow::Result<()> {
     .await?;
     println!("seeded {email} (instance admin) in workspace /{slug}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_cover_image;
+
+    #[test]
+    fn cover_image_urls() {
+        for ok in [
+            "https://images.unsplash.com/photo-1.jpg",
+            "http://minio:9000/uploads/x.png",
+            "/api/assets/v2/static/00000000-0000-0000-0000-000000000001/",
+        ] {
+            assert!(valid_cover_image(ok), "{ok}");
+        }
+        for bad in [
+            "javascript:alert(1)",
+            "JavaScript:alert(1)",
+            "data:text/html,x",
+            "ftp://example.com/x.png",
+            "not a url",
+            "/api/assets/../../etc/passwd",
+            "//evil.example/x.png",
+            "https://x.example/\nset-cookie",
+        ] {
+            assert!(!valid_cover_image(bad), "{bad}");
+        }
+        assert!(!valid_cover_image(&format!("https://x.example/{}", "a".repeat(800))));
+    }
 }
