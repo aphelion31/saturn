@@ -228,12 +228,11 @@ async fn update_description(
         Some(Value::String(v)) => Some(STANDARD.decode(v).map_err(|_| ApiError::bad("Invalid base64"))?),
         _ => return Err(ApiError::bad("Invalid description_binary")),
     };
-    let r = sqlx::query(&format!("UPDATE pages p SET description_binary=COALESCE($6,p.description_binary),description_html=COALESCE($7,p.description_html),description_json=COALESCE($8,p.description_json),description_stripped=COALESCE($9,p.description_stripped),updated_at=now(),updated_by_id=$3 WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL"))
+    let r = sqlx::query(&format!("WITH updated AS (UPDATE pages p SET description_binary=COALESCE($6,p.description_binary),description_html=COALESCE($7,p.description_html),description_json=COALESCE($8,p.description_json),description_stripped=COALESCE($9,p.description_stripped),updated_at=now(),updated_by_id=$3 WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL RETURNING p.*) INSERT INTO page_versions (workspace_id,page_id,owned_by_id,created_by_id,updated_by_id,last_saved_at,description_binary,description_html,description_json,description_stripped) SELECT workspace_id,id,owned_by_id,$3,$3,now(),description_binary,description_html,description_json,description_stripped FROM updated"))
         .bind(ctx.workspace_id()).bind(project).bind(user.id).bind(ctx.restricted_guest()).bind(id).bind(binary).bind(html).bind(b.get("description_json")).bind(stripped).execute(&st.db).await?;
     if r.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
-    // ponytail: page transactions and version snapshots require Plane's background tasks.
     Ok(Json(json!({"message":"Updated successfully"})))
 }
 
