@@ -116,6 +116,29 @@ pub fn routes() -> Router<AppState> {
             "/api/v1/workspaces/{slug}/projects/{project_id}/modules/{module_id}/module-issues/{issue_id}/",
             axum::routing::delete(v1_delete_module_issue),
         )
+        .route(
+            "/api/v1/workspaces/{slug}/members-lite/",
+            get(v1_workspace_members_lite),
+        )
+        .route("/api/v1/workspaces/{slug}/projects-lite/", get(v1_projects_lite))
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/project-members/",
+            get(v1_project_members).post(v1_create_project_member),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/project-members-lite/",
+            get(v1_project_members_lite),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/project-members/{pk}/",
+            get(v1_project_member)
+                .patch(v1_update_project_member)
+                .delete(v1_delete_project_member),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/summary/",
+            get(v1_project_summary),
+        )
 }
 
 const CYCLE_JSON: &str = "(to_jsonb(c)-'workspace_id'-'project_id'-'owned_by_id'-'created_by_id'-'updated_by_id') || jsonb_build_object('workspace',c.workspace_id,'project',c.project_id,'owned_by',c.owned_by_id,'created_by',c.created_by_id,'updated_by',c.updated_by_id)";
@@ -1836,6 +1859,326 @@ async fn v1_delete_module_issue(
         return Err(ApiError::not_found());
     }
     no_content()
+}
+
+const MEMBER_LITE_JSON: &str = "jsonb_build_object('id',u.id,'first_name',u.first_name,'last_name',u.last_name,'email',u.email,'avatar',u.avatar,'avatar_url',CASE WHEN u.avatar_asset_id IS NOT NULL THEN '/api/assets/v2/static/' || u.avatar_asset_id || '/' ELSE NULLIF(u.avatar, '') END,'display_name',u.display_name,'role',m.role,'is_active',m.is_active,'is_bot',u.is_bot)";
+
+const PROJECT_LITE_JSON: &str = "jsonb_build_object('id',p.id,'identifier',p.identifier,'name',p.name,'cover_image',p.cover_image,'icon_prop',p.icon_prop,'emoji',p.emoji,'description',p.description,'cover_image_url',p.cover_image,'archived_at',p.archived_at)";
+
+async fn v1_workspace_members_lite(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(slug): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    let rows: Vec<Value> = sqlx::query_scalar(&format!(
+        "SELECT {MEMBER_LITE_JSON} FROM workspace_members m
+         JOIN users u ON u.id = m.member_id
+         WHERE m.workspace_id = $1 AND m.deleted_at IS NULL
+         ORDER BY m.created_at, m.id"
+    ))
+    .bind(ws.workspace_id)
+    .fetch_all(&st.db)
+    .await?;
+    paginate(rows, &q)
+}
+
+async fn v1_projects_lite(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(slug): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    let include_archived = q
+        .get("include_archived")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1");
+    let cond = if include_archived {
+        ""
+    } else {
+        "AND p.archived_at IS NULL"
+    };
+    let rows: Vec<Value> = sqlx::query_scalar(&format!(
+        "SELECT {PROJECT_LITE_JSON} FROM projects p
+         LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.workspace_id = p.workspace_id AND pm.member_id = $2 AND pm.is_active AND pm.deleted_at IS NULL
+         WHERE p.workspace_id = $1 AND p.deleted_at IS NULL AND (pm.id IS NOT NULL OR p.network = 2) {cond}
+         ORDER BY p.created_at DESC, p.id"
+    ))
+    .bind(ws.workspace_id)
+    .bind(user.id)
+    .fetch_all(&st.db)
+    .await?;
+    paginate(rows, &q)
+}
+
+async fn v1_project_members(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let rows: Vec<Value> = sqlx::query_scalar(&format!(
+        "SELECT {USER_JSON} FROM project_members pm
+         JOIN users u ON u.id = pm.member_id
+         WHERE pm.project_id = $1 AND pm.workspace_id = $2 AND pm.is_active AND pm.deleted_at IS NULL
+         ORDER BY pm.created_at, pm.id"
+    ))
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_all(&st.db)
+    .await?;
+    Ok(Json(Value::Array(rows)))
+}
+
+async fn v1_create_project_member(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN])?;
+
+    let member_id = b
+        .get("member")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| ApiError::bad("Member is required"))?;
+    let role = b.get("role").and_then(Value::as_i64).unwrap_or(15) as i16;
+    if ![20, 15, 5].contains(&role) {
+        return Err(ApiError::bad("Invalid role"));
+    }
+
+    let ws_role: Option<i16> = sqlx::query_scalar(
+        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND member_id = $2 AND is_active AND deleted_at IS NULL"
+    )
+    .bind(p.workspace_id())
+    .bind(member_id)
+    .fetch_optional(&st.db)
+    .await?;
+
+    let ws_role = ws_role.ok_or_else(|| ApiError::bad("Member not found in workspace"))?;
+    if ws_role == 5 && role > 5 {
+        return Err(ApiError::bad(
+            "You cannot assign a role higher than the member's workspace role",
+        ));
+    }
+
+    let row: (Uuid, Uuid, i16) = sqlx::query_as(
+        "INSERT INTO project_members (id, project_id, workspace_id, member_id, role, created_by_id, updated_by_id)
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $5)
+         ON CONFLICT (project_id, member_id) WHERE deleted_at IS NULL
+         DO UPDATE SET role = EXCLUDED.role, updated_at = now(), updated_by_id = EXCLUDED.updated_by_id
+         RETURNING id, member_id, role",
+    )
+    .bind(pid)
+    .bind(p.workspace_id())
+    .bind(member_id)
+    .bind(role)
+    .bind(user.id)
+    .fetch_one(&st.db)
+    .await?;
+
+    created(json!({
+        "id": row.0,
+        "member": row.1,
+        "role": row.2
+    }))
+}
+
+async fn v1_project_members_lite(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let rows: Vec<Value> = sqlx::query_scalar(&format!(
+        "SELECT {MEMBER_LITE_JSON} FROM project_members m
+         JOIN users u ON u.id = m.member_id
+         WHERE m.project_id = $1 AND m.workspace_id = $2 AND m.deleted_at IS NULL
+         ORDER BY m.created_at, m.id"
+    ))
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_all(&st.db)
+    .await?;
+    paginate(rows, &q)
+}
+
+async fn v1_project_member(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, pk)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    json_row(
+        sqlx::query_scalar(&format!(
+            "SELECT {USER_JSON} FROM project_members pm
+             JOIN users u ON u.id = pm.member_id
+             WHERE (pm.id = $1 OR pm.member_id = $1) AND pm.project_id = $2 AND pm.workspace_id = $3 AND pm.deleted_at IS NULL"
+        ))
+        .bind(pk)
+        .bind(pid)
+        .bind(p.workspace_id()),
+        &st.db,
+    )
+    .await
+}
+
+async fn v1_update_project_member(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, pk)): Path<(String, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN])?;
+
+    let role = b
+        .get("role")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| ApiError::bad("Role is required"))? as i16;
+    if ![20, 15, 5].contains(&role) {
+        return Err(ApiError::bad("Invalid role"));
+    }
+
+    let ws_role: Option<i16> = sqlx::query_scalar(
+        "SELECT wm.role FROM project_members pm
+         JOIN workspace_members wm ON wm.workspace_id = pm.workspace_id AND wm.member_id = pm.member_id AND wm.is_active AND wm.deleted_at IS NULL
+         WHERE (pm.id = $1 OR pm.member_id = $1) AND pm.project_id = $2 AND pm.workspace_id = $3 AND pm.deleted_at IS NULL"
+    )
+    .bind(pk)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?;
+
+    let ws_role = ws_role.ok_or_else(ApiError::not_found)?;
+    if ws_role == 5 && role > 5 {
+        return Err(ApiError::bad(
+            "You cannot assign a role higher than the member's workspace role",
+        ));
+    }
+
+    let row: (Uuid, Uuid, i16) = sqlx::query_as(
+        "UPDATE project_members SET role = $1, updated_at = now(), updated_by_id = $2
+         WHERE (id = $3 OR member_id = $3) AND project_id = $4 AND workspace_id = $5 AND deleted_at IS NULL
+         RETURNING id, member_id, role",
+    )
+    .bind(role)
+    .bind(user.id)
+    .bind(pk)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?
+    .ok_or_else(ApiError::not_found)?;
+
+    Ok(Json(json!({
+        "id": row.0,
+        "member": row.1,
+        "role": row.2
+    })))
+}
+
+async fn v1_delete_project_member(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, pk)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN])?;
+
+    let res = sqlx::query(
+        "UPDATE project_members SET deleted_at = now(), updated_at = now(), updated_by_id = $2
+         WHERE (id = $1 OR member_id = $1) AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(user.id)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .execute(&st.db)
+    .await?;
+
+    if res.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
+}
+
+async fn v1_project_summary(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+
+    let proj: (String, String) = sqlx::query_as(
+        "SELECT name, identifier FROM projects WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?
+    .ok_or_else(ApiError::not_found)?;
+
+    let allowed = [
+        "members", "states", "labels", "cycles", "modules", "issues", "intakes", "pages",
+    ];
+    let filter_fields: Option<Vec<String>> = q.get("fields").and_then(|f| {
+        let v: Vec<String> = f
+            .split(',')
+            .map(str::trim)
+            .filter(|s| allowed.contains(s))
+            .map(str::to_string)
+            .collect();
+        if v.is_empty() { None } else { Some(v) }
+    });
+
+    let counts: Value = sqlx::query_scalar(
+        "SELECT jsonb_build_object(
+            'members', (SELECT count(*) FROM project_members WHERE project_id = $1 AND workspace_id = $2 AND is_active AND deleted_at IS NULL),
+            'states', (SELECT count(*) FROM states WHERE project_id = $1 AND workspace_id = $2 AND deleted_at IS NULL),
+            'labels', (SELECT count(*) FROM labels WHERE project_id = $1 AND workspace_id = $2 AND deleted_at IS NULL),
+            'cycles', (SELECT count(*) FROM cycles WHERE project_id = $1 AND workspace_id = $2 AND deleted_at IS NULL),
+            'modules', (SELECT count(*) FROM modules WHERE project_id = $1 AND workspace_id = $2 AND deleted_at IS NULL),
+            'issues', (SELECT count(*) FROM issues i LEFT JOIN states s ON s.id = i.state_id WHERE i.project_id = $1 AND i.workspace_id = $2 AND i.deleted_at IS NULL AND (s.group IS NULL OR s.group <> 'triage')),
+            'intakes', (SELECT count(*) FROM intake_issues WHERE project_id = $1 AND workspace_id = $2 AND deleted_at IS NULL),
+            'pages', (SELECT count(*) FROM project_pages pp JOIN pages pg ON pg.id = pp.page_id WHERE pp.project_id = $1 AND pp.workspace_id = $2 AND pp.deleted_at IS NULL AND pg.deleted_at IS NULL)
+        )"
+    )
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_one(&st.db)
+    .await?;
+
+    let counts_obj = if let Some(fields) = filter_fields {
+        let mut map = serde_json::Map::new();
+        if let Some(obj) = counts.as_object() {
+            for f in fields {
+                if let Some(v) = obj.get(&f) {
+                    map.insert(f, v.clone());
+                }
+            }
+        }
+        Value::Object(map)
+    } else {
+        counts
+    };
+
+    Ok(Json(json!({
+        "id": pid,
+        "name": proj.0,
+        "identifier": proj.1,
+        "counts": counts_obj
+    })))
 }
 
 #[cfg(test)]
