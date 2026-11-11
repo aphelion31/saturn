@@ -32,7 +32,17 @@ pub fn routes() -> Router<AppState> {
         .route("/api/users/me/onboard/", patch(onboard))
         .route("/api/users/me/tour-completed/", patch(tour_completed))
         .route("/api/users/api-tokens/", get(tokens_list).post(token_create))
-        .route("/api/users/api-tokens/{pk}/", get(token_retrieve).delete(token_delete))
+        .route("/api/users/api-tokens/{pk}/", get(token_retrieve).patch(token_update).delete(token_delete))
+}
+
+async fn token_update(State(st): State<AppState>, user: CurrentUser, Path(pk): Path<Uuid>, Json(b): Json<Value>) -> ApiResult {
+    for key in ["label", "description"] {
+        if b.get(key).is_some_and(|v| !v.is_string()) {
+            return Err(ApiError::bad_body(json!({key: ["Not a valid string."]})));
+        }
+    }
+    json_row(sqlx::query_scalar(&format!("UPDATE api_tokens AS t SET label=COALESCE($3,label), description=COALESCE($4,description), updated_at=now(), updated_by_id=$2 WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL RETURNING {TOKEN_READ_JSON} || jsonb_build_object('token', t.token)"))
+        .bind(pk).bind(user.id).bind(s(&b,"label")).bind(s(&b,"description")), &st.db).await
 }
 
 // --- API tokens (ApiTokenEndpoint). Token is returned once, on create. ---

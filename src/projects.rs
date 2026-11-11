@@ -20,15 +20,15 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/project-deploy-boards/{board_id}/",
-            axum::routing::patch(update_board),
+            get(retrieve_board).patch(update_board).delete(delete_board),
         )
         .route(
             "/api/users/me/workspaces/{slug}/projects/invitations/",
-            axum::routing::post(join_projects),
+            get(my_project_invitations).post(join_projects),
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/join/{invite_id}/",
-            axum::routing::post(accept_invite),
+            get(public_project_invite).post(accept_invite),
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/invitations/",
@@ -80,14 +80,14 @@ pub fn routes() -> Router<AppState> {
             "/api/workspaces/{slug}/projects/{project_id}/issue-labels/{label_id}/",
             get(label).patch(update_label).delete(delete_label),
         )
-        .route("/api/workspaces/{slug}/project-identifiers/", get(project_identifiers))
+        .route("/api/workspaces/{slug}/project-identifiers/", get(project_identifiers).delete(delete_identifier))
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/members/",
             get(members).post(add_members),
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/members/{member_id}/",
-            axum::routing::patch(update_member).delete(remove_member),
+            get(retrieve_member).patch(update_member).delete(remove_member),
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/members/leave/",
@@ -120,6 +120,40 @@ pub fn routes() -> Router<AppState> {
 const LABEL_JSON: &str = "jsonb_build_object('id', id, 'name', name, 'color', color, 'parent', parent_id, 'project_id', project_id, 'workspace_id', workspace_id, 'sort_order', sort_order)";
 
 const BOARD_JSON: &str = "(to_jsonb(d)-'workspace_id'-'project_id'-'intake_id'-'created_by_id'-'updated_by_id') || jsonb_build_object('workspace',d.workspace_id,'project',d.project_id,'intake',d.intake_id,'created_by',d.created_by_id,'updated_by',d.updated_by_id,'project_details',jsonb_build_object('id',p.id,'name',p.name,'identifier',p.identifier,'description',p.description,'cover_image',p.cover_image,'cover_image_url',p.cover_image,'logo_props',p.logo_props),'workspace_detail',jsonb_build_object('id',w.id,'name',w.name,'slug',w.slug))";
+
+async fn public_project_invite(State(st): State<AppState>, Path((slug, project, id)): Path<(String, Uuid, Uuid)>) -> ApiResult {
+    json_row(sqlx::query_scalar("SELECT jsonb_build_object('id',i.id,'role',i.role,'message',i.message,'accepted',i.accepted,'responded_at',i.responded_at,'project',jsonb_build_object('id',p.id,'name',p.name,'identifier',p.identifier,'description',p.description,'logo_props',p.logo_props,'cover_image',p.cover_image,'cover_image_url',p.cover_image),'workspace',jsonb_build_object('id',w.id,'name',w.name,'slug',w.slug,'logo',w.logo)) FROM project_member_invites i JOIN projects p ON p.id=i.project_id AND p.workspace_id=i.workspace_id JOIN workspaces w ON w.id=i.workspace_id WHERE w.slug=$1 AND p.id=$2 AND i.id=$3 AND i.deleted_at IS NULL AND p.deleted_at IS NULL AND w.deleted_at IS NULL")
+        .bind(slug).bind(project).bind(id), &st.db).await
+}
+
+async fn retrieve_board(State(st): State<AppState>, user: CurrentUser, Path((slug, project, id)): Path<(String, Uuid, Uuid)>) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project).await?;
+    p.require(&[ADMIN])?;
+    json_row(sqlx::query_scalar(&format!("SELECT {BOARD_JSON} FROM deploy_boards d JOIN projects p ON p.id=d.project_id AND p.workspace_id=d.workspace_id JOIN workspaces w ON w.id=d.workspace_id WHERE d.workspace_id=$1 AND d.project_id=$2 AND d.id=$3 AND d.entity_name='project' AND d.entity_identifier=$2 AND d.deleted_at IS NULL"))
+        .bind(p.workspace_id()).bind(project).bind(id), &st.db).await
+}
+
+async fn delete_board(State(st): State<AppState>, user: CurrentUser, Path((slug, project, id)): Path<(String, Uuid, Uuid)>) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, project).await?;
+    p.require(&[ADMIN])?;
+    let r = sqlx::query("UPDATE deploy_boards SET deleted_at=now() WHERE workspace_id=$1 AND project_id=$2 AND id=$3 AND entity_name='project' AND entity_identifier=$2 AND deleted_at IS NULL")
+        .bind(p.workspace_id()).bind(project).bind(id).execute(&st.db).await?;
+    if r.rows_affected() == 0 { return Err(ApiError::not_found()); }
+    no_content()
+}
+
+async fn delete_identifier(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>, Json(b): Json<Value>) -> ApiResult<StatusCode> {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN])?;
+    let name = s(&b, "name").unwrap_or("").trim().to_uppercase();
+    if name.is_empty() { return Err(ApiError::bad("Name is required")); }
+    let used: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE workspace_id=$1 AND identifier=$2 AND deleted_at IS NULL)")
+        .bind(ws.workspace_id).bind(&name).fetch_one(&st.db).await?;
+    if used { return Err(ApiError::bad("Cannot delete an identifier of an existing project")); }
+    sqlx::query("UPDATE project_identifiers SET deleted_at=now() WHERE workspace_id=$1 AND name=$2 AND deleted_at IS NULL")
+        .bind(ws.workspace_id).bind(name).execute(&st.db).await?;
+    no_content()
+}
 
 async fn get_board(
     State(st): State<AppState>,
@@ -714,6 +748,13 @@ async fn delete_label(
     no_content()
 }
 
+async fn retrieve_member(State(st): State<AppState>, user: CurrentUser, Path((slug, project, id)): Path<(String, Uuid, Uuid)>) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let sql = format!("SELECT (CASE WHEN pm.member_id=$4 THEN to_jsonb(pm) ELSE to_jsonb(pm)-'preferences'-'view_props'-'default_props' END - 'member_id' - 'project_id' - 'workspace_id') || jsonb_build_object('member',{},'project',jsonb_build_object('id',p.id,'name',p.name,'identifier',p.identifier,'description',p.description,'logo_props',p.logo_props,'cover_image',p.cover_image,'cover_image_url',p.cover_image),'workspace',jsonb_build_object('id',w.id,'name',w.name,'slug',w.slug,'logo_url',NULLIF(w.logo,''))) FROM project_members pm JOIN users u ON u.id=pm.member_id JOIN projects p ON p.id=pm.project_id AND p.workspace_id=pm.workspace_id JOIN workspaces w ON w.id=pm.workspace_id WHERE pm.workspace_id=$1 AND pm.project_id=$2 AND pm.id=$3 AND pm.deleted_at IS NULL AND NOT u.is_bot", crate::users::USER_LITE_JSON);
+    json_row(sqlx::query_scalar(&sql).bind(p.workspace_id()).bind(project).bind(id).bind(user.id), &st.db).await
+}
+
 async fn members(State(st): State<AppState>, user: CurrentUser, Path((slug, id)): Path<(String, Uuid)>) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, id).await?;
     p.require(&[ADMIN, MEMBER, GUEST])?;
@@ -1081,6 +1122,12 @@ async fn invitations_list(
         &st.db,
     )
     .await
+}
+
+async fn my_project_invitations(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    json_rows(sqlx::query_scalar(&format!("SELECT {PROJECT_INVITE_JSON} FROM project_member_invites i JOIN projects p ON p.id=i.project_id AND p.workspace_id=i.workspace_id JOIN workspaces w ON w.id=i.workspace_id JOIN users u ON lower(u.email)=lower(i.email) WHERE i.workspace_id=$1 AND u.id=$2 AND i.deleted_at IS NULL AND p.deleted_at IS NULL ORDER BY i.created_at"))
+        .bind(ws.workspace_id).bind(user.id), &st.db).await
 }
 
 async fn invitations_retrieve(

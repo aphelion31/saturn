@@ -22,7 +22,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/api/instances/configurations/disable-email-feature/",
-            post(disable_email),
+            post(disable_email).delete(disable_email),
         )
         .route("/api/instances/email-credentials-check/", post(email_check))
         .route("/api/instances/admins/", get(admins).post(add_admin))

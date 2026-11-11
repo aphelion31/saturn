@@ -42,7 +42,7 @@ pub fn routes() -> Router<AppState> {
             "/api/workspaces/{slug}/invitations/{pk}/",
             get(invite_public).patch(invite_update).delete(invite_delete),
         )
-        .route("/api/workspaces/{slug}/invitations/{pk}/join/", post(invite_join))
+        .route("/api/workspaces/{slug}/invitations/{pk}/join/", get(invite_public).post(invite_join))
         .route(
             "/api/users/me/workspaces/invitations/",
             get(my_invites_list).post(my_invites_accept),
