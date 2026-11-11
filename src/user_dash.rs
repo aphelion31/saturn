@@ -29,6 +29,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/users/me/workspaces/{slug}/dashboard/", get(dashboard))
         .route("/api/workspaces/{slug}/user-issues/{user_id}/", get(user_issues))
+        .route("/api/workspaces/{slug}/entity-search/", get(entity_search))
 }
 
 /// Plane `_visible_issues_q`: caller is an active member of the issue's project, and guests only
@@ -349,4 +350,183 @@ async fn user_issues(
         },
     )
     .await
+}
+
+/// Avatar URL for a user alias `u`, as Plane's `member__avatar_url` annotation.
+const AVATAR_URL: &str =
+    "CASE WHEN u.avatar_asset_id IS NOT NULL THEN '/api/assets/v2/static/' || u.avatar_asset_id || '/'
+    ELSE NULLIF(u.avatar, '') END";
+
+#[derive(serde::Deserialize)]
+struct EntityQ {
+    query: Option<String>,
+    query_type: Option<String>,
+    count: Option<i64>,
+    project_id: Option<Uuid>,
+}
+
+/// ILIKE pattern with `%`, `_` and `\` escaped, so the user's text matches literally.
+fn like_pattern(text: &str) -> String {
+    let esc = text.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    format!("%{esc}%")
+}
+
+/// `GET /api/workspaces/{slug}/entity-search/`: mention, project, issue, cycle, module and page lookups
+/// inside one project (Plane `SearchEndpoint`). Membership comes from `require_project`. Restricted
+/// guests see only the issues they created, as in the list endpoints.
+// ponytail: Plane answers 200 with data for any workspace member in user_mention. Here a non-member of
+// the project gets 403. Keeps the stricter tenant rule from AGENTS.md.
+async fn entity_search(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(slug): Path<String>,
+    Query(q): Query<EntityQ>,
+) -> ApiResult {
+    let Some(project_id) = q.project_id else {
+        // Plane only fills results when a project is given.
+        require_workspace(&st.db, &user, &slug).await?;
+        return Ok(Json(json!({})));
+    };
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    let ws_id = p.workspace_id();
+    let count = q.count.unwrap_or(5).clamp(1, 100);
+    let text = q.query.filter(|s| !s.is_empty());
+    let pat = text.as_deref().map(like_pattern);
+    // Sequence ids named in the query, e.g. "12" or "PRJ 12" (whole integers only, as Plane).
+    let seqs: Vec<i32> = text
+        .as_deref()
+        .unwrap_or("")
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|d| d.parse::<i32>().ok())
+        .collect();
+    let restricted = p.restricted_guest();
+
+    let mut out = serde_json::Map::new();
+    for t in q
+        .query_type
+        .as_deref()
+        .unwrap_or("user_mention")
+        .split(',')
+        .map(str::trim)
+    {
+        let rows: Vec<Value> = match t {
+            "user_mention" => {
+                sqlx::query_scalar(&format!(
+                "SELECT jsonb_build_object('member__avatar_url', {AVATAR_URL}, 'member__display_name', u.display_name,
+                    'member__id', u.id)
+                 FROM project_members pm JOIN users u ON u.id = pm.member_id
+                 WHERE pm.project_id = $1 AND pm.workspace_id = $2 AND pm.is_active AND pm.deleted_at IS NULL
+                   AND NOT u.is_bot
+                   AND ($3::text IS NULL OR u.first_name ILIKE $3 OR u.last_name ILIKE $3 OR u.display_name ILIKE $3)
+                 ORDER BY pm.created_at DESC LIMIT $4"
+            ))
+                .bind(project_id)
+                .bind(ws_id)
+                .bind(pat.as_deref())
+                .bind(count)
+                .fetch_all(&st.db)
+                .await?
+            }
+            "project" => {
+                sqlx::query_scalar(
+                    "SELECT jsonb_build_object('name', p.name, 'id', p.id, 'identifier', p.identifier,
+                    'logo_props', p.logo_props, 'workspace__slug', w.slug)
+                 FROM projects p JOIN workspaces w ON w.id = p.workspace_id
+                 WHERE p.workspace_id = $1 AND p.deleted_at IS NULL
+                   AND (EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id = p.id AND pm.member_id = $2
+                                AND pm.is_active AND pm.deleted_at IS NULL) OR p.network = 2)
+                   AND ($3::text IS NULL OR p.name ILIKE $3 OR p.identifier ILIKE $3)
+                 ORDER BY p.created_at DESC LIMIT $4",
+                )
+                .bind(ws_id)
+                .bind(user.id)
+                .bind(pat.as_deref())
+                .bind(count)
+                .fetch_all(&st.db)
+                .await?
+            }
+            "issue" => {
+                sqlx::query_scalar(&format!(
+                    "SELECT jsonb_build_object('name', i.name, 'id', i.id, 'sequence_id', i.sequence_id,
+                    'project__identifier', pr.identifier, 'project_id', i.project_id, 'priority', i.priority,
+                    'state_id', i.state_id, 'type_id', i.type_id)
+                 FROM issues i JOIN projects pr ON pr.id = i.project_id
+                 WHERE i.workspace_id = $1 AND i.project_id = $2 AND {ACTIVE}
+                   AND (NOT $4::bool OR i.created_by_id = $5)
+                   AND ($3::text IS NULL OR i.name ILIKE $3 OR pr.identifier ILIKE $3 OR i.sequence_id = ANY($6))
+                 ORDER BY i.created_at DESC LIMIT $7"
+                ))
+                .bind(ws_id)
+                .bind(project_id)
+                .bind(pat.as_deref())
+                .bind(restricted)
+                .bind(user.id)
+                .bind(&seqs)
+                .bind(count)
+                .fetch_all(&st.db)
+                .await?
+            }
+            "cycle" => {
+                sqlx::query_scalar(
+                    "SELECT jsonb_build_object('name', c.name, 'id', c.id, 'project_id', c.project_id,
+                    'project__identifier', pr.identifier, 'workspace__slug', w.slug,
+                    'status', CASE
+                        WHEN c.start_date <= now() AND c.end_date >= now() THEN 'CURRENT'
+                        WHEN c.start_date > now() THEN 'UPCOMING'
+                        WHEN c.end_date < now() THEN 'COMPLETED'
+                        ELSE 'DRAFT' END)
+                 FROM cycles c JOIN projects pr ON pr.id = c.project_id JOIN workspaces w ON w.id = c.workspace_id
+                 WHERE c.workspace_id = $1 AND c.project_id = $2 AND c.deleted_at IS NULL
+                   AND ($3::text IS NULL OR c.name ILIKE $3)
+                 ORDER BY c.created_at DESC LIMIT $4",
+                )
+                .bind(ws_id)
+                .bind(project_id)
+                .bind(pat.as_deref())
+                .bind(count)
+                .fetch_all(&st.db)
+                .await?
+            }
+            "module" => {
+                sqlx::query_scalar(
+                    "SELECT jsonb_build_object('name', m.name, 'id', m.id, 'project_id', m.project_id,
+                    'project__identifier', pr.identifier, 'status', m.status, 'workspace__slug', w.slug)
+                 FROM modules m JOIN projects pr ON pr.id = m.project_id JOIN workspaces w ON w.id = m.workspace_id
+                 WHERE m.workspace_id = $1 AND m.project_id = $2 AND m.deleted_at IS NULL
+                   AND ($3::text IS NULL OR m.name ILIKE $3)
+                 ORDER BY m.created_at DESC LIMIT $4",
+                )
+                .bind(ws_id)
+                .bind(project_id)
+                .bind(pat.as_deref())
+                .bind(count)
+                .fetch_all(&st.db)
+                .await?
+            }
+            "page" => {
+                sqlx::query_scalar(
+                    "SELECT jsonb_build_object('name', pg.name, 'id', pg.id, 'logo_props', pg.logo_props,
+                    'projects__id', pp.project_id, 'workspace__slug', w.slug)
+                 FROM pages pg JOIN project_pages pp ON pp.page_id = pg.id AND pp.deleted_at IS NULL
+                 JOIN workspaces w ON w.id = pg.workspace_id
+                 WHERE pg.workspace_id = $1 AND pp.project_id = $2 AND pg.deleted_at IS NULL
+                   AND pg.access = 0
+                   AND (NOT $4::bool OR pg.owned_by_id = $5)
+                   AND ($3::text IS NULL OR pg.name ILIKE $3)
+                 ORDER BY pg.created_at DESC LIMIT $6",
+                )
+                .bind(ws_id)
+                .bind(project_id)
+                .bind(pat.as_deref())
+                .bind(restricted)
+                .bind(user.id)
+                .bind(count)
+                .fetch_all(&st.db)
+                .await?
+            }
+            _ => continue,
+        };
+        out.insert(t.to_string(), Value::Array(rows));
+    }
+    Ok(Json(Value::Object(out)))
 }
