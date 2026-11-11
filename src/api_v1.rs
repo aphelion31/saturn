@@ -139,6 +139,26 @@ pub fn routes() -> Router<AppState> {
             "/api/v1/workspaces/{slug}/projects/{project_id}/summary/",
             get(v1_project_summary),
         )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/intake-issues/",
+            get(v1_intake_issues).post(v1_create_intake_issue),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/intake-issues/{issue_id}/",
+            get(v1_intake_issue).patch(v1_update_intake_issue).delete(v1_delete_intake_issue),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/estimates/",
+            get(v1_estimate).post(v1_create_estimate).patch(v1_update_estimate).delete(v1_delete_estimate),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/estimates/{estimate_id}/estimate-points/",
+            get(v1_estimate_points).post(v1_create_estimate_points),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/estimates/{estimate_id}/estimate-points/{estimate_point_id}/",
+            axum::routing::patch(v1_update_estimate_point).delete(v1_delete_estimate_point),
+        )
 }
 
 const CYCLE_JSON: &str = "(to_jsonb(c)-'workspace_id'-'project_id'-'owned_by_id'-'created_by_id'-'updated_by_id') || jsonb_build_object('workspace',c.workspace_id,'project',c.project_id,'owned_by',c.owned_by_id,'created_by',c.created_by_id,'updated_by',c.updated_by_id)";
@@ -2179,6 +2199,680 @@ async fn v1_project_summary(
         "identifier": proj.1,
         "counts": counts_obj
     })))
+}
+
+const INTAKE_ISSUE_V1_JSON: &str = "(to_jsonb(ii)-'workspace_id'-'project_id'-'intake_id'-'issue_id'-'duplicate_to_id'-'created_by_id'-'updated_by_id'-'deleted_at') || jsonb_build_object('workspace',ii.workspace_id,'project',ii.project_id,'issue',ii.issue_id,'inbox',ii.intake_id,'duplicate_to',ii.duplicate_to_id,'created_by',ii.created_by_id,'updated_by',ii.updated_by_id,'issue_detail',jsonb_build_object('id',i.id,'name',i.name,'description_html',i.description_html,'description_stripped',i.description_stripped,'priority',i.priority,'state_id',i.state_id,'sequence_id',i.sequence_id,'project_id',i.project_id,'parent_id',i.parent_id,'start_date',i.start_date,'target_date',i.target_date,'completed_at',i.completed_at,'sort_order',i.sort_order,'is_draft',i.is_draft,'archived_at',i.archived_at,'created_at',i.created_at,'updated_at',i.updated_at,'created_by',i.created_by_id,'updated_by',i.updated_by_id,'estimate_point',i.estimate_point_id,'type_id',i.type_id,'label_ids',COALESCE((SELECT jsonb_agg(il.label_id) FROM issue_labels il WHERE il.issue_id=i.id AND il.deleted_at IS NULL),'[]'::jsonb),'assignee_ids',COALESCE((SELECT jsonb_agg(a.assignee_id) FROM issue_assignees a WHERE a.issue_id=i.id AND a.deleted_at IS NULL),'[]'::jsonb),'module_ids',COALESCE((SELECT jsonb_agg(m.module_id) FROM module_issues m WHERE m.issue_id=i.id AND m.deleted_at IS NULL),'[]'::jsonb)))";
+
+async fn ensure_default_intake_v1(
+    db: &sqlx::PgPool,
+    workspace_id: Uuid,
+    project_id: Uuid,
+    user_id: Uuid,
+) -> ApiResult<Uuid> {
+    let id: Option<Uuid> = sqlx::query_scalar(
+        "INSERT INTO intakes (id, name, description, is_default, view_props, logo_props, project_id, workspace_id,
+             created_by_id, updated_by_id, created_at, updated_at)
+         SELECT gen_random_uuid(), 'Intake', '', true, '{}'::jsonb, '{}'::jsonb, $1, $2, $3, $3, now(), now()
+         WHERE NOT EXISTS (SELECT 1 FROM intakes WHERE project_id = $1 AND deleted_at IS NULL)
+         ON CONFLICT DO NOTHING
+         RETURNING id",
+    )
+    .bind(project_id)
+    .bind(workspace_id)
+    .bind(user_id)
+    .fetch_optional(db)
+    .await?;
+    match id {
+        Some(id) => Ok(id),
+        None => sqlx::query_scalar(
+            "SELECT id FROM intakes WHERE project_id = $1 AND deleted_at IS NULL ORDER BY created_at LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_one(db)
+        .await
+        .map_err(Into::into),
+    }
+}
+
+async fn v1_intake_issues(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+
+    let intake_id = ensure_default_intake_v1(&st.db, p.workspace_id(), pid, user.id).await?;
+    let statuses: Vec<i32> = q
+        .get("status")
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_default();
+
+    let rows: Vec<Value> = sqlx::query_scalar(&format!(
+        "SELECT {INTAKE_ISSUE_V1_JSON} FROM intake_issues ii
+         JOIN issues i ON i.id = ii.issue_id AND i.deleted_at IS NULL
+         WHERE ii.project_id = $1 AND ii.workspace_id = $2 AND ii.intake_id = $3
+           AND ii.deleted_at IS NULL
+           AND (ii.snoozed_till >= now() OR ii.snoozed_till IS NULL)
+           AND ($4::int[] = '{{}}' OR ii.status = ANY($4))
+           AND (NOT $5 OR ii.created_by_id = $6)
+         ORDER BY ii.created_at DESC, ii.id"
+    ))
+    .bind(pid)
+    .bind(p.workspace_id())
+    .bind(intake_id)
+    .bind(&statuses)
+    .bind(p.restricted_guest())
+    .bind(user.id)
+    .fetch_all(&st.db)
+    .await?;
+
+    paginate(rows, &q)
+}
+
+async fn v1_create_intake_issue(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+
+    let issue = b.get("issue").cloned().unwrap_or_else(|| json!({}));
+    let name = match issue.get("name") {
+        Some(Value::String(n)) if !n.trim().is_empty() => n.trim().to_string(),
+        _ => return Err(ApiError::bad("Name is required")),
+    };
+    let priority = s(&issue, "priority").unwrap_or("none");
+    if !["low", "medium", "high", "urgent", "none"].contains(&priority) {
+        return Err(ApiError::bad("Invalid priority"));
+    }
+    let description = match s(&issue, "description_html") {
+        Some(h) => sanitize_html(h)?,
+        None => "<p></p>".to_string(),
+    };
+    let stripped = strip_tags(&description);
+    let intake_id = ensure_default_intake_v1(&st.db, p.workspace_id(), pid, user.id).await?;
+
+    let mut tx = st.db.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1::text))")
+        .bind(pid)
+        .execute(&mut *tx)
+        .await?;
+
+    let triage: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM states WHERE project_id = $1 AND is_triage AND deleted_at IS NULL LIMIT 1")
+            .bind(pid)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let triage = match triage {
+        Some(t) => t,
+        None => {
+            sqlx::query_scalar(
+                "INSERT INTO states (name, color, \"group\", \"default\", is_triage, sequence, slug, project_id, workspace_id,
+                     created_by_id, updated_by_id)
+                 VALUES ('Triage', '#4E5355', 'triage', false, true, 65000, 'triage', $1, $2, $3, $3) RETURNING id",
+            )
+            .bind(pid)
+            .bind(p.workspace_id())
+            .bind(user.id)
+            .fetch_one(&mut *tx)
+            .await?
+        }
+    };
+
+    let seq: i64 =
+        sqlx::query_scalar("SELECT COALESCE(max(sequence), 0) + 1 FROM issue_sequences WHERE project_id = $1")
+            .bind(pid)
+            .fetch_one(&mut *tx)
+            .await?;
+
+    let issue_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO issues (id, name, description_html, description_stripped, description_json, priority, sequence_id,
+             project_id, workspace_id, state_id, sort_order, is_draft, created_by_id, updated_by_id, created_at, updated_at)
+         VALUES (gen_random_uuid(), $1, $2, $3, '{}'::jsonb, $4, $5, $6, $7, $8, 65535, false, $9, $9, now(), now())
+         RETURNING id",
+    )
+    .bind(&name)
+    .bind(&description)
+    .bind(&stripped)
+    .bind(priority)
+    .bind(seq as i32)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .bind(triage)
+    .bind(user.id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO issue_sequences (id, sequence, deleted, issue_id, project_id, workspace_id, created_by_id, updated_by_id, created_at, updated_at)
+         VALUES (gen_random_uuid(), $1, false, $2, $3, $4, $5, $5, now(), now())",
+    )
+    .bind(seq)
+    .bind(issue_id)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .bind(user.id)
+    .execute(&mut *tx)
+    .await?;
+
+    let ii_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO intake_issues (id, status, source, intake_id, issue_id, project_id, workspace_id, created_by_id,
+             updated_by_id, created_at, updated_at)
+         VALUES (gen_random_uuid(), -2, 'IN_APP', $1, $2, $3, $4, $5, $5, now(), now())
+         RETURNING id",
+    )
+    .bind(intake_id)
+    .bind(issue_id)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .bind(user.id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    let val: Value = sqlx::query_scalar(&format!(
+        "SELECT {INTAKE_ISSUE_V1_JSON} FROM intake_issues ii
+         JOIN issues i ON i.id = ii.issue_id AND i.deleted_at IS NULL
+         WHERE ii.id = $1 AND ii.project_id = $2 AND ii.workspace_id = $3 AND ii.deleted_at IS NULL"
+    ))
+    .bind(ii_id)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_one(&st.db)
+    .await?;
+
+    created(val)
+}
+
+async fn v1_intake_issue(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, iid)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    json_row(
+        sqlx::query_scalar(&format!(
+            "SELECT {INTAKE_ISSUE_V1_JSON} FROM intake_issues ii
+             JOIN issues i ON i.id = ii.issue_id AND i.deleted_at IS NULL
+             WHERE (ii.issue_id = $1 OR ii.id = $1) AND ii.project_id = $2 AND ii.workspace_id = $3 AND ii.deleted_at IS NULL"
+        ))
+        .bind(iid)
+        .bind(pid)
+        .bind(p.workspace_id()),
+        &st.db,
+    )
+    .await
+}
+
+async fn v1_update_intake_issue(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, iid)): Path<(String, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+
+    let cur: Option<(Uuid, Uuid, i32)> = sqlx::query_as(
+        "SELECT ii.id, ii.issue_id, ii.status FROM intake_issues ii
+         WHERE (ii.issue_id = $1 OR ii.id = $1) AND ii.project_id = $2 AND ii.workspace_id = $3 AND ii.deleted_at IS NULL"
+    )
+    .bind(iid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?;
+
+    let (ii_id, issue_id, old_status) = cur.ok_or_else(ApiError::not_found)?;
+    let mut tx = st.db.begin().await?;
+
+    if let Some(status) = b.get("status").and_then(Value::as_i64).map(|v| v as i32) {
+        if status == 1 && old_status != 1 {
+            let def_state: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM states WHERE project_id = $1 AND workspace_id = $2 AND \"default\" AND deleted_at IS NULL LIMIT 1"
+            )
+            .bind(pid)
+            .bind(p.workspace_id())
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            let def_state = def_state
+                .ok_or_else(|| ApiError::bad("Cannot accept intake issue: No default state found for the project"))?;
+            sqlx::query("UPDATE issues SET state_id = $1, updated_at = now(), updated_by_id = $2 WHERE id = $3 AND project_id = $4 AND workspace_id = $5")
+                .bind(def_state)
+                .bind(user.id)
+                .bind(issue_id)
+                .bind(pid)
+                .bind(p.workspace_id())
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("UPDATE intake_issues SET status = $1, updated_at = now(), updated_by_id = $2 WHERE id = $3")
+            .bind(status)
+            .bind(user.id)
+            .bind(ii_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    if let Some(issue_b) = b.get("issue").and_then(Value::as_object) {
+        if let Some(n) = issue_b.get("name").and_then(Value::as_str) {
+            sqlx::query("UPDATE issues SET name = $1, updated_at = now(), updated_by_id = $2 WHERE id = $3 AND project_id = $4 AND workspace_id = $5")
+                .bind(n)
+                .bind(user.id)
+                .bind(issue_id)
+                .bind(pid)
+                .bind(p.workspace_id())
+                .execute(&mut *tx)
+                .await?;
+        }
+        if let Some(pr) = issue_b.get("priority").and_then(Value::as_str) {
+            if ["low", "medium", "high", "urgent", "none"].contains(&pr) {
+                sqlx::query("UPDATE issues SET priority = $1, updated_at = now(), updated_by_id = $2 WHERE id = $3 AND project_id = $4 AND workspace_id = $5")
+                    .bind(pr)
+                    .bind(user.id)
+                    .bind(issue_id)
+                    .bind(pid)
+                    .bind(p.workspace_id())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+    }
+    tx.commit().await?;
+
+    v1_intake_issue(State(st), user, Path((slug, pid, iid))).await
+}
+
+async fn v1_delete_intake_issue(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, iid)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+
+    let row: Option<(Uuid, Uuid, i32, Option<Uuid>)> = sqlx::query_as(
+        "SELECT ii.id, ii.issue_id, ii.status, ii.created_by_id FROM intake_issues ii
+         WHERE (ii.issue_id = $1 OR ii.id = $1) AND ii.project_id = $2 AND ii.workspace_id = $3 AND ii.deleted_at IS NULL"
+    )
+    .bind(iid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?;
+
+    let (ii_id, issue_id, status, creator) = row.ok_or_else(ApiError::not_found)?;
+    if !(p.is_admin() || creator == Some(user.id)) {
+        return Err(ApiError::forbidden());
+    }
+
+    let mut tx = st.db.begin().await?;
+    sqlx::query("UPDATE intake_issues SET deleted_at = now(), updated_at = now(), updated_by_id = $2 WHERE id = $1")
+        .bind(ii_id)
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+
+    if [-2, -1, 0, 2].contains(&status) {
+        sqlx::query("UPDATE issues SET deleted_at = now(), updated_at = now(), updated_by_id = $4 WHERE id = $1 AND project_id = $2 AND workspace_id = $3")
+            .bind(issue_id)
+            .bind(pid)
+            .bind(p.workspace_id())
+            .bind(user.id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    no_content()
+}
+
+const ESTIMATE_JSON: &str = "(to_jsonb(e)-'workspace_id'-'project_id'-'created_by_id'-'updated_by_id'-'deleted_at') || jsonb_build_object('workspace',e.workspace_id,'project',e.project_id,'created_by',e.created_by_id,'updated_by',e.updated_by_id)";
+
+const ESTIMATE_POINT_JSON: &str = "(to_jsonb(ep)-'workspace_id'-'project_id'-'estimate_id'-'created_by_id'-'updated_by_id'-'deleted_at') || jsonb_build_object('workspace',ep.workspace_id,'project',ep.project_id,'estimate',ep.estimate_id,'created_by',ep.created_by_id,'updated_by',ep.updated_by_id)";
+
+async fn v1_estimate(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let row: Option<Value> = sqlx::query_scalar(&format!(
+        "SELECT {ESTIMATE_JSON} FROM estimates e
+         WHERE e.project_id = $1 AND e.workspace_id = $2 AND e.deleted_at IS NULL
+         ORDER BY e.created_at DESC LIMIT 1"
+    ))
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?;
+
+    match row {
+        Some(v) => Ok(Json(v)),
+        None => Err(ApiError(StatusCode::NOT_FOUND, json!({"error": "Estimate not found"}))),
+    }
+}
+
+async fn v1_create_estimate(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM estimates WHERE project_id = $1 AND workspace_id = $2 AND deleted_at IS NULL LIMIT 1",
+    )
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?;
+
+    if let Some(eid) = existing {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            json!({
+                "error": "An estimate already exists for this project",
+                "id": eid.to_string()
+            }),
+        ));
+    }
+
+    let name = s(&b, "name")
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.len() <= 255)
+        .ok_or_else(|| ApiError::bad("Name is required"))?;
+    let est_type = s(&b, "type").unwrap_or("categories");
+
+    let mut tx = st.db.begin().await?;
+    let eid: Uuid = sqlx::query_scalar(
+        "INSERT INTO estimates (id, name, description, type, project_id, workspace_id, created_by_id, updated_by_id, created_at, updated_at)
+         VALUES (gen_random_uuid(), $1, COALESCE($2, ''), $3, $4, $5, $6, $6, now(), now())
+         RETURNING id",
+    )
+    .bind(name)
+    .bind(s(&b, "description"))
+    .bind(est_type)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .bind(user.id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    sqlx::query("UPDATE projects SET estimate_id = $1 WHERE id = $2 AND workspace_id = $3")
+        .bind(eid)
+        .bind(pid)
+        .bind(p.workspace_id())
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+
+    let val: Value = sqlx::query_scalar(&format!("SELECT {ESTIMATE_JSON} FROM estimates e WHERE e.id = $1"))
+        .bind(eid)
+        .fetch_one(&st.db)
+        .await?;
+
+    created(val)
+}
+
+async fn v1_update_estimate(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+
+    let row = sqlx::query(
+        "UPDATE estimates SET
+            name = COALESCE($3, name),
+            description = COALESCE($4, description),
+            updated_at = now(),
+            updated_by_id = $5
+         WHERE project_id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(pid)
+    .bind(p.workspace_id())
+    .bind(s(&b, "name"))
+    .bind(s(&b, "description"))
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
+
+    if row.rows_affected() == 0 {
+        return Err(ApiError(StatusCode::NOT_FOUND, json!({"error": "Estimate not found"})));
+    }
+
+    v1_estimate(State(st), user, Path((slug, pid))).await
+}
+
+async fn v1_delete_estimate(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+
+    let mut tx = st.db.begin().await?;
+    let res = sqlx::query(
+        "UPDATE estimates SET deleted_at = now(), updated_at = now(), updated_by_id = $3
+         WHERE project_id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(pid)
+    .bind(p.workspace_id())
+    .bind(user.id)
+    .execute(&mut *tx)
+    .await?;
+
+    if res.rows_affected() == 0 {
+        return Err(ApiError(StatusCode::NOT_FOUND, json!({"error": "Estimate not found"})));
+    }
+
+    sqlx::query("UPDATE estimate_points SET deleted_at = now(), updated_at = now(), updated_by_id = $3 WHERE project_id = $1 AND workspace_id = $2 AND deleted_at IS NULL")
+        .bind(pid)
+        .bind(p.workspace_id())
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query("UPDATE projects SET estimate_id = NULL WHERE id = $1 AND workspace_id = $2")
+        .bind(pid)
+        .bind(p.workspace_id())
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    no_content()
+}
+
+async fn v1_estimate_points(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, eid)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM estimates WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL)"
+    )
+    .bind(eid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_one(&st.db)
+    .await?;
+
+    if !exists {
+        return Err(ApiError(StatusCode::NOT_FOUND, json!({"error": "Estimate not found"})));
+    }
+
+    let rows: Vec<Value> = sqlx::query_scalar(&format!(
+        "SELECT {ESTIMATE_POINT_JSON} FROM estimate_points ep
+         WHERE ep.estimate_id = $1 AND ep.project_id = $2 AND ep.workspace_id = $3 AND ep.deleted_at IS NULL
+         ORDER BY ep.key, ep.created_at, ep.id"
+    ))
+    .bind(eid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_all(&st.db)
+    .await?;
+
+    Ok(Json(Value::Array(rows)))
+}
+
+async fn v1_create_estimate_points(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, eid)): Path<(String, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM estimates WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL)"
+    )
+    .bind(eid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_one(&st.db)
+    .await?;
+
+    if !exists {
+        return Err(ApiError(StatusCode::NOT_FOUND, json!({"error": "Estimate not found"})));
+    }
+
+    let points: Vec<Value> = if let Some(arr) = b.as_array() {
+        arr.clone()
+    } else if let Some(arr) = b.get("estimate_points").and_then(Value::as_array) {
+        arr.clone()
+    } else {
+        vec![b]
+    };
+
+    if points.is_empty() {
+        return Err(ApiError::bad("Estimate points are required"));
+    }
+
+    let mut tx = st.db.begin().await?;
+    let mut created_ids = Vec::new();
+    for pt in points {
+        let key = pt.get("key").and_then(Value::as_i64).unwrap_or(0) as i32;
+        let value = s(&pt, "value").unwrap_or("");
+        let desc = s(&pt, "description");
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO estimate_points (id, key, value, description, estimate_id, project_id, workspace_id, created_by_id, updated_by_id, created_at, updated_at)
+             VALUES (gen_random_uuid(), $1, $2, COALESCE($3, ''), $4, $5, $6, $7, $7, now(), now())
+             RETURNING id"
+        )
+        .bind(key)
+        .bind(value)
+        .bind(desc)
+        .bind(eid)
+        .bind(pid)
+        .bind(p.workspace_id())
+        .bind(user.id)
+        .fetch_one(&mut *tx)
+        .await?;
+        created_ids.push(id);
+    }
+    tx.commit().await?;
+
+    let rows: Vec<Value> = sqlx::query_scalar(&format!(
+        "SELECT {ESTIMATE_POINT_JSON} FROM estimate_points ep
+         WHERE ep.id = ANY($1)
+         ORDER BY ep.key, ep.created_at, ep.id"
+    ))
+    .bind(&created_ids)
+    .fetch_all(&st.db)
+    .await?;
+
+    created(Value::Array(rows))
+}
+
+async fn v1_update_estimate_point(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, eid, epid)): Path<(String, Uuid, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+
+    let res = sqlx::query(
+        "UPDATE estimate_points SET
+            value = COALESCE($5, value),
+            description = COALESCE($6, description),
+            key = COALESCE($7, key),
+            updated_at = now(),
+            updated_by_id = $8
+         WHERE id = $1 AND estimate_id = $2 AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
+    )
+    .bind(epid)
+    .bind(eid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .bind(s(&b, "value"))
+    .bind(s(&b, "description"))
+    .bind(b.get("key").and_then(Value::as_i64).map(|v| v as i32))
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
+
+    if res.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+
+    json_row(
+        sqlx::query_scalar(&format!(
+            "SELECT {ESTIMATE_POINT_JSON} FROM estimate_points ep
+             WHERE ep.id = $1 AND ep.estimate_id = $2 AND ep.project_id = $3 AND ep.workspace_id = $4 AND ep.deleted_at IS NULL"
+        ))
+        .bind(epid)
+        .bind(eid)
+        .bind(pid)
+        .bind(p.workspace_id()),
+        &st.db,
+    )
+    .await
+}
+
+async fn v1_delete_estimate_point(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, eid, epid)): Path<(String, Uuid, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+
+    let res = sqlx::query(
+        "UPDATE estimate_points SET deleted_at = now(), updated_at = now(), updated_by_id = $5
+         WHERE id = $1 AND estimate_id = $2 AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
+    )
+    .bind(epid)
+    .bind(eid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
+
+    if res.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
 }
 
 #[cfg(test)]
