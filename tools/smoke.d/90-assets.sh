@@ -12,6 +12,17 @@ call PATCH "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/$ASSET/" '{}'
 got=$(curl -s -b "$jar" "$BASE/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/$ASSET/")
 [[ "$got" == "hello saturn" ]] || { echo "✖ download returned: $got" >&2; exit 1; }
 echo "✔ download round trip"
+call GET "/api/assets/v2/workspaces/$SLUG/check/$ASSET/"
+jq -e '.exists == true' <<<"$body" >/dev/null
+for url in "/api/assets/v2/workspaces/$SLUG/download/$ASSET/" "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/download/$ASSET/"; do
+  got=$(curl -s -b "$jar" "$BASE$url")
+  [[ "$got" == "hello saturn" ]] || { echo "✖ forced download failed" >&2; exit 1; }
+done
+call POST "/api/assets/v2/workspaces/$SLUG/duplicate-assets/$ASSET/" '{"entity_type":"ISSUE_DESCRIPTION"}'
+COPY=$(field '.asset_id')
+call POST "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/$PROJECT/bulk/" "{\"asset_ids\":[\"$COPY\"]}"
+call DELETE "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/$ASSET/"
+call POST "/api/assets/v2/workspaces/$SLUG/restore/$ASSET/" '{}'
 call DELETE "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/$ASSET/"
 
 # Plane #10128 & #9551: empty MIME (.txt) and .md attachment files accepted
