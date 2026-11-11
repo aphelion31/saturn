@@ -7,8 +7,10 @@
 //! (active project member; guests see own items unless the project enables guest_view_all_features).
 use std::collections::HashMap;
 
+use uuid::Uuid;
+
 use crate::common::*;
-use crate::workitems::ACTIVE;
+use crate::workitems::{ACTIVE, Arg, Base, Scope, list};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -26,6 +28,7 @@ pub fn routes() -> Router<AppState> {
             get(completed_graph),
         )
         .route("/api/users/me/workspaces/{slug}/dashboard/", get(dashboard))
+        .route("/api/workspaces/{slug}/user-issues/{user_id}/", get(user_issues))
 }
 
 /// Plane `_visible_issues_q`: caller is an active member of the issue's project, and guests only
@@ -311,4 +314,39 @@ async fn dashboard(
         "overdue_issues": overdue,
         "upcoming_issues": upcoming,
     })))
+}
+
+/// `GET /api/workspaces/{slug}/user-issues/{user_id}/`: work items the target is assigned to, created by,
+/// or subscribed to, that the caller can see. Uses the shared list engine (filters, order, group, cursor).
+// ponytail: user-activity export (CSV job) skipped, per scope.
+async fn user_issues(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, target)): Path<(String, Uuid)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    let base = Base::new(
+        format!(
+            "i.workspace_id = $1 AND {ACTIVE}
+             AND EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id = i.project_id AND pm.member_id = $2
+                 AND pm.is_active AND pm.deleted_at IS NULL
+                 AND (pm.role > 5 OR EXISTS (SELECT 1 FROM projects p WHERE p.id = i.project_id AND p.guest_view_all_features)
+                      OR i.created_by_id = $2))
+             AND (i.created_by_id = $3
+                 OR EXISTS (SELECT 1 FROM issue_assignees a WHERE a.issue_id = i.id AND a.assignee_id = $3 AND a.deleted_at IS NULL)
+                 OR EXISTS (SELECT 1 FROM issue_subscribers sb WHERE sb.issue_id = i.id AND sb.subscriber_id = $3 AND sb.deleted_at IS NULL))"
+        ),
+        vec![Arg::Uuid(ws.workspace_id), Arg::Uuid(user.id), Arg::Uuid(target)],
+    );
+    list(
+        &st.db,
+        base,
+        &q,
+        Scope::Workspace {
+            workspace_id: ws.workspace_id,
+            user_id: user.id,
+        },
+    )
+    .await
 }
