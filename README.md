@@ -105,6 +105,8 @@ Details: [commit](docs/github/01.GIT-COMMIT.md), [branch](docs/github/02.GIT-BRA
 
 ## Tests
 
+Smoke tests need `bash`, `curl`, `jq` and `psql`. Python is only needed to regenerate the schema from Plane (`tools/plane-schema.sh`, `tools/django_defaults.py`), never to run Saturn.
+
 ```bash
 cargo test                                  # unit tests (Django session and password compatibility, helpers)
 BASE=http://127.0.0.1:3000 tools/smoke.sh   # API smoke test against a running, seeded server

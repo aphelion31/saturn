@@ -1,6 +1,6 @@
 # Modules: create, update, issue membership, links, favorites, user properties, archive, soft delete.
 call POST "/api/workspaces/$SLUG/projects/$PROJECT/modules/" '{"name":"Smoke module","status":"planned"}'
-MOD=$(field "['id']")
+MOD=$(field '.id')
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/modules/"
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/modules/$MOD/"
 call PATCH "/api/workspaces/$SLUG/projects/$PROJECT/modules/$MOD/" '{"name":"Smoke module 2"}'

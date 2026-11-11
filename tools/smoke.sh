@@ -3,7 +3,7 @@
 #   saturn seed admin@saturn.dev 'Saturn-rocks-2026' Acme
 #   BASE=http://127.0.0.1:3000 tools/smoke.sh
 # Each API area has its own file in tools/smoke.d/<module>.sh, sourced in name order.
-# Fails on the first non-2xx answer. Helpers: call METHOD PATH [JSON], field "['id']", $SLUG, $PROJECT.
+# Fails on the first non-2xx answer. Helpers: call METHOD PATH [JSON], field '.id', $SLUG, $PROJECT.
 set -euo pipefail
 BASE=${BASE:-http://127.0.0.1:3000}
 EMAIL=${EMAIL:-admin@saturn.dev}
@@ -20,7 +20,7 @@ call() { # call METHOD PATH [JSON]
   if [[ "$code" != 2* ]]; then echo "✖ $1 $2 -> $code $body" >&2; exit 1; fi
   echo "✔ $1 $2 -> $code"
 }
-field() { python3 -c "import json,sys; d=json.loads(sys.argv[1]); print(eval('d'+sys.argv[2]))" "$body" "$1"; }
+field() { jq -r "$1" <<<"$body"; }
 
 # --- core: instance, auth, user ---
 call GET /api/instances/
