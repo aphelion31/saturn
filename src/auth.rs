@@ -488,6 +488,13 @@ async fn magic_generate(
     }
     sqlx::query("INSERT INTO saturn_magic_codes (key, token, attempts, expires_at) VALUES ($1,$2,0,now() + interval '10 minutes') ON CONFLICT (key) DO UPDATE SET token=$2, attempts=0, expires_at=now() + interval '10 minutes'").bind(&key).bind(&token).execute(&mut *tx).await?;
     tx.commit().await?;
+    crate::outbound::send_mail_bg(
+        &st,
+        email.clone(),
+        format!("Your unique Plane login code is {token}"),
+        format!("<p>Your unique Plane login code is <strong>{token}</strong>. It expires in 10 minutes.</p>"),
+        format!("Your unique Plane login code is {token}. It expires in 10 minutes."),
+    );
     if std::env::var("SATURN_DEV_LOG_TOKENS").as_deref() == Ok("1") {
         tracing::info!(%email, %token, "magic code");
     }
@@ -673,7 +680,7 @@ async fn forgot(st: AppState, h: HeaderMap, b: EmailCheck, app: App) -> Result<R
     let email = b.email.unwrap_or_default().trim().to_lowercase();
     let row: Option<(Uuid, String)> =
         sqlx::query_as("SELECT id,password FROM users WHERE email=$1 AND is_active AND NOT is_bot")
-            .bind(email)
+            .bind(&email)
             .fetch_optional(&st.db)
             .await?;
     if let Some((id, password)) = row {
@@ -681,8 +688,19 @@ async fn forgot(st: AppState, h: HeaderMap, b: EmailCheck, app: App) -> Result<R
         let token = reset_token(&st.cfg.secret_key, id, &password, timestamp);
         let uid = URL_SAFE_NO_PAD.encode(id.to_string());
         sqlx::query("INSERT INTO saturn_magic_codes (key, token, expires_at) VALUES ($1,$2,now()+interval '1 hour') ON CONFLICT (key) DO UPDATE SET token=$2, expires_at=now()+interval '1 hour'").bind(format!("reset:{id}")).bind(&token).execute(&st.db).await?;
+        let url = format!(
+            "{}/accounts/reset-password/?uidb64={uid}&token={token}",
+            base(&st, app).trim_end_matches('/')
+        );
+        crate::outbound::send_mail_bg(
+            &st,
+            email.to_string(),
+            "Set a new password for your Plane account".into(),
+            format!("<p>Reset your password: <a href=\"{url}\">{url}</a></p><p>The link expires in 1 hour.</p>"),
+            format!("Reset your password: {url}\nThe link expires in 1 hour."),
+        );
         if std::env::var("SATURN_DEV_LOG_TOKENS").as_deref() == Ok("1") {
-            tracing::info!(url=%format!("{}/accounts/reset-password/?uidb64={uid}&token={token}",base(&st,app).trim_end_matches('/')), "password reset link");
+            tracing::info!(%url, "password reset link");
         }
     }
     Ok(Json(json!({"message":"Check your email to reset your password"})).into_response())
@@ -1163,7 +1181,7 @@ async fn instance_info(State(st): State<AppState>) -> ApiResult {
         "has_unsplash_configured": !config_value(&st, "UNSPLASH_ACCESS_KEY", "").await.is_empty(),
         "has_llm_configured": false,
         "file_size_limit": st.cfg.file_size_limit as f64,
-        "is_smtp_configured": false,
+        "is_smtp_configured": crate::outbound::smtp(&st).await.is_some(),
         "admin_base_url": "",
         "space_base_url": "",
         "app_base_url": "",

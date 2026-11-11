@@ -24,6 +24,7 @@ pub fn routes() -> Router<AppState> {
             "/api/instances/configurations/disable-email-feature/",
             post(disable_email),
         )
+        .route("/api/instances/email-credentials-check/", post(email_check))
         .route("/api/instances/admins/", get(admins).post(add_admin))
         .route("/api/instances/admins/{pk}/", delete(remove_admin))
         .route("/api/instances/workspaces/", get(workspaces).post(create_workspace))
@@ -117,14 +118,16 @@ async fn update_configurations(State(st): State<AppState>, user: CurrentUser, Js
             Value::String(s) => s.trim().to_string(),
             other => other.to_string(),
         };
-        // ponytail: encrypted keys (Fernet in Plane) are for OAuth/SMTP/AI, which Saturn does not run; not stored.
+        // Plane stores secrets (OAuth client secrets, SMTP password, LLM key) Fernet-encrypted with SECRET_KEY.
         sqlx::query(
-            "UPDATE instance_configurations SET value = $2, updated_by_id = $3, updated_at = now()
-             WHERE key = $1 AND NOT is_encrypted AND deleted_at IS NULL",
+            "UPDATE instance_configurations
+             SET value = CASE WHEN is_encrypted THEN $4 ELSE $2 END, updated_by_id = $3, updated_at = now()
+             WHERE key = $1 AND deleted_at IS NULL",
         )
         .bind(k)
-        .bind(value)
+        .bind(&value)
         .bind(user.id)
+        .bind(crate::outbound::encrypt(&st.cfg.secret_key, &value))
         .execute(&st.db)
         .await?;
         keys.push(k.clone());
@@ -137,6 +140,39 @@ async fn update_configurations(State(st): State<AppState>, user: CurrentUser, Js
         &st.db,
     )
     .await
+}
+
+/// Plane EmailCredentialCheckEndpoint: send a test email with the stored SMTP settings.
+async fn email_check(State(st): State<AppState>, user: CurrentUser, Json(b): Json<Value>) -> ApiResult {
+    require_instance_admin(&st, &user).await?;
+    let Some(to) = b
+        .get("receiver_email")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return Err(ApiError::bad("Receiver email is required"));
+    };
+    // Plane #9491 / #9487: an empty or invalid port is a 400, not a 500.
+    let Some(smtp) = crate::outbound::smtp(&st).await else {
+        return Err(ApiError::bad("Could not connect with the SMTP server."));
+    };
+    let text = "This is a sample email notification sent from Plane application.";
+    match crate::outbound::send_mail(&smtp, to.trim(), "Email Notification from Plane", text, text).await {
+        Ok(()) => Ok(Json(json!({"message": "Email successfully sent."}))),
+        Err(e) => {
+            let msg = if e.contains("535") || e.to_lowercase().contains("auth") {
+                "Invalid credentials provided"
+            } else if e.contains("from address") {
+                "From address is invalid."
+            } else if e.contains("to address") {
+                "Invalid email header."
+            } else {
+                "Could not connect with the SMTP server."
+            };
+            tracing::warn!(error = %e, "test email failed");
+            Err(ApiError::bad(msg))
+        }
+    }
 }
 
 async fn disable_email(State(st): State<AppState>, user: CurrentUser) -> ApiResult<StatusCode> {
