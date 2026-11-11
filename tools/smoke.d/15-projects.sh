@@ -1,4 +1,15 @@
 # Project list and details
+FOREIGN_USER=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -X -q -v ON_ERROR_STOP=1 -At -v slug="$SLUG" <<< "SELECT u.id FROM users u WHERE NOT EXISTS (SELECT 1 FROM workspace_members wm JOIN workspaces w ON w.id=wm.workspace_id WHERE w.slug=:'slug' AND wm.member_id=u.id AND wm.is_active AND wm.deleted_at IS NULL) LIMIT 1")
+if [[ -n "$FOREIGN_USER" ]]; then
+  for assignment in project_lead default_assignee; do
+    for method in PATCH POST; do
+      url="$BASE/api/workspaces/$SLUG/projects/"
+      [[ "$method" == PATCH ]] && url+="$PROJECT/"
+      code=$(curl -s -o /dev/null -w '%{http_code}' -b "$jar" -X "$method" -H 'content-type: application/json' -d '{"name":"Invalid member","identifier":"INVALID","'"$assignment"'":"'"$FOREIGN_USER"'"}' "$url")
+      [[ "$code" == 400 ]] || { echo "✖ $method $assignment foreign user -> $code" >&2; exit 1; }
+    done
+  done
+fi
 call GET "/api/workspaces/$SLUG/projects/"
 call GET "/api/workspaces/$SLUG/projects/details/"
 call GET "/api/workspaces/$SLUG/project-identifiers/?name=GS"

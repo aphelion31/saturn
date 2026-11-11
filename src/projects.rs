@@ -797,6 +797,20 @@ async fn project_identifiers(
     Ok(Json(json!({"exists": identifiers.len(), "identifiers": identifiers})))
 }
 
+async fn validate_project_members(db: &sqlx::PgPool, workspace: Uuid, body: &Value) -> Result<(), ApiError> {
+    for field in ["project_lead", "default_assignee"] {
+        if let Some(value) = body.get(field).filter(|v| !v.is_null()) {
+            let id = value.as_str().and_then(|s| Uuid::parse_str(s).ok());
+            let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id=$1 AND member_id=$2 AND is_active AND deleted_at IS NULL)")
+                .bind(workspace).bind(id).fetch_one(db).await?;
+            if !valid {
+                return Err(ApiError::bad_body(json!({field: ["Invalid workspace member."]})));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn update(
     State(st): State<AppState>,
     user: CurrentUser,
@@ -807,12 +821,14 @@ async fn update(
     if !ws.is_admin() {
         require_project(&st.db, &user, &slug, id).await?.require(&[ADMIN])?;
     }
+    validate_project_members(&st.db, ws.workspace_id, &b).await?;
     let has_estimate = b.get("estimate").is_some();
     let estimate_id = uuid_of(&b, "estimate");
-    let result = sqlx::query("UPDATE projects SET name=COALESCE($3,name), description=COALESCE($4,description), network=COALESCE($5,network), estimate_id=CASE WHEN $7 THEN $8 ELSE estimate_id END, updated_by_id=$6, updated_at=now() WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL AND archived_at IS NULL")
+    let result = sqlx::query("UPDATE projects SET name=COALESCE($3,name), description=COALESCE($4,description), network=COALESCE($5,network), estimate_id=CASE WHEN $7 THEN $8 ELSE estimate_id END, project_lead_id=CASE WHEN $9 THEN $10 ELSE project_lead_id END, default_assignee_id=CASE WHEN $11 THEN $12 ELSE default_assignee_id END, updated_by_id=$6, updated_at=now() WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL AND archived_at IS NULL")
         .bind(id).bind(ws.workspace_id).bind(s(&b,"name")).bind(s(&b,"description"))
         .bind(b.get("network").and_then(Value::as_i64).map(|n| n as i16)).bind(user.id)
-        .bind(has_estimate).bind(estimate_id).execute(&st.db).await?;
+        .bind(has_estimate).bind(estimate_id).bind(b.get("project_lead").is_some()).bind(uuid_of(&b,"project_lead"))
+        .bind(b.get("default_assignee").is_some()).bind(uuid_of(&b,"default_assignee")).execute(&st.db).await?;
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
@@ -848,15 +864,7 @@ async fn create(
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let ws = require_workspace(&st.db, &user, &slug).await?;
     ws.require(&[ADMIN, MEMBER])?;
-    if let Some(lead) = uuid_of(&b, "project_lead") {
-        let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id=$1 AND member_id=$2 AND is_active AND deleted_at IS NULL)")
-            .bind(ws.workspace_id).bind(lead).fetch_one(&st.db).await?;
-        if !valid {
-            return Err(ApiError::bad_body(
-                json!({"project_lead": ["Invalid workspace member."]}),
-            ));
-        }
-    }
+    validate_project_members(&st.db, ws.workspace_id, &b).await?;
     let name = s(&b, "name")
         .map(str::trim)
         .filter(|x| !x.is_empty())
@@ -971,8 +979,8 @@ pub async fn create_project(
     let identifier = identifier.trim().to_uppercase();
     let (id,): (Uuid,) = sqlx::query_as(
         "INSERT INTO projects (name, identifier, workspace_id, created_by_id, updated_by_id, description, network,
-                               project_lead_id, logo_props, timezone)
-         VALUES ($1, $2, $3, $4, $4, COALESCE($5, ''), COALESCE($6, 2), $7, COALESCE($8, '{}'::jsonb), COALESCE($9, 'UTC'))
+                               project_lead_id, logo_props, timezone, default_assignee_id)
+         VALUES ($1, $2, $3, $4, $4, COALESCE($5, ''), COALESCE($6, 2), $7, COALESCE($8, '{}'::jsonb), COALESCE($9, 'UTC'), $10)
          RETURNING id",
     )
     .bind(name)
@@ -984,6 +992,7 @@ pub async fn create_project(
     .bind(uuid_of(extra, "project_lead"))
     .bind(extra.get("logo_props"))
     .bind(s(extra, "timezone"))
+    .bind(uuid_of(extra, "default_assignee"))
     .fetch_one(&mut *tx)
     .await?;
     sqlx::query("INSERT INTO project_identifiers (name, project_id, workspace_id, created_by_id, updated_by_id) VALUES ($1, $2, $3, $4, $4)")
