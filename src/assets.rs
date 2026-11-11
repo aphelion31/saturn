@@ -150,7 +150,7 @@ pub(crate) fn token(secret: &str, asset_id: Uuid) -> String {
     hex::encode(m.finalize().into_bytes())
 }
 
-fn upload_response(asset_id: Uuid, secret: &str) -> Value {
+pub(crate) fn upload_response(asset_id: Uuid, secret: &str) -> Value {
     json!({
         "upload_data": {
             "url": format!("/api/assets/v2/upload/{asset_id}/"),
@@ -325,7 +325,7 @@ async fn create_project_asset(
     .await
 }
 
-async fn create_user_asset(State(st): State<AppState>, user: CurrentUser, Json(b): Json<Value>) -> ApiResult {
+pub(crate) async fn create_user_asset(State(st): State<AppState>, user: CurrentUser, Json(b): Json<Value>) -> ApiResult {
     let entity_type = s(&b, "entity_type").unwrap_or("");
     if !matches!(entity_type, "USER_AVATAR" | "USER_COVER") {
         return Err(ApiError::bad_body(
@@ -880,7 +880,7 @@ async fn mark_user_uploaded(
     no_content()
 }
 
-async fn delete_user_asset(
+pub(crate) async fn delete_user_asset(
     State(st): State<AppState>,
     user: CurrentUser,
     Path(asset_id): Path<Uuid>,
