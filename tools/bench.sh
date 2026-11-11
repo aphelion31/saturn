@@ -24,13 +24,20 @@ OUT=$(mktemp -d)
 trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$OUT"' EXIT
 
 log() { echo "• $*" >&2; }
-rss_mb() { # total RSS (MB) of the given pids and their children
-  local pids all
-  pids="$*"
-  all=$(for p in $pids; do echo "$p"; pgrep -P "$p" || true; done | sort -u | tr '\n' ' ')
-  ps -o rss= -p "${all// /,}" 2>/dev/null | awk '{s+=$1} END {printf "%.0f", s/1024}'
+tree() { # the given pids and all their descendants (uv run, gunicorn and celery fork grandchildren)
+  local p
+  for p in "$@"; do
+    [[ -n "$p" ]] || continue
+    echo "$p"
+    tree $(pgrep -P "$p" || true)
+  done
 }
-nproc_of() { local all; all=$(for p in "$@"; do echo "$p"; pgrep -P "$p" || true; done | sort -u | wc -l); echo $all; }
+rss_mb() { # total RSS (MB) of the given process trees
+  local all
+  all=$(tree "$@" | sort -u | tr '\n' ',')
+  ps -o rss= -p "${all%,}" 2>/dev/null | awk '{s+=$1} END {printf "%.0f", s/1024}'
+}
+nproc_of() { tree "$@" | sort -u | wc -l | tr -d ' '; }
 wait_up() { # url -> seconds until 200
   local start; start=$(python3 -c 'import time; print(time.time())')
   for _ in $(seq 1 600); do
@@ -71,7 +78,7 @@ except Exception: print("")')
   echo "$cookie"
 }
 load() { # name url cookie -> "rps p50 p99"
-  oha -z "$DURATION" -c "$CONC" --no-tui -j -H "Cookie: session-id=$3" "$2" > "$OUT/$1.json"
+  oha -z "$DURATION" -c "$CONC" --no-tui --output-format json -H "Cookie: session-id=$3" "$2" > "$OUT/$1.json"
   python3 - "$OUT/$1.json" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -139,7 +146,7 @@ cd "$ROOT"
 sleep 8
 PLANE_COOKIE=$(login http://127.0.0.1:3901 "$OUT/plane.jar")
 PIDS="$API_PID $WORKER_PID $BEAT_PID $LIVE_PID"
-REDIS_PID=$(pgrep -x redis-server | head -1); RABBIT_PID=$(pgrep -f 'beam.smp' | head -1 || true)
+REDIS_PID=$(pgrep -f 'redis-server' | head -1 || true); RABBIT_PID=$(pgrep -f 'beam.smp' | head -1 || true)
 PLANE_IDLE=$(rss_mb $PIDS)
 INFRA_IDLE=$(rss_mb $REDIS_PID $RABBIT_PID)
 read -r PL_ME_RPS PL_ME_P50 PL_ME_P99 PL_ME_CODES < <(load plane_me http://127.0.0.1:3901/api/users/me/ "$PLANE_COOKIE")
