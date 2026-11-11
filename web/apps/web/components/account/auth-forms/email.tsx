@@ -62,7 +62,7 @@ export const AuthEmailForm = observer(function AuthEmailForm(props: TAuthEmailFo
         onFocus={() => setIsFocused(true)}
         onBlur={() => setIsFocused(false)}
         placeholder={t("auth.common.email.placeholder")}
-        autoComplete="off"
+        autoComplete="email"
         autoFocus
         ref={inputRef}
         endIcon={

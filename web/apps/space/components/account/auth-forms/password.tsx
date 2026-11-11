@@ -168,7 +168,7 @@ export const AuthPasswordForm = observer(function AuthPasswordForm(props: Props)
             placeholder="Enter password"
             onFocus={() => setIsPasswordInputFocused(true)}
             onBlur={() => setIsPasswordInputFocused(false)}
-            autoComplete="off"
+            autoComplete={mode === EAuthModes.SIGN_IN ? "current-password" : "new-password"}
             // oxlint-disable-next-line jsx-a11y/no-autofocus -- sole primary field of a dedicated auth step; matches standard sign-in flows
             autoFocus
           />
@@ -203,7 +203,7 @@ export const AuthPasswordForm = observer(function AuthPasswordForm(props: Props)
               placeholder="Confirm password"
               onFocus={() => setIsRetryPasswordInputFocused(true)}
               onBlur={() => setIsRetryPasswordInputFocused(false)}
-              autoComplete="off"
+              autoComplete="new-password"
             />
             <span className="absolute right-2">
               <IconButton

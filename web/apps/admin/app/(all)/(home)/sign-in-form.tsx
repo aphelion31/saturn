@@ -133,7 +133,7 @@ export function InstanceSignInForm() {
               placeholder="name@company.com"
               value={formData.email}
               onChange={(e) => handleFormChange("email", e.target.value)}
-              autoComplete="off"
+              autoComplete="email"
               // oxlint-disable-next-line jsx-a11y/no-autofocus -- sole primary field of a dedicated sign-in page
               autoFocus
               orientation="vertical"
@@ -149,7 +149,7 @@ export function InstanceSignInForm() {
               placeholder="Enter your password"
               value={formData.password}
               onChange={(e) => handleFormChange("password", e.target.value)}
-              autoComplete="off"
+              autoComplete="current-password"
               orientation="vertical"
               label="Password"
               required

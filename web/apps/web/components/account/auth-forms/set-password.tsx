@@ -123,7 +123,7 @@ export const SetPasswordForm = observer(function SetPasswordForm() {
           type="email"
           value={user?.email}
           placeholder={t("auth.common.email.placeholder")}
-          autoComplete="off"
+          autoComplete="email"
           disabled
         />
         <div className="space-y-1">

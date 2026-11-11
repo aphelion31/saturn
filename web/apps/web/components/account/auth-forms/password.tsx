@@ -228,7 +228,7 @@ export const AuthPasswordForm = observer(function AuthPasswordForm(props: Props)
               placeholder={t("auth.common.password.placeholder")}
               onFocus={() => setIsPasswordInputFocused(true)}
               onBlur={() => setIsPasswordInputFocused(false)}
-              autoComplete="off"
+              autoComplete={mode === EAuthModes.SIGN_IN ? "current-password" : "new-password"}
               autoFocus
               endIcon={
                 <button
@@ -268,7 +268,7 @@ export const AuthPasswordForm = observer(function AuthPasswordForm(props: Props)
               placeholder={t("auth.common.password.confirm_password.placeholder")}
               onFocus={() => setIsRetryPasswordInputFocused(true)}
               onBlur={() => setIsRetryPasswordInputFocused(false)}
-              autoComplete="off"
+              autoComplete="new-password"
               endIcon={
                 <button
                   type="button"
