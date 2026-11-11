@@ -3,6 +3,12 @@ call GET /api/users/me/workspaces/
 call GET "/api/workspace-slug-check/?slug=smoke-$RANDOM"
 call GET "/api/workspaces/$SLUG/"
 call PATCH "/api/workspaces/$SLUG/" '{"name":"Acme"}'
+call PATCH "/api/workspaces/$SLUG/" '{"timezone":"Asia/Hong_Kong"}'
+[[ $(field "['timezone']") == Asia/Hong_Kong ]]
+call GET "/api/workspaces/$SLUG/"
+[[ $(field "['timezone']") == Asia/Hong_Kong ]]
+code=$(curl -s -o /dev/null -w '%{http_code}' -b "$jar" -X PATCH -H 'content-type: application/json' -d '{"timezone":"not/a-zone"}' "$BASE/api/workspaces/$SLUG/")
+[[ "$code" == 400 ]]
 call GET "/api/workspaces/$SLUG/members/"
 call GET "/api/workspaces/$SLUG/workspace-members/me/"
 call GET "/api/workspaces/$SLUG/project-members/"

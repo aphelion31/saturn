@@ -131,6 +131,23 @@ async fn me(State(st): State<AppState>, user: CurrentUser) -> ApiResult {
     .await
 }
 
+pub async fn validate_timezone(db: &sqlx::PgPool, body: &Value, field: &str) -> Result<(), ApiError> {
+    if let Some(value) = body.get(field) {
+        let valid = if let Some(name) = value.as_str() {
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM pg_timezone_names WHERE name = $1)")
+                .bind(name)
+                .fetch_one(db)
+                .await?
+        } else {
+            false
+        };
+        if !valid {
+            return Err(ApiError::bad_body(json!({field: ["Enter a valid timezone."]})));
+        }
+    }
+    Ok(())
+}
+
 async fn update_me(State(st): State<AppState>, user: CurrentUser, Json(b): Json<Value>) -> ApiResult {
     if let Some(dn) = s(&b, "display_name")
         && dn.trim().is_empty()

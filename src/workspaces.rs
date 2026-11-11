@@ -206,6 +206,7 @@ async fn update(
 ) -> ApiResult {
     let ws = require_workspace(&st.db, &user, &slug).await?;
     ws.require(&[ADMIN])?;
+    crate::users::validate_timezone(&st.db, &b, "timezone").await?;
     if let Some(n) = s(&b, "name")
         && (n.trim().is_empty() || n.chars().count() > 80)
     {
