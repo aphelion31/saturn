@@ -120,10 +120,10 @@ const COUNTS: &str = "LEFT JOIN LATERAL (
            COALESCE(sum(ep.value::float8) FILTER (WHERE ep.id IS NOT NULL), 0)::float8 AS total_ep,
            COALESCE(sum(ep.value::float8) FILTER (WHERE s.group = 'completed'), 0)::float8 AS completed_ep
     FROM module_issues mi
-    JOIN issues i ON i.id = mi.issue_id AND i.deleted_at IS NULL AND i.archived_at IS NULL AND NOT i.is_draft
-    LEFT JOIN states s ON s.id = i.state_id
-    LEFT JOIN estimate_points ep ON ep.id = i.estimate_point_id
-    WHERE mi.module_id = m.id AND mi.deleted_at IS NULL
+    JOIN issues i ON i.id = mi.issue_id AND i.workspace_id = m.workspace_id AND i.project_id = m.project_id AND i.deleted_at IS NULL AND i.archived_at IS NULL AND NOT i.is_draft
+    LEFT JOIN states s ON s.id = i.state_id AND s.workspace_id = m.workspace_id AND s.project_id = m.project_id AND s.deleted_at IS NULL
+    LEFT JOIN estimate_points ep ON ep.id = i.estimate_point_id AND ep.workspace_id = m.workspace_id AND ep.project_id = m.project_id AND ep.deleted_at IS NULL
+    WHERE mi.module_id = m.id AND mi.workspace_id = m.workspace_id AND mi.project_id = m.project_id AND mi.deleted_at IS NULL
 ) c ON true";
 
 /// Favorite flag for `user` on module `m` (user_favorites rows are soft-deleted in Plane).

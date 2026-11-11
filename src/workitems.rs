@@ -204,6 +204,11 @@ pub fn apply_filters(base: &mut Base, q: &HashMap<String, String>) {
             }
         }
     }
+    if let Some(v) = get("updated_at__exact") {
+        if chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d").is_ok() {
+            base.and("i.updated_at::date = {}::date", Arg::Text(v.to_string()));
+        }
+    }
     if let Some(v) = get("updated_at__gt") {
         base.and("i.updated_at > {}::timestamptz", Arg::Text(v.to_string()));
     }
