@@ -35,6 +35,434 @@ pub fn routes() -> Router<AppState> {
             "/api/v1/workspaces/{slug}/projects/{project_id}/issues/{pk}/",
             get(retrieve).patch(update).delete(destroy),
         )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/comments/",
+            get(comment_list).post(comment_create),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/comments/",
+            get(comment_list).post(comment_create),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/comments/{pk}/",
+            get(comment_retrieve).patch(comment_update).delete(comment_delete),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/comments/{pk}/",
+            get(comment_retrieve).patch(comment_update).delete(comment_delete),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/links/",
+            get(link_list).post(link_create),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/links/",
+            get(link_list).post(link_create),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/links/{pk}/",
+            get(link_retrieve).patch(link_update).delete(link_delete),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/links/{pk}/",
+            get(link_retrieve).patch(link_update).delete(link_delete),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/activities/",
+            get(activity_list),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/activities/",
+            get(activity_list),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/activities/{pk}/",
+            get(activity_retrieve),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/activities/{pk}/",
+            get(activity_retrieve),
+        )
+}
+
+type SubPath = Path<(String, Uuid, Uuid)>;
+type SubItemPath = Path<(String, Uuid, Uuid, Uuid)>;
+
+/// Work item must exist in the project and be visible to the caller (restricted guests: own items only).
+async fn visible_item(
+    st: &AppState,
+    user: &CurrentUser,
+    slug: &str,
+    project_id: Uuid,
+    issue_id: Uuid,
+) -> Result<ProjectCtx, ApiError> {
+    let p = require_project(&st.db, user, slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let ok: bool = sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM issues i WHERE i.id = $1 AND i.project_id = $2 AND i.workspace_id = $3 AND i.deleted_at IS NULL AND {ACTIVE} AND (NOT $4 OR i.created_by_id = $5))"
+    ))
+    .bind(issue_id)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .bind(p.restricted_guest())
+    .bind(user.id)
+    .fetch_one(&st.db)
+    .await?;
+    if !ok {
+        return Err(ApiError::not_found());
+    }
+    Ok(p)
+}
+
+// ---- comments ----
+
+/// IssueCommentSerializer fields (`comment_stripped`/`comment_json` excluded), relations as ids.
+const COMMENT_V1: &str = "jsonb_build_object(
+    'id', c.id, 'comment_html', c.comment_html, 'access', c.access, 'attachments', c.attachments,
+    'edited_at', c.edited_at, 'actor', c.actor_id, 'issue', c.issue_id, 'project', c.project_id,
+    'workspace', c.workspace_id, 'created_by', c.created_by_id, 'updated_by', c.updated_by_id,
+    'created_at', c.created_at, 'updated_at', c.updated_at)";
+
+async fn comment_list(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id)): SubPath,
+) -> ApiResult {
+    let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
+    json_rows(
+        sqlx::query_scalar(&format!(
+            "SELECT {COMMENT_V1} FROM issue_comments c WHERE c.issue_id = $1 AND c.project_id = $2 AND c.workspace_id = $3 AND c.deleted_at IS NULL ORDER BY c.created_at"
+        ))
+        .bind(issue_id)
+        .bind(project_id)
+        .bind(p.workspace_id()),
+        &st.db,
+    )
+    .await
+}
+
+async fn comment_retrieve(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id, pk)): SubItemPath,
+) -> ApiResult {
+    let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
+    json_row(
+        sqlx::query_scalar(&format!(
+            "SELECT {COMMENT_V1} FROM issue_comments c WHERE c.id = $1 AND c.issue_id = $2 AND c.project_id = $3 AND c.workspace_id = $4 AND c.deleted_at IS NULL"
+        ))
+        .bind(pk)
+        .bind(issue_id)
+        .bind(project_id)
+        .bind(p.workspace_id()),
+        &st.db,
+    )
+    .await
+}
+
+/// Plane's comment serializer: `comment_html` is required on create and sanitized before storing.
+async fn comment_create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id)): SubPath,
+    Json(b): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let raw = s(&b, "comment_html")
+        .ok_or_else(|| ApiError::bad_body(json!({"comment_html": ["This field is required."]})))?;
+    let html = sanitize_html(raw)?;
+    let access = match s(&b, "access") {
+        None => "INTERNAL",
+        Some(v) if v == "INTERNAL" || v == "EXTERNAL" => v,
+        Some(_) => return Err(ApiError::bad_body(json!({"access": ["Invalid access"]}))),
+    };
+    // ponytail: Plane also writes a `descriptions` row and `comment_json`; skipped, UI reads comment_html.
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO issue_comments (workspace_id, project_id, issue_id, actor_id, created_by_id, updated_by_id,
+            comment_html, comment_stripped, comment_json, access, attachments)
+         VALUES ($1,$2,$3,$4,$4,$4,$5,$6,'{}'::jsonb,$7,ARRAY[]::varchar[])
+         RETURNING id",
+    )
+    .bind(p.workspace_id())
+    .bind(project_id)
+    .bind(issue_id)
+    .bind(user.id)
+    .bind(&html)
+    .bind(strip_tags(&html))
+    .bind(access)
+    .fetch_one(&st.db)
+    .await?;
+    let Json(v) = comment_retrieve(State(st), user, Path((slug, project_id, issue_id, id))).await?;
+    created(v)
+}
+
+/// Only the author edits a comment.
+async fn comment_update(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id, pk)): SubItemPath,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let html = match b.get("comment_html") {
+        None => None,
+        Some(Value::String(v)) => Some(sanitize_html(v)?),
+        Some(_) => return Err(ApiError::bad_body(json!({"comment_html": ["Invalid HTML."]}))),
+    };
+    let access = match s(&b, "access") {
+        None => None,
+        Some(v) if v == "INTERNAL" || v == "EXTERNAL" => Some(v),
+        Some(_) => return Err(ApiError::bad_body(json!({"access": ["Invalid access"]}))),
+    };
+    let r = sqlx::query(
+        "UPDATE issue_comments SET comment_html = COALESCE($5, comment_html),
+            comment_stripped = CASE WHEN $5::text IS NULL THEN comment_stripped ELSE $6 END,
+            access = COALESCE($7, access),
+            edited_at = CASE WHEN $5::text IS NOT NULL AND comment_html IS DISTINCT FROM $5 THEN now() ELSE edited_at END,
+            updated_at = now(), updated_by_id = $4
+         WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $8 AND deleted_at IS NULL AND created_by_id = $4",
+    )
+    .bind(pk)
+    .bind(issue_id)
+    .bind(project_id)
+    .bind(user.id)
+    .bind(html.as_deref())
+    .bind(html.as_deref().map(strip_tags))
+    .bind(access)
+    .bind(p.workspace_id())
+    .execute(&st.db)
+    .await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    comment_retrieve(State(st), user, Path((slug, project_id, issue_id, pk))).await
+}
+
+/// Only the author deletes a comment. Soft delete.
+async fn comment_delete(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id, pk)): SubItemPath,
+) -> ApiResult<StatusCode> {
+    let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let r = sqlx::query(
+        "UPDATE issue_comments SET deleted_at = now(), updated_at = now(), updated_by_id = $4
+         WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $5 AND deleted_at IS NULL AND created_by_id = $4",
+    )
+    .bind(pk)
+    .bind(issue_id)
+    .bind(project_id)
+    .bind(user.id)
+    .bind(p.workspace_id())
+    .execute(&st.db)
+    .await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
+}
+
+// ---- links ----
+
+const LINK_V1: &str = "jsonb_build_object(
+    'id', l.id, 'title', l.title, 'url', l.url, 'metadata', l.metadata, 'issue', l.issue_id,
+    'project', l.project_id, 'workspace', l.workspace_id, 'created_by', l.created_by_id,
+    'updated_by', l.updated_by_id, 'created_at', l.created_at, 'updated_at', l.updated_at)";
+
+/// Plane accepts bare hosts and adds `http://`; rejects anything without a host or with credentials.
+fn link_url(raw: &str) -> Result<String, ApiError> {
+    let value = if raw.starts_with("http://") || raw.starts_with("https://") {
+        raw.to_owned()
+    } else {
+        format!("http://{raw}")
+    };
+    let parsed = url::Url::parse(&value).map_err(|_| ApiError::bad_body(json!({"url": ["Invalid URL."]})))?;
+    if parsed.host_str().is_none() || !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ApiError::bad_body(json!({"url": ["Invalid URL."]})));
+    }
+    Ok(value)
+}
+
+async fn link_list(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id)): SubPath,
+) -> ApiResult {
+    let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
+    json_rows(
+        sqlx::query_scalar(&format!(
+            "SELECT {LINK_V1} FROM issue_links l WHERE l.issue_id = $1 AND l.project_id = $2 AND l.workspace_id = $3 AND l.deleted_at IS NULL ORDER BY l.created_at DESC"
+        ))
+        .bind(issue_id)
+        .bind(project_id)
+        .bind(p.workspace_id()),
+        &st.db,
+    )
+    .await
+}
+
+async fn link_retrieve(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id, pk)): SubItemPath,
+) -> ApiResult {
+    let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
+    json_row(
+        sqlx::query_scalar(&format!(
+            "SELECT {LINK_V1} FROM issue_links l WHERE l.id = $1 AND l.issue_id = $2 AND l.project_id = $3 AND l.workspace_id = $4 AND l.deleted_at IS NULL"
+        ))
+        .bind(pk)
+        .bind(issue_id)
+        .bind(project_id)
+        .bind(p.workspace_id()),
+        &st.db,
+    )
+    .await
+}
+
+async fn link_create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id)): SubPath,
+    Json(b): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let raw = s(&b, "url").ok_or_else(|| ApiError::bad_body(json!({"url": ["This field is required."]})))?;
+    let url = link_url(raw)?;
+    let title = s(&b, "title");
+    if title.is_some_and(|t| t.chars().count() > 255) {
+        return Err(ApiError::bad_body(
+            json!({"title": ["Ensure this field has no more than 255 characters."]}),
+        ));
+    }
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO issue_links (workspace_id, project_id, issue_id, url, title, metadata, created_by_id, updated_by_id)
+         SELECT $1,$2,$3,$4,$5,'{}'::jsonb,$6,$6
+         WHERE NOT EXISTS (SELECT 1 FROM issue_links WHERE issue_id = $3 AND project_id = $2 AND workspace_id = $1 AND url = $4 AND deleted_at IS NULL)
+         RETURNING id",
+    )
+    .bind(p.workspace_id())
+    .bind(project_id)
+    .bind(issue_id)
+    .bind(&url)
+    .bind(title)
+    .bind(user.id)
+    .fetch_optional(&st.db)
+    .await?
+    .ok_or_else(|| ApiError::bad_body(json!({"error": "URL already exists for this work item."})))?;
+    let Json(v) = link_retrieve(State(st), user, Path((slug, project_id, issue_id, id))).await?;
+    created(v)
+}
+
+async fn link_update(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id, pk)): SubItemPath,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let url = match s(&b, "url") {
+        None => None,
+        Some(raw) => Some(link_url(raw)?),
+    };
+    let title = s(&b, "title");
+    if title.is_some_and(|t| t.chars().count() > 255) {
+        return Err(ApiError::bad_body(
+            json!({"title": ["Ensure this field has no more than 255 characters."]}),
+        ));
+    }
+    let r = sqlx::query(
+        "UPDATE issue_links SET url = COALESCE($5, url), title = COALESCE($6, title), updated_by_id = $7, updated_at = now()
+         WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(issue_id)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .bind(url.as_deref())
+    .bind(title)
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    link_retrieve(State(st), user, Path((slug, project_id, issue_id, pk))).await
+}
+
+async fn link_delete(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id, pk)): SubItemPath,
+) -> ApiResult<StatusCode> {
+    let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let r = sqlx::query(
+        "UPDATE issue_links SET deleted_at = now(), updated_at = now(), updated_by_id = $5
+         WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(issue_id)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
+}
+
+// ---- activities (read only) ----
+
+const ACTIVITY_V1: &str = "jsonb_build_object(
+    'id', a.id, 'verb', a.verb, 'field', a.field, 'old_value', a.old_value, 'new_value', a.new_value,
+    'comment', a.comment, 'epoch', a.epoch, 'issue', a.issue_id, 'project', a.project_id,
+    'workspace', a.workspace_id, 'actor', a.actor_id, 'created_by', a.created_by_id,
+    'updated_by', a.updated_by_id, 'issue_comment', a.issue_comment_id,
+    'created_at', a.created_at, 'updated_at', a.updated_at)";
+
+async fn activity_list(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id)): SubPath,
+) -> ApiResult {
+    let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
+    json_rows(
+        sqlx::query_scalar(&format!(
+            "SELECT {ACTIVITY_V1} FROM issue_activities a WHERE a.issue_id = $1 AND a.project_id = $2 AND a.workspace_id = $3 AND a.deleted_at IS NULL ORDER BY a.created_at"
+        ))
+        .bind(issue_id)
+        .bind(project_id)
+        .bind(p.workspace_id()),
+        &st.db,
+    )
+    .await
+}
+
+async fn activity_retrieve(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, issue_id, pk)): SubItemPath,
+) -> ApiResult {
+    let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
+    json_row(
+        sqlx::query_scalar(&format!(
+            "SELECT {ACTIVITY_V1} FROM issue_activities a WHERE a.id = $1 AND a.issue_id = $2 AND a.project_id = $3 AND a.workspace_id = $4 AND a.deleted_at IS NULL"
+        ))
+        .bind(pk)
+        .bind(issue_id)
+        .bind(project_id)
+        .bind(p.workspace_id()),
+        &st.db,
+    )
+    .await
 }
 
 /// Plane v1 IssueSerializer fields: model columns as plain ids, minus description_json/stripped.
@@ -198,6 +626,14 @@ async fn create(
         .bind(project_id)
         .bind(p.workspace_id())
         .bind(i64::from(sequence))
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+    // Activity feed row, same as issues.rs::create_issue. Other fan-out (notifications, webhooks) is skipped.
+    sqlx::query("INSERT INTO issue_activities (issue_id, project_id, workspace_id, actor_id, created_by_id, updated_by_id, verb, comment, attachments, epoch) VALUES ($1,$2,$3,$4,$4,$4,'created','',ARRAY[]::varchar[],extract(epoch from now()))")
+        .bind(id)
+        .bind(project_id)
+        .bind(p.workspace_id())
         .bind(user.id)
         .execute(&mut *tx)
         .await?;
