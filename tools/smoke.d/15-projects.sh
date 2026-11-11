@@ -42,6 +42,13 @@ member_redirect=$(curl -s -o /dev/null -w '%{redirect_url}' -c "$MEMBER_JAR" -d 
 [[ "$member_redirect" != *error_code* ]]
 call POST "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/members/" '{"members":[{"member_id":"'"$SMOKE_USER"'","role":15}]}'
 MEMBERSHIP=$(field "[.[] | select(.member.id==\"$SMOKE_USER\")][0].id")
+call POST "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/issues/" '{"name":"Visible relation source"}'
+REL_SOURCE=$(field '.id')
+call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/" '{"name":"Hidden related issue"}'
+REL_HIDDEN=$(field '.id')
+call POST "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/issues/$REL_SOURCE/issue-relation/" '{"relation_type":"relates_to","issues":["'"$REL_HIDDEN"'"]}'
+rel_body=$(curl -fsS -b "$MEMBER_JAR" "$BASE/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/issues/$REL_SOURCE/issue-relation/")
+jq -e --arg id "$REL_HIDDEN" 'all(.relates_to[]; .id != $id)' <<<"$rel_body" >/dev/null
 call PATCH "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/members/$MEMBERSHIP/" '{"role":5}'
 call PATCH "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/members/$MEMBERSHIP/" '{"role":15}'
 code=$(curl -s -o /dev/null -w '%{http_code}' -b "$MEMBER_JAR" -X PATCH -H 'content-type: application/json' -d '{"role":20}' "$BASE/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/members/$MEMBERSHIP/")
