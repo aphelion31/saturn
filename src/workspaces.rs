@@ -1219,7 +1219,8 @@ async fn user_profile(
     let ws = require_workspace(&st.db, &user, &slug).await?;
     let row: Option<Value> = sqlx::query_scalar(
         "SELECT jsonb_build_object('email', u.email, 'first_name', u.first_name, 'last_name', u.last_name,
-            'avatar_url', NULLIF(u.avatar, ''), 'cover_image_url', u.cover_image, 'date_joined', u.date_joined)
+            'avatar_url', NULLIF(u.avatar, ''), 'cover_image_url', u.cover_image, 'date_joined', u.date_joined,
+            'user_timezone', u.user_timezone)
          FROM workspace_members m JOIN users u ON u.id = m.member_id
          WHERE m.workspace_id = $1 AND m.member_id = $2 AND m.is_active AND m.deleted_at IS NULL",
     )
