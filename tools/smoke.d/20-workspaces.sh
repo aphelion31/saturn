@@ -43,3 +43,9 @@ call GET "/api/workspaces/$SLUG/user-favorites/"
 call POST "/api/workspaces/$SLUG/user-favorites/" '{"entity_type":"folder","name":"Smoke","is_folder":true}'
 UID_SELF=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "select u.id from users u where u.email='$EMAIL'" 2>/dev/null || true)
 [[ -n "$UID_SELF" ]] && call GET "/api/workspaces/$SLUG/user-stats/$UID_SELF/" && call GET "/api/workspaces/$SLUG/user-profile/$UID_SELF/" && call GET "/api/workspaces/$SLUG/user-activity/$UID_SELF/"
+if [[ -n "$UID_SELF" ]]; then
+  # The profile overview page maps over these arrays; a missing key crashes it.
+  call GET "/api/workspaces/$SLUG/user-stats/$UID_SELF/"
+  jq -e '(.state_distribution|type=="array") and (.priority_distribution|type=="array") and (.present_cycles|type=="array") and (.upcoming_cycles|type=="array")' <<<"$body" >/dev/null \
+    || { echo "✖ user-stats is missing distribution or cycle arrays" >&2; exit 1; }
+fi
