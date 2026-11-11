@@ -25,8 +25,10 @@ call GET "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/issue-relation/"
 STATE=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "select id from states where project_id='$PROJECT' and \"group\"='completed' and deleted_at is null limit 1")
 [[ -n "$STATE" ]] || { echo 'No completed state for issue smoke test' >&2; exit 1; }
 call POST "/api/workspaces/$SLUG/projects/$PROJECT/bulk-operation-issues/" "{\"issue_ids\":[\"$ISSUE\"],\"properties\":{\"state_id\":\"$STATE\",\"priority\":\"high\"}}"
-call POST "/api/workspaces/$SLUG/projects/$PROJECT/bulk-archive-issues/" "{\"issue_ids\":[\"$ISSUE\"]}"
+call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/archive/" '{}'
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/archived-issues/"
+jq -e --arg id "$ISSUE" 'any(.results[]; .id == $id)' <<<"$body" >/dev/null
 call DELETE "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/archive/"
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/"
 call DELETE "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/"
 call DELETE "/api/workspaces/$SLUG/projects/$PROJECT/bulk-delete-issues/" "{\"issue_ids\":[\"$RELATED\"]}"
