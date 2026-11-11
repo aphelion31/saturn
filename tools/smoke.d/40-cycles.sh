@@ -2,6 +2,11 @@
 C="/api/workspaces/$SLUG/projects/$PROJECT/cycles"
 call POST "$C/" '{"name":"Smoke cycle '$RANDOM'","start_date":"2030-01-01","end_date":"2030-01-10"}'
 CYCLE=$(field '.id')
+call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/" '{"name":"Cycle issue"}'
+CYCLE_ISSUE=$(field '.id')
+call POST "$C/$CYCLE/cycle-issues/" '{"issues":["'$CYCLE_ISSUE'"]}'
+call POST "$C/$CYCLE/cycle-issues/" '{"issues":["'$CYCLE_ISSUE'"]}'
+call DELETE "/api/workspaces/$SLUG/projects/$PROJECT/issues/$CYCLE_ISSUE/"
 call GET "$C/"
 call GET "$C/$CYCLE/"
 call PATCH "$C/$CYCLE/" '{"name":"Smoke renamed"}'

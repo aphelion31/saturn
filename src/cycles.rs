@@ -844,7 +844,8 @@ async fn ci_add(
          SELECT gen_random_uuid(), $1, i.id, i.project_id, i.workspace_id, $2, $2 FROM issues i
          WHERE i.id = ANY($3) AND i.project_id = $4 AND i.workspace_id = $5 AND {ACTIVE}
            AND NOT EXISTS (SELECT 1 FROM cycle_issues ci
-                           WHERE ci.issue_id = i.id AND ci.cycle_id = $1 AND ci.deleted_at IS NULL)"
+                           WHERE ci.issue_id = i.id AND ci.cycle_id = $1 AND ci.deleted_at IS NULL)
+         ON CONFLICT DO NOTHING"
     ))
     .bind(cycle_id)
     .bind(user.id)
