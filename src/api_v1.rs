@@ -6,6 +6,7 @@ use axum::{
 };
 
 use crate::common::*;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -50,6 +51,38 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/v1/workspaces/{slug}/projects/{project_id}/cycles-lite/",
             get(cycle_list),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/cycles/",
+            get(v1_cycles).post(v1_create_cycle),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/cycles/{cycle_id}/",
+            get(v1_cycle).patch(v1_update_cycle).delete(v1_delete_cycle),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/cycles/{cycle_id}/archive/",
+            axum::routing::post(v1_archive_cycle),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/archived-cycles/",
+            get(v1_archived_cycles),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/archived-cycles/{cycle_id}/unarchive/",
+            axum::routing::delete(v1_unarchive_cycle),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/cycles/{cycle_id}/cycle-issues/",
+            get(v1_cycle_issues).post(v1_add_cycle_issues),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/cycles/{cycle_id}/cycle-issues/{issue_id}/",
+            get(v1_cycle_issue).delete(v1_delete_cycle_issue),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/cycles/{cycle_id}/transfer-issues/",
+            axum::routing::post(v1_transfer_cycle_issues),
         )
 }
 
@@ -485,6 +518,716 @@ async fn workspace_members(State(st): State<AppState>, user: CurrentUser, Path(s
         &st.db,
     )
     .await
+}
+
+const TZ: &str = "(SELECT p.timezone FROM projects p WHERE p.id = $1)";
+
+fn start_sql(p: &str) -> String {
+    format!(
+        "(CASE WHEN {p}::text IS NULL THEN NULL
+          WHEN {p}::date = (now() AT TIME ZONE {TZ})::date THEN now()
+          ELSE ((({p}::date)::timestamp + interval '1 second') AT TIME ZONE {TZ}) END)"
+    )
+}
+
+fn end_sql(p: &str) -> String {
+    format!(
+        "(CASE WHEN {p}::text IS NULL THEN NULL
+          ELSE ((({p}::date)::timestamp + interval '23 hours 59 minutes') AT TIME ZONE {TZ}) END)"
+    )
+}
+
+fn parse_day(b: &Value, k: &str) -> Result<Option<String>, ApiError> {
+    let v = match b.get(k) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(v)) if v.is_empty() => return Ok(None),
+        Some(Value::String(v)) => v,
+        Some(_) => {
+            return Err(ApiError::bad(
+                "Date has wrong format. Use one of these formats instead: YYYY-MM-DD.",
+            ));
+        }
+    };
+    let day = v.get(..10).unwrap_or(v);
+    NaiveDate::parse_from_str(day, "%Y-%m-%d")
+        .map_err(|_| ApiError::bad("Date has wrong format. Use one of these formats instead: YYYY-MM-DD."))?;
+    Ok(Some(day.to_string()))
+}
+
+const CYCLE_DETAIL_JSON: &str = "(to_jsonb(c)-'workspace_id'-'project_id'-'owned_by_id'-'created_by_id'-'updated_by_id'-'deleted_at') || jsonb_build_object(
+    'workspace',c.workspace_id,
+    'project',c.project_id,
+    'owned_by',c.owned_by_id,
+    'created_by',c.created_by_id,
+    'updated_by',c.updated_by_id,
+    'total_issues',COALESCE(k.total, 0),
+    'completed_issues',COALESCE(k.completed, 0),
+    'cancelled_issues',COALESCE(k.cancelled, 0),
+    'started_issues',COALESCE(k.started, 0),
+    'unstarted_issues',COALESCE(k.unstarted, 0),
+    'backlog_issues',COALESCE(k.backlog, 0),
+    'total_estimates',k.total_est,
+    'completed_estimates',k.comp_est,
+    'started_estimates',k.start_est
+)";
+
+const CYCLE_COUNTS_FROM: &str = "LEFT JOIN LATERAL (
+    SELECT count(*) AS total,
+        count(*) FILTER (WHERE s.group = 'backlog') AS backlog,
+        count(*) FILTER (WHERE s.group = 'unstarted') AS unstarted,
+        count(*) FILTER (WHERE s.group = 'started') AS started,
+        count(*) FILTER (WHERE s.group = 'completed') AS completed,
+        count(*) FILTER (WHERE s.group = 'cancelled') AS cancelled,
+        sum(ep.key)::float8 AS total_est,
+        sum(ep.key) FILTER (WHERE s.group = 'completed')::float8 AS comp_est,
+        sum(ep.key) FILTER (WHERE s.group = 'started')::float8 AS start_est
+    FROM cycle_issues ci
+    JOIN issues i ON i.id = ci.issue_id AND i.deleted_at IS NULL AND i.archived_at IS NULL AND NOT i.is_draft
+    LEFT JOIN states s ON s.id = i.state_id
+    LEFT JOIN estimate_points ep ON ep.id = i.estimate_point_id AND ep.deleted_at IS NULL
+    WHERE ci.cycle_id = c.id AND ci.deleted_at IS NULL
+) k ON true";
+
+const CYCLE_ISSUE_JSON: &str = "(to_jsonb(ci)-'workspace_id'-'project_id'-'cycle_id'-'issue_id'-'created_by_id'-'updated_by_id'-'deleted_at') || jsonb_build_object('workspace',ci.workspace_id,'project',ci.project_id,'cycle',ci.cycle_id,'issue',ci.issue_id,'created_by',ci.created_by_id,'updated_by',ci.updated_by_id,'sub_issues_count',(SELECT count(*) FROM issues sub WHERE sub.parent_id=ci.issue_id AND sub.deleted_at IS NULL AND sub.archived_at IS NULL AND NOT sub.is_draft))";
+
+const ISSUE_JSON: &str = "(to_jsonb(i)-'workspace_id'-'project_id'-'created_by_id'-'updated_by_id'-'state_id'-'parent_id'-'estimate_point_id'-'deleted_at') || jsonb_build_object('workspace',i.workspace_id,'project',i.project_id,'created_by',i.created_by_id,'updated_by',i.updated_by_id,'state',i.state_id,'parent',i.parent_id,'estimate_point',i.estimate_point_id,'sub_issues_count',(SELECT count(*) FROM issues sub WHERE sub.parent_id=i.id AND sub.deleted_at IS NULL AND sub.archived_at IS NULL AND NOT sub.is_draft),'bridge_id',ci.id,'assignees',COALESCE((SELECT jsonb_agg(ia.assignee_id) FROM issue_assignees ia WHERE ia.issue_id=i.id AND ia.deleted_at IS NULL),'[]'::jsonb),'labels',COALESCE((SELECT jsonb_agg(il.label_id) FROM issue_labels il WHERE il.issue_id=i.id AND il.deleted_at IS NULL),'[]'::jsonb))";
+
+async fn v1_cycles(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let view = q.get("cycle_view").map(String::as_str).unwrap_or("all");
+    let cond = match view {
+        "current" => "AND c.start_date <= now() AND c.end_date >= now()",
+        "upcoming" => "AND c.start_date > now()",
+        "completed" => "AND c.end_date < now()",
+        "draft" => "AND c.start_date IS NULL AND c.end_date IS NULL",
+        "incomplete" => "AND (c.end_date >= now() OR c.end_date IS NULL)",
+        _ => "",
+    };
+    let rows: Vec<Value> = sqlx::query_scalar(&format!(
+        "SELECT {CYCLE_DETAIL_JSON} FROM cycles c {CYCLE_COUNTS_FROM}
+         JOIN projects p ON p.id = c.project_id AND p.workspace_id = c.workspace_id
+         WHERE c.project_id = $1 AND c.workspace_id = $2 AND c.deleted_at IS NULL AND c.archived_at IS NULL
+           AND p.deleted_at IS NULL AND p.archived_at IS NULL {cond}
+         ORDER BY c.created_at DESC, c.id"
+    ))
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_all(&st.db)
+    .await?;
+
+    if view == "current" {
+        Ok(Json(Value::Array(rows)))
+    } else {
+        paginate(rows, &q)
+    }
+}
+
+async fn v1_cycle(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, cid)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    json_row(
+        sqlx::query_scalar(&format!(
+            "SELECT {CYCLE_DETAIL_JSON} FROM cycles c {CYCLE_COUNTS_FROM}
+             WHERE c.id = $1 AND c.project_id = $2 AND c.workspace_id = $3 AND c.deleted_at IS NULL AND c.archived_at IS NULL"
+        ))
+        .bind(cid)
+        .bind(pid)
+        .bind(p.workspace_id()),
+        &st.db,
+    )
+    .await
+}
+
+async fn v1_create_cycle(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let name = s(&b, "name")
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.len() <= 255)
+        .ok_or_else(|| ApiError::bad("Invalid name"))?;
+
+    let start = parse_day(&b, "start_date")?;
+    let end = parse_day(&b, "end_date")?;
+    if start.is_some() != end.is_some() {
+        return Err(ApiError::bad(
+            "Both start date and end date are either required or are to be null",
+        ));
+    }
+    if let (Some(s), Some(e)) = (&start, &end) {
+        if s > e {
+            return Err(ApiError::bad("Start date cannot exceed end date"));
+        }
+    }
+
+    if let (Some(ext_id), Some(ext_src)) = (s(&b, "external_id"), s(&b, "external_source")) {
+        let exists: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM cycles WHERE project_id=$1 AND workspace_id=$2 AND external_id=$3 AND external_source=$4 AND deleted_at IS NULL"
+        )
+        .bind(pid).bind(p.workspace_id()).bind(ext_id).bind(ext_src).fetch_optional(&st.db).await?;
+        if let Some(existing_id) = exists {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                json!({
+                    "error": "Cycle with the same external id and external source already exists",
+                    "id": existing_id.to_string()
+                }),
+            ));
+        }
+    }
+
+    let owned_by = match b.get("owned_by").and_then(Value::as_str) {
+        Some(s) => Uuid::parse_str(s).map_err(|_| ApiError::bad("Invalid owned_by"))?,
+        None => user.id,
+    };
+
+    let sql = format!(
+        "INSERT INTO cycles (id, name, description, start_date, end_date, owned_by_id, created_by_id, updated_by_id,
+            project_id, workspace_id, timezone, view_props, logo_props, external_source, external_id, sort_order)
+         VALUES (gen_random_uuid(), $4, COALESCE($5, ''), {start}, {end}, $11, $3, $3, $1, $2,
+            COALESCE((SELECT p.timezone FROM projects p WHERE p.id = $1), 'UTC'),
+            COALESCE($6::jsonb, '{{}}'::jsonb), COALESCE($7::jsonb, '{{}}'::jsonb), $8, $9,
+            COALESCE($10::float8, (SELECT COALESCE(max(sort_order), 0) + 10000 FROM cycles WHERE project_id = $1), 65535))
+         RETURNING id",
+        start = start_sql("$12"),
+        end = end_sql("$13"),
+    );
+
+    let id: Uuid = sqlx::query_scalar(&sql)
+        .bind(pid)
+        .bind(p.workspace_id())
+        .bind(user.id)
+        .bind(name)
+        .bind(s(&b, "description"))
+        .bind(b.get("view_props").filter(|v| !v.is_null()))
+        .bind(b.get("logo_props").filter(|v| !v.is_null()))
+        .bind(s(&b, "external_source"))
+        .bind(s(&b, "external_id"))
+        .bind(b.get("sort_order").and_then(Value::as_f64))
+        .bind(owned_by)
+        .bind(start)
+        .bind(end)
+        .fetch_one(&st.db)
+        .await?;
+
+    let Json(val) = v1_cycle(State(st), user, Path((slug, pid, id))).await?;
+    created(val)
+}
+
+async fn v1_update_cycle(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, cid)): Path<(String, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+
+    let cur: (
+        Option<DateTime<Utc>>,
+        Option<DateTime<Utc>>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT c.archived_at, c.end_date, c.external_id, c.external_source FROM cycles c
+         WHERE c.id = $1 AND c.project_id = $2 AND c.workspace_id = $3 AND c.deleted_at IS NULL",
+    )
+    .bind(cid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?
+    .ok_or_else(ApiError::not_found)?;
+
+    if cur.0.is_some() {
+        return Err(ApiError::bad("Archived cycle cannot be edited"));
+    }
+
+    let completed = cur.1.is_some_and(|e| e < Utc::now());
+    if completed && b.get("sort_order").is_none() {
+        return Err(ApiError::bad(
+            "The Cycle has already been completed so it cannot be edited",
+        ));
+    }
+
+    if let Some(n) = b.get("name") {
+        if n.as_str().is_none_or(|s| s.trim().is_empty() || s.len() > 255) {
+            return Err(ApiError::bad("Invalid name"));
+        }
+    }
+
+    let has_start = b.get("start_date").is_some();
+    let has_end = b.get("end_date").is_some();
+    let start = parse_day(&b, "start_date")?;
+    let end = parse_day(&b, "end_date")?;
+    if has_start && has_end {
+        if let (Some(s), Some(e)) = (&start, &end) {
+            if s > e {
+                return Err(ApiError::bad("Start date cannot exceed end date"));
+            }
+        }
+    }
+
+    if let Some(ext_id) = s(&b, "external_id") {
+        let ext_src = s(&b, "external_source").or(cur.3.as_deref());
+        if cur.2.as_deref() != Some(ext_id) {
+            let conflict: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM cycles WHERE project_id=$1 AND workspace_id=$2 AND external_id=$3 AND external_source=$4 AND deleted_at IS NULL AND id <> $5"
+            )
+            .bind(pid).bind(p.workspace_id()).bind(ext_id).bind(ext_src).bind(cid).fetch_optional(&st.db).await?;
+            if let Some(conflict_id) = conflict {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    json!({
+                        "error": "Cycle with the same external id and external source already exists",
+                        "id": conflict_id.to_string()
+                    }),
+                ));
+            }
+        }
+    }
+
+    let has_owned_by = b.get("owned_by").is_some();
+    let owned_by = b
+        .get("owned_by")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok());
+
+    let sql = format!(
+        "UPDATE cycles c SET
+            name = COALESCE($5, c.name),
+            description = COALESCE($6, c.description),
+            start_date = CASE WHEN $7 THEN {start} ELSE c.start_date END,
+            end_date = CASE WHEN $9 THEN {end} ELSE c.end_date END,
+            view_props = COALESCE($11::jsonb, c.view_props),
+            logo_props = COALESCE($12::jsonb, c.logo_props),
+            external_source = COALESCE($13, c.external_source),
+            external_id = COALESCE($14, c.external_id),
+            sort_order = COALESCE($15::float8, c.sort_order),
+            owned_by_id = CASE WHEN $16 THEN $17 ELSE c.owned_by_id END,
+            updated_by_id = $3, updated_at = now()
+         WHERE c.id = $4 AND c.project_id = $1 AND c.workspace_id = $2
+           AND c.deleted_at IS NULL AND c.archived_at IS NULL",
+        start = start_sql("$8"),
+        end = end_sql("$10"),
+    );
+
+    let res = sqlx::query(&sql)
+        .bind(pid)
+        .bind(p.workspace_id())
+        .bind(user.id)
+        .bind(cid)
+        .bind(s(&b, "name"))
+        .bind(s(&b, "description"))
+        .bind(has_start)
+        .bind(start)
+        .bind(has_end)
+        .bind(end)
+        .bind(b.get("view_props").filter(|v| !v.is_null()))
+        .bind(b.get("logo_props").filter(|v| !v.is_null()))
+        .bind(s(&b, "external_source"))
+        .bind(s(&b, "external_id"))
+        .bind(b.get("sort_order").and_then(Value::as_f64))
+        .bind(has_owned_by)
+        .bind(owned_by)
+        .execute(&st.db)
+        .await?;
+
+    if res.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+
+    v1_cycle(State(st), user, Path((slug, pid, cid))).await
+}
+
+async fn v1_delete_cycle(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, cid)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    let (created_by_id,): (Option<Uuid>,) = sqlx::query_as(
+        "SELECT created_by_id FROM cycles WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+    )
+    .bind(cid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?
+    .ok_or_else(ApiError::not_found)?;
+
+    if !p.is_admin() && created_by_id != Some(user.id) {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            json!({"error": "Only admin or creator can delete the cycle"}),
+        ));
+    }
+
+    let mut tx = st.db.begin().await?;
+    sqlx::query(
+        "UPDATE cycles SET deleted_at=now(), updated_at=now(), updated_by_id=$2 WHERE id=$1 AND deleted_at IS NULL",
+    )
+    .bind(cid)
+    .bind(user.id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE cycle_issues SET deleted_at=now(), updated_at=now(), updated_by_id=$2 WHERE cycle_id=$1 AND deleted_at IS NULL")
+        .bind(cid).bind(user.id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE user_favorites SET deleted_at=now() WHERE entity_type='cycle' AND entity_identifier=$1 AND project_id=$2 AND deleted_at IS NULL")
+        .bind(cid).bind(pid).execute(&mut *tx).await?;
+    tx.commit().await?;
+    no_content()
+}
+
+async fn v1_archive_cycle(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, cid)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+
+    let (end_date,): (Option<DateTime<Utc>>,) = sqlx::query_as(
+        "SELECT end_date FROM cycles WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+    )
+    .bind(cid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?
+    .ok_or_else(ApiError::not_found)?;
+
+    if end_date.is_none_or(|e| e >= Utc::now()) {
+        return Err(ApiError::bad("Only completed cycles can be archived"));
+    }
+
+    let mut tx = st.db.begin().await?;
+    sqlx::query(
+        "UPDATE cycles SET archived_at=now(), updated_at=now(), updated_by_id=$2 WHERE id=$1 AND deleted_at IS NULL",
+    )
+    .bind(cid)
+    .bind(user.id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE user_favorites SET deleted_at=now() WHERE entity_type='cycle' AND entity_identifier=$1 AND project_id=$2 AND deleted_at IS NULL")
+        .bind(cid).bind(pid).execute(&mut *tx).await?;
+    tx.commit().await?;
+    no_content()
+}
+
+async fn v1_archived_cycles(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let rows: Vec<Value> = sqlx::query_scalar(&format!(
+        "SELECT {CYCLE_DETAIL_JSON} FROM cycles c {CYCLE_COUNTS_FROM}
+         WHERE c.project_id=$1 AND c.workspace_id=$2 AND c.deleted_at IS NULL AND c.archived_at IS NOT NULL
+         ORDER BY c.created_at DESC, c.id"
+    ))
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_all(&st.db)
+    .await?;
+    paginate(rows, &q)
+}
+
+async fn v1_unarchive_cycle(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, cid)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let res = sqlx::query(
+        "UPDATE cycles SET archived_at=NULL, updated_at=now(), updated_by_id=$4
+         WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL AND archived_at IS NOT NULL",
+    )
+    .bind(cid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
+    if res.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
+}
+
+async fn v1_cycle_issues(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, cid)): Path<(String, Uuid, Uuid)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM cycles WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL)",
+    )
+    .bind(cid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_one(&st.db)
+    .await?;
+    if !exists {
+        return Err(ApiError::not_found());
+    }
+
+    let rows: Vec<Value> = sqlx::query_scalar(&format!(
+        "SELECT {ISSUE_JSON} FROM issues i
+         JOIN cycle_issues ci ON ci.issue_id = i.id AND ci.cycle_id = $1 AND ci.deleted_at IS NULL
+         WHERE i.project_id = $2 AND i.workspace_id = $3 AND i.deleted_at IS NULL
+           AND (NOT $4 OR i.created_by_id = $5)
+         ORDER BY i.created_at DESC, i.id"
+    ))
+    .bind(cid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .bind(p.restricted_guest())
+    .bind(user.id)
+    .fetch_all(&st.db)
+    .await?;
+    paginate(rows, &q)
+}
+
+async fn v1_add_cycle_issues(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, cid)): Path<(String, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+
+    let issues: Vec<Uuid> = b
+        .get("issues")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if issues.is_empty() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "Work items are required", "code": "MISSING_WORK_ITEMS"}),
+        ));
+    }
+
+    let (end_date,): (Option<DateTime<Utc>>,) = sqlx::query_as(
+        "SELECT end_date FROM cycles WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+    )
+    .bind(cid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?
+    .ok_or_else(ApiError::not_found)?;
+
+    if end_date.is_some_and(|e| e < Utc::now()) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            json!({"code": "CYCLE_COMPLETED", "message": "The Cycle has already been completed so no new issues can be added"}),
+        ));
+    }
+
+    let mut tx = st.db.begin().await?;
+    sqlx::query(
+        "UPDATE cycle_issues SET cycle_id=$1, updated_by_id=$2, updated_at=now()
+         WHERE issue_id = ANY($3) AND project_id=$4 AND workspace_id=$5 AND deleted_at IS NULL AND cycle_id <> $1",
+    )
+    .bind(cid)
+    .bind(user.id)
+    .bind(&issues)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO cycle_issues (id, cycle_id, issue_id, project_id, workspace_id, created_by_id, updated_by_id)
+         SELECT gen_random_uuid(), $1, i.id, i.project_id, i.workspace_id, $2, $2
+         FROM issues i
+         WHERE i.id = ANY($3) AND i.project_id = $4 AND i.workspace_id = $5 AND i.deleted_at IS NULL
+           AND NOT EXISTS (SELECT 1 FROM cycle_issues ci WHERE ci.issue_id = i.id AND ci.cycle_id = $1 AND ci.deleted_at IS NULL)
+         ON CONFLICT DO NOTHING"
+    )
+    .bind(cid).bind(user.id).bind(&issues).bind(pid).bind(p.workspace_id()).execute(&mut *tx).await?;
+    tx.commit().await?;
+
+    let rows: Vec<Value> = sqlx::query_scalar(&format!(
+        "SELECT {CYCLE_ISSUE_JSON} FROM cycle_issues ci
+         WHERE ci.cycle_id = $1 AND ci.project_id = $2 AND ci.workspace_id = $3 AND ci.deleted_at IS NULL
+         ORDER BY ci.created_at DESC, ci.id"
+    ))
+    .bind(cid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_all(&st.db)
+    .await?;
+    Ok(Json(Value::Array(rows)))
+}
+
+async fn v1_cycle_issue(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, cid, iid)): Path<(String, Uuid, Uuid, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    json_row(sqlx::query_scalar(&format!(
+        "SELECT {CYCLE_ISSUE_JSON} FROM cycle_issues ci
+         WHERE ci.cycle_id = $1 AND ci.issue_id = $2 AND ci.project_id = $3 AND ci.workspace_id = $4 AND ci.deleted_at IS NULL"
+    ))
+    .bind(cid).bind(iid).bind(pid).bind(p.workspace_id()), &st.db).await
+}
+
+async fn v1_delete_cycle_issue(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, cid, iid)): Path<(String, Uuid, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let res = sqlx::query(
+        "UPDATE cycle_issues SET deleted_at=now(), updated_at=now(), updated_by_id=$5
+         WHERE issue_id=$1 AND cycle_id=$2 AND project_id=$3 AND workspace_id=$4 AND deleted_at IS NULL",
+    )
+    .bind(iid)
+    .bind(cid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
+    if res.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
+}
+
+async fn v1_transfer_cycle_issues(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, cid)): Path<(String, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+
+    let Some(new_cid) = uuid_of(&b, "new_cycle_id") else {
+        return Err(ApiError::bad("New Cycle Id is required"));
+    };
+
+    let old_cycle: (Option<DateTime<Utc>>,) = sqlx::query_as(
+        "SELECT end_date FROM cycles WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+    )
+    .bind(cid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?
+    .ok_or_else(ApiError::not_found)?;
+
+    if old_cycle.0.is_some_and(|e| e > Utc::now()) {
+        return Err(ApiError::bad("The old cycle is not completed yet"));
+    }
+
+    let new_cycle: (Option<DateTime<Utc>>,) = sqlx::query_as(
+        "SELECT end_date FROM cycles WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+    )
+    .bind(new_cid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?
+    .ok_or_else(|| ApiError::bad("The cycle where the issues are transferred is already completed"))?;
+
+    if new_cycle.0.is_some_and(|e| e < Utc::now()) {
+        return Err(ApiError::bad(
+            "The cycle where the issues are transferred is already completed",
+        ));
+    }
+
+    let mut tx = st.db.begin().await?;
+    let c: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*),
+            count(*) FILTER (WHERE s.group = 'completed'),
+            count(*) FILTER (WHERE s.group = 'cancelled'),
+            count(*) FILTER (WHERE s.group = 'started'),
+            count(*) FILTER (WHERE s.group = 'unstarted'),
+            count(*) FILTER (WHERE s.group = 'backlog')
+         FROM cycle_issues ci
+         JOIN issues i ON i.id = ci.issue_id AND i.deleted_at IS NULL AND i.archived_at IS NULL AND NOT i.is_draft
+         LEFT JOIN states s ON s.id = i.state_id
+         WHERE ci.cycle_id = $1 AND ci.project_id = $2 AND ci.workspace_id = $3 AND ci.deleted_at IS NULL",
+    )
+    .bind(cid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_one(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "UPDATE cycles SET progress_snapshot = jsonb_build_object(
+            'total_issues', $2::bigint,
+            'completed_issues', $3::bigint,
+            'cancelled_issues', $4::bigint,
+            'started_issues', $5::bigint,
+            'unstarted_issues', $6::bigint,
+            'backlog_issues', $7::bigint
+        ) WHERE id = $1",
+    )
+    .bind(cid)
+    .bind(c.0)
+    .bind(c.1)
+    .bind(c.2)
+    .bind(c.3)
+    .bind(c.4)
+    .bind(c.5)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "UPDATE cycle_issues ci SET cycle_id = $1, updated_by_id = $2, updated_at = now()
+         WHERE ci.cycle_id = $3 AND ci.project_id = $4 AND ci.workspace_id = $5 AND ci.deleted_at IS NULL
+           AND ci.issue_id IN (
+               SELECT i.id FROM issues i
+               JOIN states s ON s.id = i.state_id
+               WHERE s.group = ANY($6) AND i.deleted_at IS NULL AND i.archived_at IS NULL AND NOT i.is_draft
+           )",
+    )
+    .bind(new_cid)
+    .bind(user.id)
+    .bind(cid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .bind(vec!["backlog", "unstarted", "started"])
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(Json(json!({"message": "Success"})))
 }
 
 #[cfg(test)]
