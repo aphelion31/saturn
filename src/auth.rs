@@ -5,14 +5,18 @@
 //! as `?error_code=..&error_message=..` query params, which the React apps read. Saturn keeps that.
 use axum::{
     Form, Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Redirect, Response},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use dashmap::DashMap;
+use hmac::{Hmac, Mac};
+use rand::Rng;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::Sha256;
 use std::sync::OnceLock;
 use std::time::Instant;
 use uuid::Uuid;
@@ -24,6 +28,18 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/auth/get-csrf-token/", get(csrf_token))
         .route("/auth/email-check/", post(email_check))
+        .route("/auth/magic-generate/", post(magic_generate))
+        .route("/auth/spaces/magic-generate/", post(magic_generate))
+        .route("/auth/magic-sign-in/", post(magic_sign_in_app))
+        .route("/auth/magic-sign-up/", post(magic_sign_up_app))
+        .route("/auth/spaces/magic-sign-in/", post(magic_sign_in_space))
+        .route("/auth/spaces/magic-sign-up/", post(magic_sign_up_space))
+        .route("/auth/forgot-password/", post(forgot_app))
+        .route("/auth/spaces/forgot-password/", post(forgot_space))
+        .route("/auth/reset-password/{uid}/{token}/", post(reset_app))
+        .route("/auth/spaces/reset-password/{uid}/{token}/", post(reset_space))
+        .route("/auth/set-password/", post(set_password))
+        .route("/auth/change-password/", post(change_password))
         .route("/auth/spaces/email-check/", post(email_check))
         .route("/auth/sign-in/", post(sign_in_app))
         .route("/auth/sign-up/", post(sign_up_app))
@@ -69,6 +85,19 @@ fn code(name: &str) -> u32 {
         "ADMIN_USER_ALREADY_EXIST" => 5180,
         "ADMIN_USER_DOES_NOT_EXIST" => 5185,
         "RATE_LIMIT_EXCEEDED" => 5900,
+        "MAGIC_LINK_LOGIN_DISABLED" => 5016,
+        "MAGIC_SIGN_IN_EMAIL_CODE_REQUIRED" => 5085,
+        "MAGIC_SIGN_UP_EMAIL_CODE_REQUIRED" => 5055,
+        "INVALID_MAGIC_CODE_SIGN_IN" => 5090,
+        "INVALID_MAGIC_CODE_SIGN_UP" => 5092,
+        "EXPIRED_MAGIC_CODE_SIGN_IN" => 5095,
+        "EXPIRED_MAGIC_CODE_SIGN_UP" => 5097,
+        "EMAIL_CODE_ATTEMPT_EXHAUSTED_SIGN_IN" => 5100,
+        "EMAIL_CODE_ATTEMPT_EXHAUSTED_SIGN_UP" => 5102,
+        "INVALID_PASSWORD_TOKEN" => 5125,
+        "INVALID_PASSWORD" => 5020,
+        "INCORRECT_OLD_PASSWORD" => 5135,
+        "PASSWORD_ALREADY_SET" => 5145,
         _ => 5999,
     }
 }
@@ -116,7 +145,13 @@ fn check_rate_limit(headers: &HeaderMap, scope: &str) -> bool {
     let Some(cap) = rate_limit_max() else {
         return true;
     };
-    check_rate_limit_with_cap(AUTH_BUCKETS.get_or_init(DashMap::new), headers, scope, cap, Instant::now())
+    check_rate_limit_with_cap(
+        AUTH_BUCKETS.get_or_init(DashMap::new),
+        headers,
+        scope,
+        cap,
+        Instant::now(),
+    )
 }
 
 fn check_rate_limit_with_cap(
@@ -210,7 +245,7 @@ fn err_redirect(st: &AppState, app: App, next: &str, name: &str, email: Option<&
     if let Some(e) = email {
         p.push(("email", e.to_string()));
     }
-    Redirect::to(&redirect_url(st, app, next, &p)).into_response()
+    (StatusCode::FOUND, [(header::LOCATION, redirect_url(st, app, next, &p))]).into_response()
 }
 
 fn redirect_with_cookie(to: &str, cookie: String) -> Response {
@@ -395,6 +430,444 @@ struct EmailCheck {
     email: Option<String>,
 }
 
+fn token_matches(expected: &str, supplied: &str) -> bool {
+    let mut mac = Hmac::<Sha256>::new_from_slice(b"saturn-token-comparison").expect("HMAC key");
+    mac.update(expected.as_bytes());
+    let digest = mac.finalize().into_bytes();
+    let mut check = Hmac::<Sha256>::new_from_slice(b"saturn-token-comparison").expect("HMAC key");
+    check.update(supplied.as_bytes());
+    check.verify_slice(&digest).is_ok()
+}
+
+async fn magic_generate(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(b): Json<EmailCheck>,
+) -> Result<Response, ApiError> {
+    if !check_rate_limit(&headers, "magic-generate") {
+        return Ok(rate_limit_response());
+    }
+    let email = b.email.unwrap_or_default().trim().to_lowercase();
+    let error = if !setup_done(&st).await? {
+        Some("INSTANCE_NOT_CONFIGURED")
+    } else if !valid_email(&email) {
+        Some("INVALID_EMAIL")
+    } else if config_value(&st, "ENABLE_MAGIC_LINK_LOGIN", "0").await != "1" {
+        Some("MAGIC_LINK_LOGIN_DISABLED")
+    } else {
+        None
+    };
+    if let Some(e) = error {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error_code":code(e),"error_message":e})),
+        )
+            .into_response());
+    }
+    let key = format!("magic_{email}");
+    let issue_key = format!("issued:{email}");
+    let token = format!("{:06}", rand::thread_rng().gen_range(100000..1000000));
+    let mut tx = st.db.begin().await?;
+    let issued: (i32,) = sqlx::query_as("INSERT INTO saturn_magic_codes (key, token, attempts, expires_at) VALUES ($1, '', 1, now() + interval '10 minutes') ON CONFLICT (key) DO UPDATE SET attempts = CASE WHEN saturn_magic_codes.expires_at <= now() THEN 1 ELSE saturn_magic_codes.attempts + 1 END, expires_at = CASE WHEN saturn_magic_codes.expires_at <= now() THEN now() + interval '10 minutes' ELSE saturn_magic_codes.expires_at END RETURNING attempts").bind(issue_key).fetch_one(&mut *tx).await?;
+    if issued.0 > 4 {
+        tx.commit().await?;
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE email = $1)")
+            .bind(&email)
+            .fetch_one(&st.db)
+            .await?;
+        let e = if exists {
+            "EMAIL_CODE_ATTEMPT_EXHAUSTED_SIGN_IN"
+        } else {
+            "EMAIL_CODE_ATTEMPT_EXHAUSTED_SIGN_UP"
+        };
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error_code":code(e),"error_message":e})),
+        )
+            .into_response());
+    }
+    sqlx::query("INSERT INTO saturn_magic_codes (key, token, attempts, expires_at) VALUES ($1,$2,0,now() + interval '10 minutes') ON CONFLICT (key) DO UPDATE SET token=$2, attempts=0, expires_at=now() + interval '10 minutes'").bind(&key).bind(&token).execute(&mut *tx).await?;
+    tx.commit().await?;
+    if std::env::var("SATURN_DEV_LOG_TOKENS").as_deref() == Ok("1") {
+        tracing::info!(%email, %token, "magic code");
+    }
+    Ok(Json(json!({"key":key})).into_response())
+}
+
+#[derive(Deserialize)]
+struct MagicForm {
+    email: Option<String>,
+    code: Option<String>,
+    next_path: Option<String>,
+}
+
+async fn magic_auth(
+    st: AppState,
+    headers: HeaderMap,
+    f: MagicForm,
+    app: App,
+    signup: bool,
+) -> Result<Response, ApiError> {
+    if !check_rate_limit(&headers, "magic-auth") {
+        return Ok(rate_limit_response());
+    }
+    let next = safe_next(f.next_path.as_deref());
+    let email = f.email.unwrap_or_default().trim().to_lowercase();
+    let supplied = f.code.unwrap_or_default();
+    let suffix = if signup { "SIGN_UP" } else { "SIGN_IN" };
+    let fail = |name: &str| err_redirect(&st, app, &next, name, Some(&email));
+    if email.is_empty() || supplied.is_empty() {
+        return Ok(fail(if signup {
+            "MAGIC_SIGN_UP_EMAIL_CODE_REQUIRED"
+        } else {
+            "MAGIC_SIGN_IN_EMAIL_CODE_REQUIRED"
+        }));
+    }
+    if !setup_done(&st).await? {
+        return Ok(fail("INSTANCE_NOT_CONFIGURED"));
+    }
+    if config_value(&st, "ENABLE_MAGIC_LINK_LOGIN", "0").await != "1" {
+        return Ok(fail("MAGIC_LINK_LOGIN_DISABLED"));
+    }
+    let row: Option<(Uuid, bool, bool, bool)> =
+        sqlx::query_as("SELECT id, is_active, is_bot, last_logout_time IS NOT NULL FROM users WHERE email=$1")
+            .bind(&email)
+            .fetch_optional(&st.db)
+            .await?;
+    if signup && row.is_some() {
+        return Ok(fail("USER_ALREADY_EXIST"));
+    }
+    if !signup && row.is_none() {
+        return Ok(fail("USER_DOES_NOT_EXIST"));
+    }
+    if let Some((_, active, bot, logged_out)) = row {
+        if bot || (!active && logged_out) {
+            return Ok(fail("USER_ACCOUNT_DEACTIVATED"));
+        }
+    }
+    if signup && config_value(&st, "ENABLE_SIGNUP", "0").await != "1" {
+        return Ok(fail("SIGNUP_DISABLED"));
+    }
+    let key = format!("magic_{email}");
+    let mut tx = st.db.begin().await?;
+    let record: Option<(String, i32)> =
+        sqlx::query_as("SELECT token, attempts FROM saturn_magic_codes WHERE key=$1 AND expires_at > now() FOR UPDATE")
+            .bind(&key)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((expected, attempts)) = record else {
+        return Ok(fail(&format!("EXPIRED_MAGIC_CODE_{suffix}")));
+    };
+    if !token_matches(&expected, supplied.trim()) {
+        if attempts + 1 >= 5 {
+            sqlx::query("DELETE FROM saturn_magic_codes WHERE key=$1")
+                .bind(&key)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            sqlx::query("UPDATE saturn_magic_codes SET attempts=attempts+1 WHERE key=$1")
+                .bind(&key)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        return Ok(fail(&format!(
+            "{}_{suffix}",
+            if attempts + 1 >= 5 {
+                "EMAIL_CODE_ATTEMPT_EXHAUSTED"
+            } else {
+                "INVALID_MAGIC_CODE"
+            }
+        )));
+    }
+    sqlx::query("DELETE FROM saturn_magic_codes WHERE key=$1 OR key=$2")
+        .bind(&key)
+        .bind(format!("issued:{email}"))
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    let id = if let Some((id, _, _, _)) = row {
+        id
+    } else {
+        let id = create_user(&st.db, &email, &Uuid::new_v4().to_string(), "", "").await?;
+        sqlx::query("UPDATE users SET is_password_autoset=true WHERE id=$1")
+            .bind(id)
+            .execute(&st.db)
+            .await?;
+        id
+    };
+    sqlx::query("UPDATE users SET is_active=true, last_login_medium='email' WHERE id=$1")
+        .bind(id)
+        .execute(&st.db)
+        .await?;
+    join_accepted_invites(&st, id, &email).await?;
+    let session_key = session::create(&st, id, false, device_info(&headers, &st, app)).await?;
+    let path = if !next.is_empty() {
+        next
+    } else if app == App::Web {
+        landing(&st, id, &email).await?
+    } else {
+        String::new()
+    };
+    let to = if app == App::Web {
+        format!(
+            "{}/{}",
+            base(&st, app).trim_end_matches('/'),
+            path.trim_start_matches('/')
+        )
+    } else {
+        redirect_url(&st, app, &path, &[])
+    };
+    Ok(redirect_with_cookie(
+        &to,
+        session::set_cookie(&st, session::COOKIE, Some(&session_key), session::AGE_SECS),
+    ))
+}
+
+async fn magic_sign_in_app(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Form(f): Form<MagicForm>,
+) -> Result<Response, ApiError> {
+    magic_auth(s, h, f, App::Web, false).await
+}
+async fn magic_sign_up_app(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Form(f): Form<MagicForm>,
+) -> Result<Response, ApiError> {
+    magic_auth(s, h, f, App::Web, true).await
+}
+async fn magic_sign_in_space(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Form(f): Form<MagicForm>,
+) -> Result<Response, ApiError> {
+    magic_auth(s, h, f, App::Space, false).await
+}
+async fn magic_sign_up_space(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Form(f): Form<MagicForm>,
+) -> Result<Response, ApiError> {
+    magic_auth(s, h, f, App::Space, true).await
+}
+
+fn reset_token(secret: &str, id: Uuid, password: &str, timestamp: i64) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC key");
+    mac.update(format!("{id}:{password}:{timestamp}").as_bytes());
+    format!("{timestamp}-{}", hex::encode(mac.finalize().into_bytes()))
+}
+
+fn reset_valid(secret: &str, id: Uuid, password: &str, token: &str, now: i64) -> bool {
+    let Some(timestamp) = token.split_once('-').and_then(|(s, _)| s.parse::<i64>().ok()) else {
+        return false;
+    };
+    timestamp <= now && now - timestamp <= 3600 && token_matches(&reset_token(secret, id, password, timestamp), token)
+}
+
+async fn forgot(st: AppState, h: HeaderMap, b: EmailCheck, app: App) -> Result<Response, ApiError> {
+    if !check_rate_limit(&h, "forgot-password") {
+        return Ok(rate_limit_response());
+    }
+    let email = b.email.unwrap_or_default().trim().to_lowercase();
+    let row: Option<(Uuid, String)> =
+        sqlx::query_as("SELECT id,password FROM users WHERE email=$1 AND is_active AND NOT is_bot")
+            .bind(email)
+            .fetch_optional(&st.db)
+            .await?;
+    if let Some((id, password)) = row {
+        let timestamp = chrono::Utc::now().timestamp();
+        let token = reset_token(&st.cfg.secret_key, id, &password, timestamp);
+        let uid = URL_SAFE_NO_PAD.encode(id.to_string());
+        sqlx::query("INSERT INTO saturn_magic_codes (key, token, expires_at) VALUES ($1,$2,now()+interval '1 hour') ON CONFLICT (key) DO UPDATE SET token=$2, expires_at=now()+interval '1 hour'").bind(format!("reset:{id}")).bind(&token).execute(&st.db).await?;
+        if std::env::var("SATURN_DEV_LOG_TOKENS").as_deref() == Ok("1") {
+            tracing::info!(url=%format!("{}/accounts/reset-password/?uidb64={uid}&token={token}",base(&st,app).trim_end_matches('/')), "password reset link");
+        }
+    }
+    Ok(Json(json!({"message":"Check your email to reset your password"})).into_response())
+}
+async fn forgot_app(State(s): State<AppState>, h: HeaderMap, Json(b): Json<EmailCheck>) -> Result<Response, ApiError> {
+    forgot(s, h, b, App::Web).await
+}
+async fn forgot_space(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Json(b): Json<EmailCheck>,
+) -> Result<Response, ApiError> {
+    forgot(s, h, b, App::Space).await
+}
+
+#[derive(Deserialize)]
+struct ResetForm {
+    password: Option<String>,
+    confirm_password: Option<String>,
+}
+async fn reset(
+    st: AppState,
+    h: HeaderMap,
+    uid: String,
+    token: String,
+    f: ResetForm,
+    app: App,
+) -> Result<Response, ApiError> {
+    if !check_rate_limit(&h, "reset-password") {
+        return Ok(rate_limit_response());
+    }
+    let fail = |name: &str| {
+        let mut q = url::form_urlencoded::Serializer::new(String::new());
+        q.append_pair("error_code", &code(name).to_string())
+            .append_pair("error_message", name);
+        (
+            StatusCode::FOUND,
+            [(
+                header::LOCATION,
+                format!(
+                    "{}/accounts/reset-password?{}",
+                    base(&st, app).trim_end_matches('/'),
+                    q.finish()
+                ),
+            )],
+        )
+            .into_response()
+    };
+    let id = URL_SAFE_NO_PAD
+        .decode(uid)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|s| Uuid::parse_str(&s).ok());
+    let Some(id) = id else {
+        return Ok(fail("INVALID_PASSWORD_TOKEN"));
+    };
+    let mut tx = st.db.begin().await?;
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT password FROM users WHERE id=$1 AND is_active AND NOT is_bot FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((hash,)) = row else {
+        return Ok(fail("INVALID_PASSWORD_TOKEN"));
+    };
+    if !reset_valid(&st.cfg.secret_key, id, &hash, &token, chrono::Utc::now().timestamp()) {
+        return Ok(fail("INVALID_PASSWORD_TOKEN"));
+    }
+    let password = f.password.unwrap_or_default();
+    if f.confirm_password.as_deref() != Some(password.as_str()) || !strong(&password) {
+        return Ok(fail("PASSWORD_TOO_WEAK"));
+    }
+    sqlx::query("UPDATE users SET password=$2,is_password_autoset=false WHERE id=$1")
+        .bind(id)
+        .bind(session::hash_password(&password))
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM saturn_magic_codes WHERE key=$1")
+        .bind(format!("reset:{id}"))
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok((
+        StatusCode::FOUND,
+        [(
+            header::LOCATION,
+            format!("{}/sign-in?success=True", base(&st, app).trim_end_matches('/')),
+        )],
+    )
+        .into_response())
+}
+async fn reset_app(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Path((u, t)): Path<(String, String)>,
+    Form(f): Form<ResetForm>,
+) -> Result<Response, ApiError> {
+    reset(s, h, u, t, f, App::Web).await
+}
+async fn reset_space(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Path((u, t)): Path<(String, String)>,
+    Form(f): Form<ResetForm>,
+) -> Result<Response, ApiError> {
+    reset(s, h, u, t, f, App::Space).await
+}
+
+#[derive(Deserialize)]
+struct PasswordBody {
+    password: Option<String>,
+    old_password: Option<String>,
+    new_password: Option<String>,
+}
+async fn update_password(
+    st: AppState,
+    h: HeaderMap,
+    user: CurrentUser,
+    b: PasswordBody,
+    set: bool,
+) -> Result<Response, ApiError> {
+    if !check_rate_limit(&h, "change-password") {
+        return Ok(rate_limit_response());
+    }
+    let (hash, autoset): (String, bool) = sqlx::query_as("SELECT password,is_password_autoset FROM users WHERE id=$1")
+        .bind(user.id)
+        .fetch_one(&st.db)
+        .await?;
+    let password = if set {
+        b.password.unwrap_or_default()
+    } else {
+        b.new_password.unwrap_or_default()
+    };
+    let err = if set && !autoset {
+        Some("PASSWORD_ALREADY_SET")
+    } else if !set && !session::check_password(&b.old_password.unwrap_or_default(), &hash) {
+        Some("INCORRECT_OLD_PASSWORD")
+    } else if !strong(&password) {
+        Some("PASSWORD_TOO_WEAK")
+    } else {
+        None
+    };
+    if let Some(e) = err {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error_code":code(e),"error_message":e})),
+        )
+            .into_response());
+    }
+    let changed = sqlx::query("UPDATE users SET password=$2,is_password_autoset=false WHERE id=$1 AND password=$3")
+        .bind(user.id)
+        .bind(session::hash_password(&password))
+        .bind(hash)
+        .execute(&st.db)
+        .await?;
+    if changed.rows_affected() != 1 {
+        return Err(ApiError::bad("Password changed concurrently"));
+    }
+    let key = session::create(&st, user.id, false, device_info(&h, &st, App::Web)).await?;
+    Ok((
+        [(
+            header::SET_COOKIE,
+            session::set_cookie(&st, session::COOKIE, Some(&key), session::AGE_SECS),
+        )],
+        Json(json!({"message":"Password updated successfully"})),
+    )
+        .into_response())
+}
+async fn set_password(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    u: CurrentUser,
+    Json(b): Json<PasswordBody>,
+) -> Result<Response, ApiError> {
+    update_password(s, h, u, b, true).await
+}
+async fn change_password(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    u: CurrentUser,
+    Json(b): Json<PasswordBody>,
+) -> Result<Response, ApiError> {
+    update_password(s, h, u, b, false).await
+}
+
 async fn email_check(State(st): State<AppState>, headers: HeaderMap, Json(b): Json<EmailCheck>) -> Response {
     if !check_rate_limit(&headers, "email-check") {
         return rate_limit_response();
@@ -416,14 +889,14 @@ async fn email_check(State(st): State<AppState>, headers: HeaderMap, Json(b): Js
     if !valid_email(&email) {
         return fail("INVALID_EMAIL");
     }
-    // ponytail: no SMTP in Saturn, so magic codes are never offered.
-    let existing: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM users WHERE email = $1")
+    let existing: Option<(bool,)> = sqlx::query_as("SELECT is_password_autoset FROM users WHERE email = $1")
         .bind(&email)
         .fetch_optional(&st.db)
         .await
         .ok()
         .flatten();
-    Json(json!({"existing": existing.is_some(), "status": "CREDENTIAL"})).into_response()
+    let magic = config_value(&st, "ENABLE_MAGIC_LINK_LOGIN", "0").await == "1";
+    Json(json!({"existing": existing.is_some(), "status": if magic && existing.map(|x| x.0).unwrap_or(true) { "MAGIC_CODE" } else { "CREDENTIAL" }})).into_response()
 }
 
 #[derive(Deserialize, Default)]
@@ -683,7 +1156,7 @@ async fn instance_info(State(st): State<AppState>) -> ApiResult {
         "is_github_enabled": false,
         "is_gitlab_enabled": false,
         "is_gitea_enabled": false,
-        "is_magic_login_enabled": false,
+        "is_magic_login_enabled": on(config_value(&st, "ENABLE_MAGIC_LINK_LOGIN", "0").await),
         "is_email_password_enabled": true,
         "github_app_name": "",
         "slack_client_id": null,
@@ -861,6 +1334,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reset_token_expires_and_binds_password() {
+        let id = Uuid::new_v4();
+        let token = reset_token("secret", id, "hash", 1000);
+        assert!(reset_valid("secret", id, "hash", &token, 4600));
+        assert!(!reset_valid("secret", id, "hash", &token, 4601));
+        assert!(!reset_valid("secret", id, "hash", &token, 999));
+        assert!(!reset_valid("secret", id, "changed", &token, 1000));
+        assert!(!reset_valid("other", id, "hash", &token, 1000));
+        assert!(!token_matches("123456", "123457"));
+    }
+
+    #[test]
     fn next_path_rules() {
         assert_eq!(safe_next(Some("/acme/projects")), "/acme/projects");
         assert_eq!(safe_next(Some("//evil.com")), "");
@@ -886,10 +1371,22 @@ mod tests {
             let h = peer("192.168.1.1", &format!("10.0.0.{i}"));
             assert!(check_rate_limit_with_cap(&buckets, &h, "test", 10.0, now));
         }
-        assert!(!check_rate_limit_with_cap(&buckets, &peer("192.168.1.1", "10.9.9.9"), "test", 10.0, now));
+        assert!(!check_rate_limit_with_cap(
+            &buckets,
+            &peer("192.168.1.1", "10.9.9.9"),
+            "test",
+            10.0,
+            now
+        ));
 
         // A different peer is not throttled.
-        assert!(check_rate_limit_with_cap(&buckets, &peer("192.168.1.2", "10.0.0.1"), "test", 10.0, now));
+        assert!(check_rate_limit_with_cap(
+            &buckets,
+            &peer("192.168.1.2", "10.0.0.1"),
+            "test",
+            10.0,
+            now
+        ));
     }
 
     #[test]
