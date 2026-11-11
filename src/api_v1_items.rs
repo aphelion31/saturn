@@ -853,6 +853,17 @@ async fn create(
             Some(parse_dt(v)?)
         }
     };
+    let completed_at: Option<chrono::DateTime<chrono::Utc>> = match b.get("completed_at") {
+        Some(v) if !v.is_null() => Some(parse_dt(v)?),
+        Some(_) => None,
+        None => {
+            if ["completed", "cancelled"].contains(&state_group.as_str()) {
+                Some(chrono::Utc::now())
+            } else {
+                None
+            }
+        }
+    };
     if let Some(parent) = parent {
         let ok: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM issues WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL)",
@@ -887,8 +898,7 @@ async fn create(
             target_date, estimate_point_id, archived_at)
          VALUES ($1,$2,$3,$4,$5,$6,$6,
             COALESCE((SELECT MAX(sort_order)+10000 FROM issues WHERE project_id=$2 AND workspace_id=$3 AND state_id=$4 AND deleted_at IS NULL), 65535),
-            CASE WHEN (SELECT \"group\" FROM states WHERE id=$4) IN ('completed','cancelled') THEN now() ELSE NULL END,
-            $7, $8, $9, $10, $11, $12, $13, $14)
+            $7, $8, $9, $10, $11, $12, $13, $14, $15)
          RETURNING id",
     )
     .bind(name)
@@ -897,6 +907,7 @@ async fn create(
     .bind(state)
     .bind(sequence)
     .bind(user.id)
+    .bind(completed_at)
     .bind(priority)
     .bind(&html)
     .bind(strip_tags(&html))
@@ -1037,6 +1048,22 @@ async fn update(
             sqlx::query("UPDATE issues SET archived_at = $4, updated_at = now(), updated_by_id = $5 WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL")
                 .bind(pk).bind(project_id).bind(p.workspace_id()).bind(dt).bind(user.id).execute(&mut *tx).await?;
         }
+    }
+    if let Some(comp_val) = b.get("completed_at") {
+        if comp_val.is_null() {
+            sqlx::query("UPDATE issues SET completed_at = NULL, updated_at = now(), updated_by_id = $4 WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL")
+                .bind(pk).bind(project_id).bind(p.workspace_id()).bind(user.id).execute(&mut *tx).await?;
+        } else {
+            let dt = parse_dt(comp_val)?;
+            sqlx::query("UPDATE issues SET completed_at = $4, updated_at = now(), updated_by_id = $5 WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL")
+                .bind(pk).bind(project_id).bind(p.workspace_id()).bind(dt).bind(user.id).execute(&mut *tx).await?;
+        }
+    } else if (b.get("state_id").is_some() || b.get("state").is_some()) && target_state_id != old_state_id {
+        let is_done = state_group
+            .as_deref()
+            .is_some_and(|g| ["completed", "cancelled"].contains(&g));
+        sqlx::query("UPDATE issues SET completed_at = CASE WHEN $4 THEN now() ELSE NULL END WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL")
+            .bind(pk).bind(project_id).bind(p.workspace_id()).bind(is_done).execute(&mut *tx).await?;
     }
     if (b.get("state_id").is_some() || b.get("state").is_some()) && target_state_id != old_state_id {
         if let Some(sid) = target_state_id {

@@ -12,6 +12,14 @@ v1() { # v1 METHOD PATH [JSON]: same as call, with X-Api-Key instead of the cook
 V1="/api/v1/workspaces/$SLUG/projects/$PROJECT/work-items"
 v1 POST "$V1/" '{"name":"V1 smoke item","priority":"high","description_html":"<p>hi</p>"}'
 ITEM=$(field '.id'); IDENT=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "select p.identifier||'-'||i.sequence_id from issues i join projects p on p.id=i.project_id where i.id='$ITEM'")
+# 9011: accept completed_at on create
+v1 POST "$V1/" '{"name":"V1 completed item","completed_at":"2026-01-02T00:00:00Z"}'
+COMP_ITEM=$(field '.id')
+jq -e '.completed_at | startswith("2026-01-02")' <<<"$body" >/dev/null
+# 9011: accept completed_at on patch
+v1 PATCH "$V1/$COMP_ITEM/" '{"completed_at":"2026-01-03T12:00:00Z"}'
+jq -e '.completed_at | startswith("2026-01-03")' <<<"$body" >/dev/null
+v1 DELETE "$V1/$COMP_ITEM/"
 v1 GET "$V1/?per_page=5"
 jq -e '.results and .next_cursor and (has("total_results"))' <<<"$body" >/dev/null
 # 9429: non-positive or non-numeric per_page rejected with 400
