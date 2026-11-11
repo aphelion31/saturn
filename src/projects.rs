@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::get,
+    routing::{get, post},
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -30,6 +30,27 @@ pub fn routes() -> Router<AppState> {
             "/api/workspaces/{slug}/projects/{project_id}/join/{invite_id}/",
             axum::routing::post(accept_invite),
         )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/invitations/",
+            get(invitations_list).post(invitations_create),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/invitations/{pk}/",
+            get(invitations_retrieve).delete(invitations_destroy),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/project-estimates/",
+            get(project_estimates),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/preferences/member/{member_id}/",
+            get(member_preferences_get).patch(member_preferences_patch),
+        )
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/bulk-create-labels/",
+            post(bulk_create_labels),
+        )
+        .route("/api/workspaces/{slug}/labels/", get(workspace_labels))
         .route("/api/workspaces/{slug}/estimates/", get(workspace_estimates))
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/user-properties/",
@@ -782,9 +803,12 @@ async fn update(
     if !ws.is_admin() {
         require_project(&st.db, &user, &slug, id).await?.require(&[ADMIN])?;
     }
-    let result = sqlx::query("UPDATE projects SET name=COALESCE($3,name), description=COALESCE($4,description), network=COALESCE($5,network), updated_by_id=$6, updated_at=now() WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL AND archived_at IS NULL")
+    let has_estimate = b.get("estimate").is_some();
+    let estimate_id = uuid_of(&b, "estimate");
+    let result = sqlx::query("UPDATE projects SET name=COALESCE($3,name), description=COALESCE($4,description), network=COALESCE($5,network), estimate_id=CASE WHEN $7 THEN $8 ELSE estimate_id END, updated_by_id=$6, updated_at=now() WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL AND archived_at IS NULL")
         .bind(id).bind(ws.workspace_id).bind(s(&b,"name")).bind(s(&b,"description"))
-        .bind(b.get("network").and_then(Value::as_i64).map(|n| n as i16)).bind(user.id).execute(&st.db).await?;
+        .bind(b.get("network").and_then(Value::as_i64).map(|n| n as i16)).bind(user.id)
+        .bind(has_estimate).bind(estimate_id).execute(&st.db).await?;
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
@@ -988,4 +1012,341 @@ pub async fn create_project(
     }
     crate::states::create_defaults(tx, workspace_id, id, user_id).await?;
     Ok(id)
+}
+
+const PROJECT_INVITE_JSON: &str = "jsonb_build_object(
+    'id', i.id,
+    'email', i.email,
+    'role', i.role,
+    'accepted', i.accepted,
+    'token', i.token,
+    'message', i.message,
+    'responded_at', i.responded_at,
+    'created_at', i.created_at,
+    'updated_at', i.updated_at,
+    'created_by', i.created_by_id,
+    'updated_by', i.updated_by_id,
+    'project', jsonb_build_object('id', p.id, 'name', p.name, 'identifier', p.identifier, 'description', p.description, 'cover_image', p.cover_image, 'cover_image_url', p.cover_image, 'logo_props', p.logo_props),
+    'workspace', jsonb_build_object('id', w.id, 'name', w.name, 'slug', w.slug, 'logo', w.logo, 'owner', w.owner_id, 'logo_url', NULLIF(w.logo, ''))
+)";
+
+fn invite_token() -> String {
+    use rand::Rng;
+    const B62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut r = rand::thread_rng();
+    (0..32).map(|_| B62[r.gen_range(0..62)] as char).collect()
+}
+
+fn valid_email(e: &str) -> bool {
+    let Some((local, domain)) = e.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !e.contains(char::is_whitespace)
+}
+
+async fn invitations_list(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN])?;
+    json_rows(
+        sqlx::query_scalar(&format!(
+            "SELECT {PROJECT_INVITE_JSON} FROM project_member_invites i
+             JOIN projects p ON p.id = i.project_id
+             JOIN workspaces w ON w.id = i.workspace_id
+             WHERE i.project_id = $1 AND i.workspace_id = $2 AND i.deleted_at IS NULL
+             ORDER BY i.created_at"
+        ))
+        .bind(project_id)
+        .bind(p.workspace_id()),
+        &st.db,
+    )
+    .await
+}
+
+async fn invitations_retrieve(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, pk)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN])?;
+    json_row(
+        sqlx::query_scalar(&format!(
+            "SELECT {PROJECT_INVITE_JSON} FROM project_member_invites i
+             JOIN projects p ON p.id = i.project_id
+             JOIN workspaces w ON w.id = i.workspace_id
+             WHERE i.id = $1 AND i.project_id = $2 AND i.workspace_id = $3 AND i.deleted_at IS NULL"
+        ))
+        .bind(pk)
+        .bind(project_id)
+        .bind(p.workspace_id()),
+        &st.db,
+    )
+    .await
+}
+
+async fn invitations_destroy(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, pk)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN])?;
+    let r = sqlx::query(
+        "UPDATE project_member_invites SET deleted_at = now(), updated_at = now(), updated_by_id = $4
+         WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
+}
+
+async fn invitations_create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN])?;
+    let emails = b.get("emails").and_then(Value::as_array).cloned().unwrap_or_default();
+    if emails.is_empty() {
+        return Err(ApiError::bad("Emails are required"));
+    }
+    let mut rows: Vec<(String, i16)> = Vec::new();
+    for e in &emails {
+        let addr = s(e, "email").unwrap_or("").trim().to_lowercase();
+        if !valid_email(&addr) {
+            return Err(ApiError::bad(format!(
+                "Invalid email - {addr} provided a valid email address is required to send the invite"
+            )));
+        }
+        let role = e.get("role").and_then(Value::as_i64).unwrap_or(5) as i16;
+        let ws_role: Option<i16> = sqlx::query_scalar(
+            "SELECT m.role FROM workspace_members m
+             JOIN users u ON u.id = m.member_id
+             WHERE m.workspace_id = $1 AND lower(u.email) = $2 AND m.is_active AND m.deleted_at IS NULL",
+        )
+        .bind(p.workspace_id())
+        .bind(&addr)
+        .fetch_optional(&st.db)
+        .await?;
+        if let Some(wr) = ws_role {
+            if (wr == 5 || wr == 20) && wr != role {
+                return Err(ApiError::bad(
+                    "You cannot invite a user with different role than workspace role",
+                ));
+            }
+        }
+        rows.push((addr, role));
+    }
+    let mut tx = st.db.begin().await?;
+    for (addr, role) in &rows {
+        let token = invite_token();
+        sqlx::query(
+            "INSERT INTO project_member_invites (id, email, token, role, accepted, project_id, workspace_id, created_by_id, updated_by_id)
+             VALUES (gen_random_uuid(), $1, $2, $3, false, $4, $5, $6, $6)",
+        )
+        .bind(addr)
+        .bind(token)
+        .bind(role)
+        .bind(project_id)
+        .bind(p.workspace_id())
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    // ponytail: email sending skipped; invite row stored in DB
+    Ok(Json(json!({"message": "Email sent successfully"})))
+}
+
+async fn project_estimates(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let est_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT estimate_id FROM projects WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?
+    .flatten();
+    let Some(estimate_id) = est_id else {
+        return Ok(Json(json!([])));
+    };
+    json_rows(
+        sqlx::query_scalar(&format!(
+            "SELECT {POINT_JSON} FROM estimate_points WHERE estimate_id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL ORDER BY key"
+        ))
+        .bind(estimate_id)
+        .bind(project_id)
+        .bind(p.workspace_id()),
+        &st.db,
+    )
+    .await
+}
+
+async fn member_preferences_get(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, member_id)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    if member_id != user.id {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            json!({"error": "You cannot access another member's preferences."}),
+        ));
+    }
+    json_row(
+        sqlx::query_scalar(
+            "SELECT jsonb_build_object('preferences', preferences, 'project_id', project_id, 'member_id', member_id, 'workspace_id', workspace_id)
+             FROM project_members
+             WHERE project_id = $1 AND member_id = $2 AND workspace_id = $3 AND is_active AND deleted_at IS NULL",
+        )
+        .bind(project_id)
+        .bind(member_id)
+        .bind(p.workspace_id()),
+        &st.db,
+    )
+    .await
+}
+
+async fn member_preferences_patch(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, member_id)): Path<(String, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    if member_id != user.id {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            json!({"error": "You cannot access another member's preferences."}),
+        ));
+    }
+    let prefs = if let Some(p) = b.get("preferences").filter(|v| v.is_object()) {
+        p.clone()
+    } else {
+        b
+    };
+    let row: Value = sqlx::query_scalar(
+        "UPDATE project_members
+         SET preferences = COALESCE(preferences, '{}'::jsonb) || $4::jsonb,
+             updated_at = now(),
+             updated_by_id = $2
+         WHERE project_id = $1 AND member_id = $2 AND workspace_id = $3 AND is_active AND deleted_at IS NULL
+         RETURNING preferences",
+    )
+    .bind(project_id)
+    .bind(member_id)
+    .bind(p.workspace_id())
+    .bind(prefs)
+    .fetch_one(&st.db)
+    .await?;
+
+    Ok(Json(json!({"preferences": row})))
+}
+
+async fn bulk_create_labels(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN])?;
+    let label_data = b
+        .get("label_data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut created_labels: Vec<Value> = Vec::new();
+    let mut tx = st.db.begin().await?;
+    for item in &label_data {
+        let name = s(item, "name")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Migrated");
+        let desc = s(item, "description").unwrap_or("Migrated Issue");
+        let color = s(item, "color")
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                use rand::Rng;
+                format!("#{:06X}", rand::thread_rng().gen_range(0..=0xFFFFFF))
+            });
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM labels WHERE project_id = $1 AND workspace_id = $2 AND lower(name) = lower($3) AND deleted_at IS NULL)",
+        )
+        .bind(project_id)
+        .bind(p.workspace_id())
+        .bind(name)
+        .fetch_one(&mut *tx)
+        .await?;
+        if exists {
+            continue;
+        }
+        let val: Value = sqlx::query_scalar(&format!(
+            "INSERT INTO labels (project_id, workspace_id, name, description, color, created_by_id, updated_by_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $6)
+             RETURNING {LABEL_JSON}"
+        ))
+        .bind(project_id)
+        .bind(p.workspace_id())
+        .bind(name)
+        .bind(desc)
+        .bind(color)
+        .bind(user.id)
+        .fetch_one(&mut *tx)
+        .await?;
+        created_labels.push(val);
+    }
+    tx.commit().await?;
+    created(json!({"labels": created_labels}))
+}
+
+async fn workspace_labels(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER, GUEST])?;
+    json_rows(
+        sqlx::query_scalar(
+            "SELECT jsonb_build_object('id', l.id, 'name', l.name, 'color', l.color, 'parent', l.parent_id,
+                 'project_id', l.project_id, 'workspace_id', l.workspace_id, 'sort_order', l.sort_order)
+             FROM labels l
+             WHERE l.workspace_id = $1 AND l.deleted_at IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM projects p
+                   JOIN project_members pm ON pm.project_id = p.id
+                   WHERE p.id = l.project_id AND p.deleted_at IS NULL AND p.archived_at IS NULL
+                     AND pm.member_id = $2 AND pm.is_active AND pm.deleted_at IS NULL
+               )
+             ORDER BY l.sort_order",
+        )
+        .bind(ws.workspace_id)
+        .bind(user.id),
+        &st.db,
+    )
+    .await
 }

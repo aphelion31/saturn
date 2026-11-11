@@ -24,12 +24,24 @@ pub fn routes() -> Router<AppState> {
             get(project_list).post(project_create),
         )
         .route(
+            "/api/workspaces/{slug}/projects/{project_id}/project-views/",
+            get(project_list).post(project_user_views_or_create),
+        )
+        .route(
             "/api/workspaces/{slug}/projects/{project_id}/views/{pk}/",
             get(project_retrieve).patch(project_update).delete(project_destroy),
         )
         .route("/api/workspaces/{slug}/views/", get(ws_list).post(ws_create))
         .route(
+            "/api/workspaces/{slug}/workspace-views/",
+            get(ws_list).post(ws_create_or_props),
+        )
+        .route(
             "/api/workspaces/{slug}/views/{pk}/",
+            get(ws_retrieve).patch(ws_update).delete(ws_destroy),
+        )
+        .route(
+            "/api/workspaces/{slug}/workspace-views/{pk}/",
             get(ws_retrieve).patch(ws_update).delete(ws_destroy),
         )
         .route("/api/workspaces/{slug}/issues/", get(ws_issues))
@@ -431,6 +443,73 @@ async fn ws_retrieve(
     view_by_id(&st.db, pk, None, ws.workspace_id, user.id).await
 }
 
+async fn ws_create_or_props(
+    st: State<AppState>,
+    user: CurrentUser,
+    path: Path<String>,
+    Json(b): Json<Value>,
+) -> ApiResult<axum::response::Response> {
+    use axum::response::IntoResponse;
+    if b.get("view_props").is_some() && b.get("name").is_none() {
+        let ws = require_workspace(&st.db, &user, &path.0).await?;
+        ws.require(&[ADMIN, MEMBER, GUEST])?;
+        let view_props = b.get("view_props").cloned().unwrap_or_else(|| json!({}));
+        sqlx::query(
+            "UPDATE workspace_members SET view_props = $3, updated_at = now(), updated_by_id = $2
+             WHERE workspace_id = $1 AND member_id = $2 AND is_active AND deleted_at IS NULL",
+        )
+        .bind(ws.workspace_id)
+        .bind(user.id)
+        .bind(view_props)
+        .execute(&st.db)
+        .await?;
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    let (status, json) = ws_create(st, user, path, Json(b)).await?;
+    Ok((status, json).into_response())
+}
+
+async fn project_user_views_or_create(
+    st: State<AppState>,
+    user: CurrentUser,
+    path: Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult<axum::response::Response> {
+    use axum::response::IntoResponse;
+    if b.get("name").is_some() && b.get("view_props").is_none() && b.get("preferences").is_none() {
+        let (status, json) = project_create(st, user, path, Json(b)).await?;
+        return Ok((status, json).into_response());
+    }
+    let p = require_project(&st.db, &user, &path.0.0, path.0.1).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let view_props = b.get("view_props");
+    let default_props = b.get("default_props");
+    let preferences = b.get("preferences");
+    let sort_order = b.get("sort_order").and_then(Value::as_f64);
+
+    sqlx::query(
+        "UPDATE project_members SET
+            view_props = COALESCE($3, view_props),
+            default_props = COALESCE($4, default_props),
+            preferences = COALESCE($5, preferences),
+            sort_order = COALESCE($6, sort_order),
+            updated_at = now(),
+            updated_by_id = $2
+         WHERE project_id = $1 AND member_id = $2 AND workspace_id = $7 AND is_active AND deleted_at IS NULL",
+    )
+    .bind(path.0.1)
+    .bind(user.id)
+    .bind(view_props)
+    .bind(default_props)
+    .bind(preferences)
+    .bind(sort_order)
+    .bind(p.workspace_id())
+    .execute(&st.db)
+    .await?;
+
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 async fn ws_update(
     State(st): State<AppState>,
     user: CurrentUser,
@@ -466,6 +545,35 @@ async fn ws_issues(
 ) -> ApiResult {
     let ws = require_workspace(&st.db, &user, &slug).await?;
     ws.require(&[ADMIN, MEMBER, GUEST])?;
+    let mut q = q;
+    if let Some(view_id_str) = q.get("view_id").or_else(|| q.get("view")).cloned() {
+        if let Ok(view_id) = Uuid::parse_str(&view_id_str) {
+            if let Some(filters) = sqlx::query_scalar::<_, Value>(
+                "SELECT filters FROM issue_views WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
+            )
+            .bind(view_id)
+            .bind(ws.workspace_id)
+            .fetch_optional(&st.db)
+            .await?
+            {
+                if let Some(obj) = filters.as_object() {
+                    for (k, v) in obj {
+                        if !q.contains_key(k) {
+                            if let Some(s) = v.as_str() {
+                                q.insert(k.clone(), s.to_string());
+                            } else if let Some(arr) = v.as_array() {
+                                let items: Vec<String> =
+                                    arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+                                if !items.is_empty() {
+                                    q.insert(k.clone(), items.join(","));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     let base = Base::new(
         format!(
             "i.workspace_id = $1 AND {ACTIVE} AND EXISTS (
