@@ -59,6 +59,18 @@ pub fn routes() -> Router<AppState> {
             get(list).post(create),
         )
         .route("/api/workspaces/{slug}/projects/{project_id}/issues/list/", get(list))
+        .route("/api/workspaces/{slug}/projects/{project_id}/issues-detail/", get(list))
+        .route("/api/workspaces/{slug}/projects/{project_id}/deleted-issues/", get(deleted_issues))
+        .route("/api/workspaces/{slug}/projects/{project_id}/issue-dates/", axum::routing::post(issue_dates))
+        .route("/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-attachments/{attachment_id}/", axum::routing::delete(legacy_attachment_delete))
+        .route("/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/meta/", get(issue_meta))
+        .route("/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-attachments/", get(legacy_attachments))
+        .route("/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/versions/", get(issue_versions))
+        .route("/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/versions/{version_id}/", get(issue_version))
+        .route("/api/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/description-versions/", get(description_versions))
+        .route("/api/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/description-versions/{version_id}/", get(description_version))
+        .route("/api/workspaces/{slug}/projects/{project_id}/intake-work-items/{issue_id}/description-versions/", get(description_versions))
+        .route("/api/workspaces/{slug}/projects/{project_id}/intake-work-items/{issue_id}/description-versions/{version_id}/", get(description_version))
         .route("/api/workspaces/{slug}/projects/{project_id}/v2/issues/", get(list))
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/archived-issues/",
@@ -160,6 +172,193 @@ pub fn routes() -> Router<AppState> {
 
 type IssuePath = (String, Uuid, Uuid);
 type CommentPath = (String, Uuid, Uuid, Uuid);
+
+async fn issue_dates(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project)): Path<(String, Uuid)>,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let updates = body
+        .get("updates")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError::bad("Invalid updates"))?;
+    let mut tx = st.db.begin().await?;
+    for update in updates {
+        let id = optional_uuid(update, "id")?.ok_or_else(|| ApiError::bad("Invalid issue id"))?;
+        let start = optional_date(update, "start_date")?;
+        let target = optional_date(update, "target_date")?;
+        let dates: Option<(Option<chrono::NaiveDate>, Option<chrono::NaiveDate>)> = sqlx::query_as("SELECT start_date,target_date FROM issues WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL FOR UPDATE").bind(id).bind(project).bind(p.workspace_id()).fetch_optional(&mut *tx).await?;
+        if let Some((old_start, old_target)) = dates {
+            if start
+                .or(old_start)
+                .zip(target.or(old_target))
+                .is_some_and(|(a, b)| a > b)
+            {
+                return Err(ApiError::bad_body(
+                    serde_json::json!({"message":"Start date cannot exceed target date"}),
+                ));
+            }
+            sqlx::query("UPDATE issues SET start_date=COALESCE($4,start_date),target_date=COALESCE($5,target_date),updated_at=now(),updated_by_id=$6 WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL").bind(id).bind(project).bind(p.workspace_id()).bind(start).bind(target).bind(user.id).execute(&mut *tx).await?;
+        }
+    }
+    // ponytail: asynchronous activity fan-out is omitted until a shared activity helper is available.
+    tx.commit().await?;
+    Ok(Json(serde_json::json!({"message":"Issues updated successfully"})))
+}
+
+async fn legacy_attachment_delete(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, issue, id)): Path<CommentPath>,
+) -> ApiResult<axum::http::StatusCode> {
+    let p = visible_issue(&st, &user, &slug, project, issue).await?;
+    let owner: Option<Option<Uuid>> = sqlx::query_scalar("SELECT created_by_id FROM file_assets WHERE id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND entity_type='ISSUE_ATTACHMENT' AND deleted_at IS NULL").bind(id).bind(issue).bind(project).bind(p.workspace_id()).fetch_optional(&st.db).await?;
+    if owner.ok_or_else(ApiError::not_found)? != Some(user.id) {
+        p.require(&[ADMIN])?;
+    }
+    sqlx::query("UPDATE file_assets SET deleted_at=now(),is_deleted=true WHERE id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND deleted_at IS NULL").bind(id).bind(issue).bind(project).bind(p.workspace_id()).execute(&st.db).await?;
+    no_content()
+}
+
+async fn issue_meta(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, issue)): Path<IssuePath>,
+) -> ApiResult {
+    let p = visible_issue(&st, &user, &slug, project, issue).await?;
+    json_row(sqlx::query_scalar("SELECT jsonb_build_object('sequence_id',i.sequence_id,'project_identifier',p.identifier) FROM issues i JOIN projects p ON p.id=i.project_id AND p.workspace_id=i.workspace_id WHERE i.id=$1 AND i.project_id=$2 AND i.workspace_id=$3 AND i.deleted_at IS NULL AND p.deleted_at IS NULL").bind(issue).bind(project).bind(p.workspace_id()), &st.db).await
+}
+
+async fn deleted_issues(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project)): Path<(String, Uuid)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let after = q
+        .get("updated_at__gt")
+        .map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|d| d.to_utc())
+                .map_err(|_| ApiError::bad("Invalid updated_at__gt"))
+        })
+        .transpose()?;
+    json_rows(sqlx::query_scalar("SELECT to_jsonb(id) FROM issues WHERE workspace_id=$1 AND project_id=$2 AND (deleted_at IS NOT NULL OR archived_at IS NOT NULL) AND ($3::timestamptz IS NULL OR updated_at>$3) AND (NOT $4 OR created_by_id=$5) ORDER BY created_at DESC").bind(p.workspace_id()).bind(project).bind(after).bind(p.restricted_guest()).bind(user.id), &st.db).await
+}
+
+async fn legacy_attachments(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, issue)): Path<IssuePath>,
+) -> ApiResult {
+    let p = visible_issue(&st, &user, &slug, project, issue).await?;
+    json_rows(sqlx::query_scalar("SELECT (to_jsonb(f)-'workspace_id'-'project_id'-'issue_id'-'created_by_id'-'updated_by_id'-'comment_id'-'page_id'-'user_id'-'draft_issue_id') || jsonb_build_object('workspace',f.workspace_id,'project',f.project_id,'issue',f.issue_id,'created_by',f.created_by_id,'updated_by',f.updated_by_id,'comment',f.comment_id,'page',f.page_id,'user',f.user_id,'draft_issue',f.draft_issue_id,'asset_url','/api/assets/v2/workspaces/' || $4 || '/projects/' || f.project_id || '/issues/' || f.issue_id || '/attachments/' || f.id || '/') FROM file_assets f WHERE f.workspace_id=$1 AND f.project_id=$2 AND f.issue_id=$3 AND f.entity_type='ISSUE_ATTACHMENT' AND f.deleted_at IS NULL ORDER BY f.created_at DESC").bind(p.workspace_id()).bind(project).bind(issue).bind(slug), &st.db).await
+}
+
+const VERSION_SUMMARY: &str = "jsonb_build_object('id',v.id,'workspace',v.workspace_id,'project',v.project_id,'issue',v.issue_id,'last_saved_at',v.last_saved_at,'owned_by',v.owned_by_id,'created_at',v.created_at,'updated_at',v.updated_at,'created_by',v.created_by_id,'updated_by',v.updated_by_id)";
+
+async fn versions(
+    st: AppState,
+    user: CurrentUser,
+    (slug, project, issue): IssuePath,
+    q: HashMap<String, String>,
+    description: bool,
+) -> ApiResult {
+    let p = visible_issue(&st, &user, &slug, project, issue).await?;
+    let (size, page) = if let Some(cursor) = q.get("cursor") {
+        let parts: Vec<_> = cursor.split(':').collect();
+        if parts.len() != 3 {
+            return Err(ApiError::bad("Invalid cursor"));
+        }
+        let size = parts[0]
+            .parse::<i64>()
+            .map_err(|_| ApiError::bad("Invalid cursor"))?
+            .clamp(1, 1000);
+        let page = parts[1]
+            .parse::<i64>()
+            .map_err(|_| ApiError::bad("Invalid cursor"))?
+            .max(0);
+        parts[2].parse::<i64>().map_err(|_| ApiError::bad("Invalid cursor"))?;
+        (size, page)
+    } else {
+        (1000, 0)
+    };
+    let offset = page.checked_mul(size).ok_or_else(|| ApiError::bad("Invalid cursor"))?;
+    let table = if description {
+        "issue_description_versions"
+    } else {
+        "issue_versions"
+    };
+    let total: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table} v WHERE v.workspace_id=$1 AND v.project_id=$2 AND v.issue_id=$3 AND v.deleted_at IS NULL")).bind(p.workspace_id()).bind(project).bind(issue).fetch_one(&st.db).await?;
+    let results: Vec<Value> = sqlx::query_scalar(&format!("SELECT {VERSION_SUMMARY} FROM {table} v WHERE v.workspace_id=$1 AND v.project_id=$2 AND v.issue_id=$3 AND v.deleted_at IS NULL ORDER BY v.created_at DESC,v.id DESC LIMIT $4 OFFSET $5")).bind(p.workspace_id()).bind(project).bind(issue).bind(size).bind(offset).fetch_all(&st.db).await?;
+    let next = offset.saturating_add(size) < total;
+    Ok(Json(
+        serde_json::json!({"prev_cursor":format!("{size}:{}:0",page-1),"cursor":format!("{size}:{page}:0"),"next_cursor":if next { Some(format!("{size}:{}:0",page+1)) } else { None },"prev_page_results":page>0,"next_page_results":next,"page_count":results.len(),"total_results":total,"total_pages":(total+size-1)/size,"results":results}),
+    ))
+}
+
+async fn issue_versions(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(path): Path<IssuePath>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    versions(st, user, path, q, false).await
+}
+async fn description_versions(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(path): Path<IssuePath>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    versions(st, user, path, q, true).await
+}
+
+async fn version(
+    st: AppState,
+    user: CurrentUser,
+    (slug, project, issue, id): CommentPath,
+    description: bool,
+) -> ApiResult {
+    let p = visible_issue(&st, &user, &slug, project, issue).await?;
+    let table = if description {
+        "issue_description_versions"
+    } else {
+        "issue_versions"
+    };
+    let excluded = if description {
+        "'deleted_at'"
+    } else {
+        "'deleted_at'-'properties'-'activity_id'"
+    };
+    let sql = format!(
+        "SELECT (to_jsonb(v)-{excluded}-'workspace_id'-'project_id'-'issue_id'-'owned_by_id'-'created_by_id'-'updated_by_id') || {VERSION_SUMMARY} FROM {table} v WHERE v.workspace_id=$1 AND v.project_id=$2 AND v.issue_id=$3 AND v.id=$4 AND v.deleted_at IS NULL"
+    );
+    json_row(
+        sqlx::query_scalar(&sql)
+            .bind(p.workspace_id())
+            .bind(project)
+            .bind(issue)
+            .bind(id),
+        &st.db,
+    )
+    .await
+}
+async fn issue_version(State(st): State<AppState>, user: CurrentUser, Path(path): Path<CommentPath>) -> ApiResult {
+    version(st, user, path, false).await
+}
+async fn description_version(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(path): Path<CommentPath>,
+) -> ApiResult {
+    version(st, user, path, true).await
+}
 
 async fn search_issues(
     State(st): State<AppState>,
