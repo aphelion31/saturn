@@ -943,18 +943,40 @@ async fn update(
         Some(_) => return Err(ApiError::bad_body(json!({"description_html": ["Invalid HTML."]}))),
     };
     let mut tx = st.db.begin().await?;
-    let exists: bool = sqlx::query_scalar(&format!(
-        "SELECT EXISTS (SELECT 1 FROM issues i WHERE i.id = $1 AND i.project_id = $2 AND i.workspace_id = $3 AND i.deleted_at IS NULL AND {ACTIVE} AND (NOT $4 OR i.created_by_id = $5))"
+    let old: Option<(Option<chrono::NaiveDate>, Option<chrono::NaiveDate>)> = sqlx::query_as(&format!(
+        "SELECT i.start_date, i.target_date FROM issues i WHERE i.id = $1 AND i.project_id = $2 AND i.workspace_id = $3 AND i.deleted_at IS NULL AND {ACTIVE} AND (NOT $4 OR i.created_by_id = $5) FOR UPDATE"
     ))
     .bind(pk)
     .bind(project_id)
     .bind(p.workspace_id())
     .bind(p.restricted_guest())
     .bind(user.id)
-    .fetch_one(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
-    if !exists {
-        return Err(ApiError::not_found());
+    let (old_start, old_target) = old.ok_or_else(ApiError::not_found)?;
+
+    let has_start = b.get("start_date").is_some();
+    let has_target = b.get("target_date").is_some();
+    let start_val = if has_start {
+        opt_date(&b, "start_date")?
+    } else {
+        old_start
+    };
+    let target_val = if has_target {
+        opt_date(&b, "target_date")?
+    } else {
+        old_target
+    };
+    if start_val.zip(target_val).is_some_and(|(s, t)| s > t) {
+        return Err(ApiError::bad("Start date cannot exceed target date"));
+    }
+    if has_start {
+        sqlx::query("UPDATE issues SET start_date = $4, updated_at = now(), updated_by_id = $5 WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL")
+            .bind(pk).bind(project_id).bind(p.workspace_id()).bind(start_val).bind(user.id).execute(&mut *tx).await?;
+    }
+    if has_target {
+        sqlx::query("UPDATE issues SET target_date = $4, updated_at = now(), updated_by_id = $5 WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL")
+            .bind(pk).bind(project_id).bind(p.workspace_id()).bind(target_val).bind(user.id).execute(&mut *tx).await?;
     }
     sqlx::query(
         "UPDATE issues SET name = COALESCE($4, name), priority = COALESCE($5, priority),
