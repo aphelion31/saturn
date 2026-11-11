@@ -83,6 +83,10 @@ pub fn routes() -> Router<AppState> {
             "/api/v1/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/activities/{pk}/",
             get(activity_retrieve),
         )
+        .route("/api/v1/workspaces/{slug}/work-items/search/", get(search))
+        .route("/api/v1/workspaces/{slug}/issues/search/", get(search))
+        .route("/api/v1/workspaces/{slug}/work-items/{identifier}/", get(by_identifier))
+        .route("/api/v1/workspaces/{slug}/issues/{identifier}/", get(by_identifier))
 }
 
 type SubPath = Path<(String, Uuid, Uuid)>;
@@ -805,4 +809,88 @@ fn opt_date(b: &Value, k: &str) -> Result<Option<chrono::NaiveDate>, ApiError> {
                 )
             }),
     }
+}
+
+// ---- lookup and search ----
+
+/// Work item by `{PROJECT_IDENTIFIER}-{SEQUENCE}` in the workspace, as Plane's `WorkspaceIssueAPIEndpoint`.
+/// Restricted guests only resolve work items they created; anything else is 404.
+async fn by_identifier(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, identifier)): Path<(String, String)>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    // Split on the last '-' so project identifiers may not contain one, sequence is digits only.
+    let (project_identifier, seq) = identifier.rsplit_once('-').ok_or_else(ApiError::not_found)?;
+    let seq: i32 = seq.parse().map_err(|_| ApiError::not_found())?;
+    let project_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT p.id FROM projects p JOIN project_members pm ON pm.project_id = p.id AND pm.member_id = $3
+         AND pm.is_active AND pm.deleted_at IS NULL
+         WHERE p.workspace_id = $1 AND p.identifier = $2 AND p.deleted_at IS NULL",
+    )
+    .bind(ws.workspace_id)
+    .bind(project_identifier)
+    .bind(user.id)
+    .fetch_optional(&st.db)
+    .await?;
+    let project_id = project_id.ok_or_else(ApiError::not_found)?;
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let mut sql = format!(
+        "SELECT {ITEM_V1} FROM issues i WHERE i.workspace_id = $1 AND i.project_id = $2 AND i.sequence_id = $3 AND {ACTIVE}"
+    );
+    if p.restricted_guest() {
+        sql.push_str(" AND i.created_by_id = $4");
+    }
+    let q = sqlx::query_scalar(&sql)
+        .bind(ws.workspace_id)
+        .bind(project_id)
+        .bind(seq);
+    let q = if p.restricted_guest() { q.bind(user.id) } else { q };
+    json_row(q, &st.db).await
+}
+
+/// Plane's IssueSearchEndpoint: name ILIKE or `IDENTIFIER-SEQ` match, workspace or one project,
+/// limit default 10, returns `{"issues": [...]}`. Guests see only their own items.
+async fn search(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(slug): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    let Some(term) = q.get("search").map(|v| v.trim()).filter(|v| !v.is_empty()) else {
+        return Ok(Json(json!({"issues": []})));
+    };
+    let limit: i64 = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(10).clamp(1, 100);
+    let project_id = q
+        .get("project_id")
+        .filter(|_| q.get("workspace_search").map(String::as_str) != Some("true"))
+        .map(|v| Uuid::parse_str(v).map_err(|_| ApiError::bad("Invalid project_id")))
+        .transpose()?;
+    // Plane matches a sequence id only when the query has whole integers, else ILIKE on name and identifier.
+    let seq: Option<i32> = term.parse().ok();
+    let rows: Vec<Value> = sqlx::query_scalar(&format!(
+        "SELECT jsonb_build_object('name', i.name, 'id', i.id, 'sequence_id', i.sequence_id,
+            'project_id', i.project_id, 'project__identifier', p.identifier, 'workspace__slug', w.slug)
+         FROM issues i
+         JOIN projects p ON p.id = i.project_id AND p.workspace_id = i.workspace_id AND p.deleted_at IS NULL AND p.archived_at IS NULL
+         JOIN workspaces w ON w.id = i.workspace_id
+         JOIN project_members pm ON pm.project_id = i.project_id AND pm.member_id = $2 AND pm.is_active AND pm.deleted_at IS NULL
+         WHERE i.workspace_id = $1 AND {ACTIVE}
+           AND ($3::uuid IS NULL OR i.project_id = $3)
+           AND (pm.role > 5 OR p.guest_view_all_features OR i.created_by_id = $2)
+           AND (i.name ILIKE '%' || $4 || '%' OR (p.identifier || '-' || i.sequence_id::text) ILIKE '%' || $4 || '%' OR i.sequence_id = $5)
+         ORDER BY i.created_at DESC LIMIT $6"
+    ))
+    .bind(ws.workspace_id)
+    .bind(user.id)
+    .bind(project_id)
+    .bind(term)
+    .bind(seq)
+    .bind(limit)
+    .fetch_all(&st.db)
+    .await?;
+    Ok(Json(json!({"issues": rows})))
 }
