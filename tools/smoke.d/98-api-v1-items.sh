@@ -14,6 +14,13 @@ v1 POST "$V1/" '{"name":"V1 smoke item","priority":"high","description_html":"<p
 ITEM=$(field '.id'); IDENT=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "select p.identifier||'-'||i.sequence_id from issues i join projects p on p.id=i.project_id where i.id='$ITEM'")
 v1 GET "$V1/?per_page=5"
 jq -e '.results and .next_cursor and (has("total_results"))' <<<"$body" >/dev/null
+# 9429: non-positive or non-numeric per_page rejected with 400
+c=$(curl -s -o /dev/null -w '%{http_code}' -H "X-Api-Key: $TOKEN" "$BASE$V1/?per_page=0")
+[[ "$c" == "400" ]] || { echo "✖ per_page=0 -> $c" >&2; exit 1; }
+c=$(curl -s -o /dev/null -w '%{http_code}' -H "X-Api-Key: $TOKEN" "$BASE$V1/?per_page=-5")
+[[ "$c" == "400" ]] || { echo "✖ per_page=-5 -> $c" >&2; exit 1; }
+c=$(curl -s -o /dev/null -w '%{http_code}' -H "X-Api-Key: $TOKEN" "$BASE$V1/?per_page=abc")
+[[ "$c" == "400" ]] || { echo "✖ per_page=abc -> $c" >&2; exit 1; }
 v1 GET "$V1/$ITEM/"
 jq -e '.assignees and .labels and (has("description_json") | not)' <<<"$body" >/dev/null
 v1 PATCH "$V1/$ITEM/" '{"name":"V1 smoke renamed"}'

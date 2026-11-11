@@ -726,6 +726,12 @@ async fn list(
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER, GUEST])?;
+    if let Some(v) = q.get("per_page") {
+        let ok = v.parse::<usize>().ok().is_some_and(|n| (1..=1000).contains(&n));
+        if !ok {
+            return Err(ApiError::bad("Invalid per_page parameter."));
+        }
+    }
     let mut base = Base::new(
         format!("i.project_id = $1 AND i.workspace_id = $2 AND {ACTIVE}"),
         vec![Arg::Uuid(project_id), Arg::Uuid(p.workspace_id())],
