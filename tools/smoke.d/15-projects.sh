@@ -28,7 +28,9 @@ call GET "/api/workspaces/$SLUG/projects/$PROJECT/project-members/me/"
 call GET "/api/workspaces/$SLUG/user-favorite-projects/"
 call POST "/api/workspaces/$SLUG/user-favorite-projects/" '{"project":"'"$PROJECT"'"}'
 call DELETE "/api/workspaces/$SLUG/user-favorite-projects/$PROJECT/"
-call POST "/api/workspaces/$SLUG/projects/" '{"name":"Smoke project '$RANDOM'","identifier":"S'$RANDOM'"}'
+code=$(curl -s -o /dev/null -w '%{http_code}' -b "$jar" -X POST -H 'content-type: application/json' -d '{"name":"Invalid project","identifier":""}' "$BASE/api/workspaces/$SLUG/projects/")
+[[ "$code" == 400 ]] || { echo "✖ invalid project identifier -> $code" >&2; exit 1; }
+call POST "/api/workspaces/$SLUG/projects/" '{"name":"Smoke & project '$RANDOM'","identifier":"S'$RANDOM'"}'
 SMOKE_PROJECT=$(field '.id')
 # Use a unique disposable workspace member with the seed user's password hash.
 SMOKE_USER=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -X -q -v ON_ERROR_STOP=1 -At -v email="$EMAIL" <<< "INSERT INTO users (email, username, password, display_name) SELECT gen_random_uuid()::text || '@smoke.invalid', gen_random_uuid()::text, password, 'Smoke member' FROM users WHERE email=:'email' RETURNING id")
