@@ -1559,6 +1559,7 @@ async fn public_mark_uploaded(
     let row: Option<(Uuid,)> = sqlx::query_as(
         "SELECT id FROM file_assets
          WHERE id = $1 AND workspace_id = $2 AND project_id = $3
+           AND entity_type = 'COMMENT_DESCRIPTION'
            AND created_by_id = $4 AND deleted_at IS NULL",
     )
     .bind(asset_id)
@@ -1593,6 +1594,7 @@ async fn public_delete_asset(
     let row: Option<(Uuid,)> = sqlx::query_as(
         "SELECT id FROM file_assets
          WHERE id = $1 AND workspace_id = $2 AND project_id = $3
+           AND entity_type IN ('ISSUE_DESCRIPTION', 'COMMENT_DESCRIPTION')
            AND created_by_id = $4 AND deleted_at IS NULL",
     )
     .bind(asset_id)
@@ -1620,6 +1622,7 @@ async fn public_restore_asset(
     let row: Option<(Uuid,)> = sqlx::query_as(
         "SELECT id FROM file_assets
          WHERE id = $1 AND workspace_id = $2 AND project_id = $3
+           AND entity_type IN ('ISSUE_DESCRIPTION', 'COMMENT_DESCRIPTION')
            AND created_by_id = $4",
     )
     .bind(asset_id)

@@ -42,6 +42,18 @@ got=$(curl -s "$BASE/api/public/assets/v2/anchor/$ANCHOR/$PUB_ASSET_ID/")
 [[ "$got" == "public image data" ]] || { echo "✖ public download returned: $got" >&2; exit 1; }
 echo "✔ public asset download roundtrip -> 200"
 
+# Plane #10099: public Space asset writes scoped to the uploader
+other_jar=$(mktemp)
+curl -s -c "$other_jar" -d "email=other@saturn.dev&password=Saturn-rocks-2026" "$BASE/auth/sign-in/" >/dev/null
+code=$(curl -s -b "$other_jar" -o /dev/null -w '%{http_code}' -X PATCH "$BASE/api/public/assets/v2/anchor/$ANCHOR/$PUB_ASSET_ID/")
+[[ "$code" == 404 ]] || { echo "✖ other user PATCH public asset -> $code (expected 404)" >&2; exit 1; }
+code=$(curl -s -b "$other_jar" -o /dev/null -w '%{http_code}' -X DELETE "$BASE/api/public/assets/v2/anchor/$ANCHOR/$PUB_ASSET_ID/")
+[[ "$code" == 404 ]] || { echo "✖ other user DELETE public asset -> $code (expected 404)" >&2; exit 1; }
+code=$(curl -s -b "$other_jar" -o /dev/null -w '%{http_code}' -X POST "$BASE/api/public/assets/v2/anchor/$ANCHOR/restore/$PUB_ASSET_ID/")
+[[ "$code" == 404 ]] || { echo "✖ other user restore public asset -> $code (expected 404)" >&2; exit 1; }
+rm -f "$other_jar"
+echo "✔ Plane #10099: public Space asset writes scoped to uploader"
+
 if [[ -n "${PUB_COMMENT_ID:-}" ]]; then
   call POST "/api/public/assets/v2/anchor/$ANCHOR/$PUB_COMMENT_ID/bulk/" "{\"asset_ids\":[\"$PUB_ASSET_ID\"]}"
   echo "✔ public asset bulk bind -> 204"
