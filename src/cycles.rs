@@ -736,11 +736,11 @@ async fn progress(
             'completed_issues', count(*) FILTER (WHERE s.group = 'completed'),
             'total_issues', count(*))
          FROM cycle_issues ci
-         JOIN issues i ON i.id = ci.issue_id AND i.deleted_at IS NULL AND i.archived_at IS NULL AND NOT i.is_draft
-         LEFT JOIN states s ON s.id = i.state_id
+         JOIN issues i ON i.id = ci.issue_id AND i.project_id = $2 AND i.workspace_id = $3 AND i.deleted_at IS NULL AND i.archived_at IS NULL AND NOT i.is_draft
+         LEFT JOIN states s ON s.id = i.state_id AND s.project_id = $2 AND s.workspace_id = $3 AND s.deleted_at IS NULL
          LEFT JOIN LATERAL (SELECT CASE WHEN e.type = 'points' THEN NULLIF(ep.value, '')::float8 END AS v
             FROM estimate_points ep JOIN estimates e ON e.id = ep.estimate_id
-            WHERE ep.id = i.estimate_point_id AND ep.deleted_at IS NULL) pt ON true
+            WHERE ep.id = i.estimate_point_id AND ep.project_id = $2 AND ep.workspace_id = $3 AND ep.deleted_at IS NULL AND e.project_id = $2 AND e.workspace_id = $3 AND e.deleted_at IS NULL) pt ON true
          WHERE ci.cycle_id = $1 AND ci.project_id = $2 AND ci.workspace_id = $3 AND ci.deleted_at IS NULL",
     )
     .bind(pk)
