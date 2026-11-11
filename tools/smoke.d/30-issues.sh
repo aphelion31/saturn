@@ -32,3 +32,7 @@ call DELETE "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/archive/"
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/"
 call DELETE "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/"
 call DELETE "/api/workspaces/$SLUG/projects/$PROJECT/bulk-delete-issues/" "{\"issue_ids\":[\"$RELATED\"]}"
+for per_page in 0 -1 nope; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' -b "$jar" "$BASE/api/workspaces/$SLUG/projects/$PROJECT/issues/?per_page=$per_page")
+  [[ "$code" == 400 ]] || { echo "✖ per_page=$per_page -> $code, expected 400" >&2; exit 1; }
+done
