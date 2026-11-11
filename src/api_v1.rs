@@ -84,6 +84,38 @@ pub fn routes() -> Router<AppState> {
             "/api/v1/workspaces/{slug}/projects/{project_id}/cycles/{cycle_id}/transfer-issues/",
             axum::routing::post(v1_transfer_cycle_issues),
         )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/modules/",
+            get(v1_modules).post(v1_create_module),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/modules-lite/",
+            get(v1_modules_lite),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/modules/{pk}/",
+            get(v1_module).patch(v1_update_module).delete(v1_delete_module),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/modules/{pk}/archive/",
+            axum::routing::post(v1_archive_module),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/archived-modules/",
+            get(v1_archived_modules),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/archived-modules/{pk}/unarchive/",
+            axum::routing::delete(v1_unarchive_module),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/modules/{module_id}/module-issues/",
+            get(v1_module_issues).post(v1_add_module_issues),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/modules/{module_id}/module-issues/{issue_id}/",
+            axum::routing::delete(v1_delete_module_issue),
+        )
 }
 
 const CYCLE_JSON: &str = "(to_jsonb(c)-'workspace_id'-'project_id'-'owned_by_id'-'created_by_id'-'updated_by_id') || jsonb_build_object('workspace',c.workspace_id,'project',c.project_id,'owned_by',c.owned_by_id,'created_by',c.created_by_id,'updated_by',c.updated_by_id)";
@@ -1228,6 +1260,582 @@ async fn v1_transfer_cycle_issues(
 
     tx.commit().await?;
     Ok(Json(json!({"message": "Success"})))
+}
+
+const MODULE_LITE_JSON: &str = "(to_jsonb(m)-'workspace_id'-'project_id'-'lead_id'-'created_by_id'-'updated_by_id'-'deleted_at') || jsonb_build_object('workspace',m.workspace_id,'project',m.project_id,'lead',m.lead_id,'created_by',m.created_by_id,'updated_by',m.updated_by_id,'members',COALESCE((SELECT jsonb_agg(mm.member_id) FROM module_members mm WHERE mm.module_id=m.id AND mm.deleted_at IS NULL),'[]'::jsonb))";
+
+const MODULE_DETAIL_JSON: &str = "(to_jsonb(m)-'workspace_id'-'project_id'-'lead_id'-'created_by_id'-'updated_by_id'-'deleted_at') || jsonb_build_object('workspace',m.workspace_id,'project',m.project_id,'lead',m.lead_id,'created_by',m.created_by_id,'updated_by',m.updated_by_id,'members',COALESCE((SELECT jsonb_agg(mm.member_id) FROM module_members mm WHERE mm.module_id=m.id AND mm.deleted_at IS NULL),'[]'::jsonb),'total_issues',COALESCE(k.total,0),'completed_issues',COALESCE(k.completed,0),'cancelled_issues',COALESCE(k.cancelled,0),'started_issues',COALESCE(k.started,0),'unstarted_issues',COALESCE(k.unstarted,0),'backlog_issues',COALESCE(k.backlog,0))";
+
+const MODULE_COUNTS_FROM: &str = "LEFT JOIN LATERAL (
+    SELECT count(DISTINCT mi.issue_id) AS total,
+        count(DISTINCT mi.issue_id) FILTER (WHERE s.group = 'backlog') AS backlog,
+        count(DISTINCT mi.issue_id) FILTER (WHERE s.group = 'unstarted') AS unstarted,
+        count(DISTINCT mi.issue_id) FILTER (WHERE s.group = 'started') AS started,
+        count(DISTINCT mi.issue_id) FILTER (WHERE s.group = 'completed') AS completed,
+        count(DISTINCT mi.issue_id) FILTER (WHERE s.group = 'cancelled') AS cancelled
+    FROM module_issues mi
+    JOIN issues i ON i.id = mi.issue_id AND i.deleted_at IS NULL AND i.archived_at IS NULL AND NOT i.is_draft
+    LEFT JOIN states s ON s.id = i.state_id
+    WHERE mi.module_id = m.id AND mi.deleted_at IS NULL
+) k ON true";
+
+const MODULE_ISSUE_JSON: &str = "(to_jsonb(mi)-'workspace_id'-'project_id'-'module_id'-'issue_id'-'created_by_id'-'updated_by_id'-'deleted_at') || jsonb_build_object('workspace',mi.workspace_id,'project',mi.project_id,'module',mi.module_id,'issue',mi.issue_id,'created_by',mi.created_by_id,'updated_by',mi.updated_by_id,'sub_issues_count',(SELECT count(*) FROM issues sub WHERE sub.parent_id=mi.issue_id AND sub.deleted_at IS NULL AND sub.archived_at IS NULL AND NOT sub.is_draft))";
+
+const MODULE_ISSUE_ITEM_JSON: &str = "(to_jsonb(i)-'workspace_id'-'project_id'-'created_by_id'-'updated_by_id'-'state_id'-'parent_id'-'estimate_point_id'-'deleted_at') || jsonb_build_object('workspace',i.workspace_id,'project',i.project_id,'created_by',i.created_by_id,'updated_by',i.updated_by_id,'state',i.state_id,'parent',i.parent_id,'estimate_point',i.estimate_point_id,'sub_issues_count',(SELECT count(*) FROM issues sub WHERE sub.parent_id=i.id AND sub.deleted_at IS NULL AND sub.archived_at IS NULL AND NOT sub.is_draft),'bridge_id',mi.id,'assignees',COALESCE((SELECT jsonb_agg(ia.assignee_id) FROM issue_assignees ia WHERE ia.issue_id=i.id AND ia.deleted_at IS NULL),'[]'::jsonb),'labels',COALESCE((SELECT jsonb_agg(il.label_id) FROM issue_labels il WHERE il.issue_id=i.id AND il.deleted_at IS NULL),'[]'::jsonb))";
+
+async fn v1_modules(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let rows: Vec<Value> = sqlx::query_scalar(&format!(
+        "SELECT {MODULE_DETAIL_JSON} FROM modules m {MODULE_COUNTS_FROM}
+         JOIN projects p ON p.id = m.project_id AND p.workspace_id = m.workspace_id
+         WHERE m.project_id = $1 AND m.workspace_id = $2 AND m.deleted_at IS NULL AND m.archived_at IS NULL
+           AND p.deleted_at IS NULL AND p.archived_at IS NULL
+         ORDER BY m.created_at DESC, m.id"
+    ))
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_all(&st.db)
+    .await?;
+    paginate(rows, &q)
+}
+
+async fn v1_modules_lite(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let rows: Vec<Value> = sqlx::query_scalar(&format!(
+        "SELECT {MODULE_LITE_JSON} FROM modules m
+         JOIN projects p ON p.id = m.project_id AND p.workspace_id = m.workspace_id
+         WHERE m.project_id = $1 AND m.workspace_id = $2 AND m.deleted_at IS NULL AND m.archived_at IS NULL
+           AND p.deleted_at IS NULL AND p.archived_at IS NULL
+         ORDER BY m.created_at DESC, m.id"
+    ))
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_all(&st.db)
+    .await?;
+    paginate(rows, &q)
+}
+
+async fn v1_module(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, mid)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    json_row(
+        sqlx::query_scalar(&format!(
+            "SELECT {MODULE_DETAIL_JSON} FROM modules m {MODULE_COUNTS_FROM}
+             WHERE m.id = $1 AND m.project_id = $2 AND m.workspace_id = $3 AND m.deleted_at IS NULL AND m.archived_at IS NULL"
+        ))
+        .bind(mid)
+        .bind(pid)
+        .bind(p.workspace_id()),
+        &st.db,
+    )
+    .await
+}
+
+async fn v1_create_module(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+
+    let name = s(&b, "name")
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.len() <= 255)
+        .ok_or_else(|| ApiError::bad("Invalid name"))?;
+
+    let dup: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM modules WHERE name = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL",
+    )
+    .bind(name)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?;
+    if let Some(dup_id) = dup {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "id": dup_id.to_string(),
+                "code": "MODULE_NAME_ALREADY_EXISTS",
+                "error": "Module with this name already exists",
+                "message": "Module with this name already exists"
+            }),
+        ));
+    }
+
+    if let (Some(ext_id), Some(ext_src)) = (s(&b, "external_id"), s(&b, "external_source")) {
+        let exists: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM modules WHERE project_id=$1 AND workspace_id=$2 AND external_id=$3 AND external_source=$4 AND deleted_at IS NULL"
+        )
+        .bind(pid).bind(p.workspace_id()).bind(ext_id).bind(ext_src).fetch_optional(&st.db).await?;
+        if let Some(existing_id) = exists {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                json!({
+                    "error": "Module with the same external id and external source already exists",
+                    "id": existing_id.to_string()
+                }),
+            ));
+        }
+    }
+
+    let start = parse_day(&b, "start_date")?;
+    let target = parse_day(&b, "target_date")?;
+    if let (Some(s), Some(e)) = (&start, &target) {
+        if s > e {
+            return Err(ApiError::bad("Start date cannot exceed target date"));
+        }
+    }
+
+    let lead_id = b
+        .get("lead")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok());
+    let status = s(&b, "status").unwrap_or("planned");
+
+    let mut tx = st.db.begin().await?;
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO modules (id, name, description, start_date, target_date, status, lead_id, project_id, workspace_id,
+            created_by_id, updated_by_id, view_props, logo_props, external_source, external_id, sort_order)
+         VALUES (gen_random_uuid(), $1, COALESCE($2, ''), $3::date, $4::date, $5, $6, $7, $8, $9, $9,
+            COALESCE($10::jsonb, '{}'::jsonb), COALESCE($11::jsonb, '{}'::jsonb), $12, $13,
+            COALESCE($14::float8, (SELECT COALESCE(max(sort_order), 0) + 10000 FROM modules WHERE project_id = $7), 65535))
+         RETURNING id",
+    )
+    .bind(name)
+    .bind(s(&b, "description"))
+    .bind(start)
+    .bind(target)
+    .bind(status)
+    .bind(lead_id)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .bind(user.id)
+    .bind(b.get("view_props").filter(|v| !v.is_null()))
+    .bind(b.get("logo_props").filter(|v| !v.is_null()))
+    .bind(s(&b, "external_source"))
+    .bind(s(&b, "external_id"))
+    .bind(b.get("sort_order").and_then(Value::as_f64))
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if let Some(members) = b.get("members").and_then(Value::as_array) {
+        let member_ids: Vec<Uuid> = members
+            .iter()
+            .filter_map(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok()))
+            .collect();
+        for m in member_ids {
+            sqlx::query(
+                "INSERT INTO module_members (id, module_id, member_id, project_id, workspace_id, created_by_id, updated_by_id)
+                 VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $5) ON CONFLICT DO NOTHING"
+            )
+            .bind(id).bind(m).bind(pid).bind(p.workspace_id()).bind(user.id).execute(&mut *tx).await?;
+        }
+    }
+    tx.commit().await?;
+
+    let Json(val) = v1_module(State(st), user, Path((slug, pid, id))).await?;
+    created(val)
+}
+
+async fn v1_update_module(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, mid)): Path<(String, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+
+    let cur: (Option<DateTime<Utc>>, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT m.archived_at, m.name, m.external_id, m.external_source FROM modules m
+         WHERE m.id = $1 AND m.project_id = $2 AND m.workspace_id = $3 AND m.deleted_at IS NULL",
+    )
+    .bind(mid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?
+    .ok_or_else(ApiError::not_found)?;
+
+    if cur.0.is_some() {
+        return Err(ApiError::bad("Archived module cannot be edited"));
+    }
+
+    if let Some(n) = s(&b, "name").map(str::trim) {
+        if n.is_empty() || n.len() > 255 {
+            return Err(ApiError::bad("Invalid name"));
+        }
+        if Some(n) != cur.1.as_deref() {
+            let dup: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM modules WHERE name = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL AND id <> $4"
+            )
+            .bind(n).bind(pid).bind(p.workspace_id()).bind(mid).fetch_optional(&st.db).await?;
+            if dup.is_some() {
+                return Err(ApiError::bad("Module with this name already exists"));
+            }
+        }
+    }
+
+    if let Some(ext_id) = s(&b, "external_id") {
+        let ext_src = s(&b, "external_source").or(cur.3.as_deref());
+        if cur.2.as_deref() != Some(ext_id) {
+            let conflict: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM modules WHERE project_id=$1 AND workspace_id=$2 AND external_id=$3 AND external_source=$4 AND deleted_at IS NULL AND id <> $5"
+            )
+            .bind(pid).bind(p.workspace_id()).bind(ext_id).bind(ext_src).bind(mid).fetch_optional(&st.db).await?;
+            if let Some(conflict_id) = conflict {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    json!({
+                        "error": "Module with the same external id and external source already exists",
+                        "id": conflict_id.to_string()
+                    }),
+                ));
+            }
+        }
+    }
+
+    let has_start = b.get("start_date").is_some();
+    let has_target = b.get("target_date").is_some();
+    let start = parse_day(&b, "start_date")?;
+    let target = parse_day(&b, "target_date")?;
+    if has_start && has_target {
+        if let (Some(s), Some(e)) = (&start, &target) {
+            if s > e {
+                return Err(ApiError::bad("Start date cannot exceed target date"));
+            }
+        }
+    }
+
+    let has_lead = b.get("lead").is_some();
+    let lead_id = b
+        .get("lead")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok());
+
+    let mut tx = st.db.begin().await?;
+    let res = sqlx::query(
+        "UPDATE modules SET
+            name = COALESCE($4, name),
+            description = COALESCE($5, description),
+            start_date = CASE WHEN $6 THEN $7::date ELSE start_date END,
+            target_date = CASE WHEN $8 THEN $9::date ELSE target_date END,
+            status = COALESCE($10, status),
+            lead_id = CASE WHEN $11 THEN $12 ELSE lead_id END,
+            view_props = COALESCE($13::jsonb, view_props),
+            logo_props = COALESCE($14::jsonb, logo_props),
+            external_source = COALESCE($15, external_source),
+            external_id = COALESCE($16, external_id),
+            sort_order = COALESCE($17::float8, sort_order),
+            updated_by_id = $3, updated_at = now()
+         WHERE id = $1 AND project_id = $2 AND workspace_id = $18
+           AND deleted_at IS NULL AND archived_at IS NULL",
+    )
+    .bind(mid)
+    .bind(pid)
+    .bind(user.id)
+    .bind(s(&b, "name"))
+    .bind(s(&b, "description"))
+    .bind(has_start)
+    .bind(start)
+    .bind(has_target)
+    .bind(target)
+    .bind(s(&b, "status"))
+    .bind(has_lead)
+    .bind(lead_id)
+    .bind(b.get("view_props").filter(|v| !v.is_null()))
+    .bind(b.get("logo_props").filter(|v| !v.is_null()))
+    .bind(s(&b, "external_source"))
+    .bind(s(&b, "external_id"))
+    .bind(b.get("sort_order").and_then(Value::as_f64))
+    .bind(p.workspace_id())
+    .execute(&mut *tx)
+    .await?;
+
+    if res.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+
+    if let Some(members) = b.get("members").and_then(Value::as_array) {
+        sqlx::query("DELETE FROM module_members WHERE module_id = $1")
+            .bind(mid)
+            .execute(&mut *tx)
+            .await?;
+        let member_ids: Vec<Uuid> = members
+            .iter()
+            .filter_map(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok()))
+            .collect();
+        for m in member_ids {
+            sqlx::query(
+                "INSERT INTO module_members (id, module_id, member_id, project_id, workspace_id, created_by_id, updated_by_id)
+                 VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $5) ON CONFLICT DO NOTHING"
+            )
+            .bind(mid).bind(m).bind(pid).bind(p.workspace_id()).bind(user.id).execute(&mut *tx).await?;
+        }
+    }
+    tx.commit().await?;
+
+    v1_module(State(st), user, Path((slug, pid, mid))).await
+}
+
+async fn v1_delete_module(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, mid)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    let (created_by_id,): (Option<Uuid>,) = sqlx::query_as(
+        "SELECT created_by_id FROM modules WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+    )
+    .bind(mid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?
+    .ok_or_else(ApiError::not_found)?;
+
+    if !p.is_admin() && created_by_id != Some(user.id) {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            json!({"error": "Only admin or creator can delete the module"}),
+        ));
+    }
+
+    let mut tx = st.db.begin().await?;
+    sqlx::query(
+        "UPDATE modules SET deleted_at=now(), updated_at=now(), updated_by_id=$2 WHERE id=$1 AND deleted_at IS NULL",
+    )
+    .bind(mid)
+    .bind(user.id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE module_issues SET deleted_at=now(), updated_at=now(), updated_by_id=$2 WHERE module_id=$1 AND deleted_at IS NULL")
+        .bind(mid).bind(user.id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE user_favorites SET deleted_at=now() WHERE entity_type='module' AND entity_identifier=$1 AND project_id=$2 AND deleted_at IS NULL")
+        .bind(mid).bind(pid).execute(&mut *tx).await?;
+    tx.commit().await?;
+    no_content()
+}
+
+async fn v1_archive_module(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, mid)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+
+    let (status,): (String,) = sqlx::query_as(
+        "SELECT status FROM modules WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+    )
+    .bind(mid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?
+    .ok_or_else(ApiError::not_found)?;
+
+    if !["completed", "cancelled"].contains(&status.as_str()) {
+        return Err(ApiError::bad("Only completed or cancelled modules can be archived"));
+    }
+
+    let mut tx = st.db.begin().await?;
+    sqlx::query(
+        "UPDATE modules SET archived_at=now(), updated_at=now(), updated_by_id=$2 WHERE id=$1 AND deleted_at IS NULL",
+    )
+    .bind(mid)
+    .bind(user.id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE user_favorites SET deleted_at=now() WHERE entity_type='module' AND entity_identifier=$1 AND project_id=$2 AND deleted_at IS NULL")
+        .bind(mid).bind(pid).execute(&mut *tx).await?;
+    tx.commit().await?;
+    no_content()
+}
+
+async fn v1_archived_modules(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let rows: Vec<Value> = sqlx::query_scalar(&format!(
+        "SELECT {MODULE_DETAIL_JSON} FROM modules m {MODULE_COUNTS_FROM}
+         WHERE m.project_id=$1 AND m.workspace_id=$2 AND m.deleted_at IS NULL AND m.archived_at IS NOT NULL
+         ORDER BY m.created_at DESC, m.id"
+    ))
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_all(&st.db)
+    .await?;
+    paginate(rows, &q)
+}
+
+async fn v1_unarchive_module(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, mid)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let res = sqlx::query(
+        "UPDATE modules SET archived_at=NULL, updated_at=now(), updated_by_id=$4
+         WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL AND archived_at IS NOT NULL",
+    )
+    .bind(mid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
+    if res.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
+}
+
+async fn v1_module_issues(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, mid)): Path<(String, Uuid, Uuid)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM modules WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL)",
+    )
+    .bind(mid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_one(&st.db)
+    .await?;
+    if !exists {
+        return Err(ApiError::not_found());
+    }
+
+    let rows: Vec<Value> = sqlx::query_scalar(&format!(
+        "SELECT {MODULE_ISSUE_ITEM_JSON} FROM issues i
+         JOIN module_issues mi ON mi.issue_id = i.id AND mi.module_id = $1 AND mi.deleted_at IS NULL
+         WHERE i.project_id = $2 AND i.workspace_id = $3 AND i.deleted_at IS NULL
+           AND (NOT $4 OR i.created_by_id = $5)
+         ORDER BY i.created_at DESC, i.id"
+    ))
+    .bind(mid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .bind(p.restricted_guest())
+    .bind(user.id)
+    .fetch_all(&st.db)
+    .await?;
+    paginate(rows, &q)
+}
+
+async fn v1_add_module_issues(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, mid)): Path<(String, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+
+    let issues: Vec<Uuid> = b
+        .get("issues")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if issues.is_empty() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            json!({"error": "Issues are required"}),
+        ));
+    }
+
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM modules WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL)",
+    )
+    .bind(mid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_one(&st.db)
+    .await?;
+    if !exists {
+        return Err(ApiError::not_found());
+    }
+
+    let mut tx = st.db.begin().await?;
+    sqlx::query(
+        "INSERT INTO module_issues (id, module_id, issue_id, project_id, workspace_id, created_by_id, updated_by_id)
+         SELECT gen_random_uuid(), $1, i.id, i.project_id, i.workspace_id, $2, $2
+         FROM issues i
+         WHERE i.id = ANY($3) AND i.project_id = $4 AND i.workspace_id = $5 AND i.deleted_at IS NULL
+           AND NOT EXISTS (SELECT 1 FROM module_issues mi WHERE mi.issue_id = i.id AND mi.module_id = $1 AND mi.deleted_at IS NULL)
+         ON CONFLICT DO NOTHING"
+    )
+    .bind(mid).bind(user.id).bind(&issues).bind(pid).bind(p.workspace_id()).execute(&mut *tx).await?;
+    tx.commit().await?;
+
+    let rows: Vec<Value> = sqlx::query_scalar(&format!(
+        "SELECT {MODULE_ISSUE_JSON} FROM module_issues mi
+         WHERE mi.module_id = $1 AND mi.project_id = $2 AND mi.workspace_id = $3 AND mi.deleted_at IS NULL
+         ORDER BY mi.created_at DESC, mi.id"
+    ))
+    .bind(mid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .fetch_all(&st.db)
+    .await?;
+    Ok(Json(Value::Array(rows)))
+}
+
+async fn v1_delete_module_issue(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, mid, iid)): Path<(String, Uuid, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let res = sqlx::query(
+        "UPDATE module_issues SET deleted_at=now(), updated_at=now(), updated_by_id=$5
+         WHERE module_id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND deleted_at IS NULL",
+    )
+    .bind(mid)
+    .bind(iid)
+    .bind(pid)
+    .bind(p.workspace_id())
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
+    if res.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
 }
 
 #[cfg(test)]
