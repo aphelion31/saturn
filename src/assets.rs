@@ -7,7 +7,7 @@
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Multipart, Path, State},
+    extract::{DefaultBodyLimit, FromRequest, Multipart, Path, State},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -21,6 +21,27 @@ use crate::common::*;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        // Legacy file-assets
+        .route(
+            "/api/users/file-assets/",
+            get(legacy_list_user_assets).post(legacy_upload_user_asset),
+        )
+        .route(
+            "/api/users/file-assets/{pk}/",
+            get(legacy_get_user_asset).delete(legacy_delete_user_asset),
+        )
+        .route(
+            "/api/workspaces/file-assets/{workspace_id}/{asset_key}/",
+            get(legacy_get_workspace_asset).delete(legacy_delete_workspace_asset),
+        )
+        .route(
+            "/api/workspaces/file-assets/{workspace_id}/{asset_key}/restore/",
+            post(legacy_restore_workspace_asset),
+        )
+        .route(
+            "/api/workspaces/{slug}/file-assets/",
+            get(legacy_list_workspace_assets).post(legacy_create_workspace_asset),
+        )
         .route("/api/assets/v2/workspaces/{slug}/check/{asset_id}/", get(check_asset))
         .route(
             "/api/assets/v2/workspaces/{slug}/download/{asset_id}/",
@@ -995,6 +1016,534 @@ async fn delete_attachment(
     let (_, entity_type, id) = owned_asset(&st, &p.ws, asset_id, Some(project_id)).await?;
     soft_delete(&st, id, &entity_type).await?;
     no_content()
+}
+
+// --- legacy FileAsset endpoints ---
+
+pub(crate) const FILE_ASSET_JSON: &str = "(to_jsonb(f) - 'workspace_id' - 'project_id' - 'issue_id' - 'created_by_id' - 'updated_by_id' - 'comment_id' - 'page_id' - 'user_id' - 'draft_issue_id')
+|| jsonb_build_object(
+    'workspace', f.workspace_id,
+    'project', f.project_id,
+    'issue', f.issue_id,
+    'created_by', f.created_by_id,
+    'updated_by', f.updated_by_id,
+    'comment', f.comment_id,
+    'page', f.page_id,
+    'user', f.user_id,
+    'draft_issue', f.draft_issue_id,
+    'asset_url', CASE
+        WHEN f.entity_type IN ('WORKSPACE_LOGO', 'USER_AVATAR', 'USER_COVER', 'PROJECT_COVER')
+            THEN '/api/assets/v2/static/' || f.id || '/'
+        WHEN f.workspace_id IS NOT NULL AND f.project_id IS NOT NULL AND f.entity_type = 'ISSUE_ATTACHMENT' AND w.slug IS NOT NULL
+            THEN '/api/assets/v2/workspaces/' || w.slug || '/projects/' || f.project_id || '/issues/' || f.issue_id || '/attachments/' || f.id || '/'
+        WHEN f.workspace_id IS NOT NULL AND f.project_id IS NOT NULL AND w.slug IS NOT NULL
+            THEN '/api/assets/v2/workspaces/' || w.slug || '/projects/' || f.project_id || '/' || f.id || '/'
+        WHEN f.workspace_id IS NOT NULL AND w.slug IS NOT NULL
+            THEN '/api/assets/v2/workspaces/' || w.slug || '/' || f.id || '/'
+        ELSE NULL
+    END
+)";
+
+pub(crate) async fn require_workspace_by_id(
+    db: &sqlx::PgPool,
+    user: &CurrentUser,
+    workspace_id: Uuid,
+) -> Result<WorkspaceCtx, ApiError> {
+    let row: Option<(String, i16)> = sqlx::query_as(
+        "SELECT w.slug, m.role FROM workspaces w
+         JOIN workspace_members m ON m.workspace_id = w.id AND m.member_id = $2 AND m.is_active AND m.deleted_at IS NULL
+         WHERE w.id = $1 AND w.deleted_at IS NULL",
+    )
+    .bind(workspace_id)
+    .bind(user.id)
+    .fetch_optional(db)
+    .await?;
+    let (slug, role) = row.ok_or_else(ApiError::forbidden)?;
+    Ok(WorkspaceCtx {
+        workspace_id,
+        slug,
+        user_id: user.id,
+        role,
+    })
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+struct PermAsset {
+    id: Uuid,
+    workspace_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    entity_type: Option<String>,
+    created_by_id: Option<Uuid>,
+}
+
+async fn can_modify_file_asset(
+    db: &sqlx::PgPool,
+    user: &CurrentUser,
+    workspace_role: i16,
+    asset: &PermAsset,
+) -> Result<bool, ApiError> {
+    if asset.entity_type.as_deref() == Some("WORKSPACE_LOGO") {
+        return Ok(workspace_role >= ADMIN);
+    }
+    let mut role = Some(workspace_role);
+    if let (Some(ws_id), Some(project_id)) = (asset.workspace_id, asset.project_id) {
+        let pm_role: Option<(i16,)> = sqlx::query_as(
+            "SELECT role FROM project_members
+             WHERE workspace_id = $1 AND project_id = $2 AND member_id = $3 AND is_active AND deleted_at IS NULL",
+        )
+        .bind(ws_id)
+        .bind(project_id)
+        .bind(user.id)
+        .fetch_optional(db)
+        .await?;
+        role = match pm_role {
+            Some(_) if workspace_role >= ADMIN => Some(ADMIN),
+            Some((r,)) => Some(r),
+            None => None,
+        };
+        if asset.entity_type.as_deref() == Some("PROJECT_COVER") {
+            return Ok(role == Some(ADMIN));
+        }
+    }
+    if asset.created_by_id == Some(user.id) && role.is_some() {
+        return Ok(true);
+    }
+    if asset.entity_type.as_deref() == Some("ISSUE_ATTACHMENT") {
+        return Ok(role == Some(ADMIN));
+    }
+    Ok(role.map_or(false, |r| r >= MEMBER))
+}
+
+/// GET /api/users/file-assets/
+async fn legacy_list_user_assets(State(st): State<AppState>, user: CurrentUser) -> ApiResult {
+    json_rows(
+        sqlx::query_scalar(&format!(
+            "SELECT {FILE_ASSET_JSON} FROM file_assets f
+             LEFT JOIN workspaces w ON w.id = f.workspace_id
+             WHERE (f.user_id = $1 OR (f.user_id IS NULL AND f.created_by_id = $1))
+               AND f.entity_type IN ('USER_AVATAR', 'USER_COVER')
+               AND f.deleted_at IS NULL
+             ORDER BY f.created_at DESC"
+        ))
+        .bind(user.id),
+        &st.db,
+    )
+    .await
+}
+
+/// POST /api/users/file-assets/ (multipart upload)
+async fn legacy_upload_user_asset(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    mut form: Multipart,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let mut file_data: Option<(String, String, Vec<u8>)> = None;
+    let mut entity_type = "USER_AVATAR".to_string();
+
+    while let Some(field) = form
+        .next_field()
+        .await
+        .map_err(|_| ApiError::bad("Invalid multipart body"))?
+    {
+        match field.name() {
+            Some("entity_type") => {
+                let val = field.text().await.map_err(|_| ApiError::bad("Invalid entity_type"))?;
+                if !matches!(val.as_str(), "USER_AVATAR" | "USER_COVER") {
+                    return Err(ApiError::bad_body(
+                        json!({"error": "Invalid entity type.", "status": false}),
+                    ));
+                }
+                entity_type = val;
+            }
+            Some("asset" | "file") => {
+                let name = sanitize_filename(field.file_name().unwrap_or("unnamed"));
+                let typ = field.content_type().unwrap_or("application/octet-stream").to_string();
+                let mut buf = Vec::new();
+                let mut field = field;
+                while let Some(chunk) = field.chunk().await.map_err(|_| ApiError::bad("Upload interrupted"))? {
+                    if buf.len() + chunk.len() > st.cfg.file_size_limit as usize {
+                        return Err(ApiError::bad("File size exceeds the allowed limit"));
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+                file_data = Some((name, typ, buf));
+            }
+            _ => {}
+        }
+    }
+
+    let (name, typ, data) = file_data.ok_or_else(|| ApiError::bad("Missing file field"))?;
+    let id = Uuid::new_v4();
+    let key = format!("users/{}/{}-{}", user.id, id.simple(), name);
+    let path = disk_path(&st, &key)?;
+    if let Some(dir) = path.parent() {
+        tokio::fs::create_dir_all(dir).await.map_err(io_err)?;
+    }
+    tokio::fs::write(&path, &data).await.map_err(io_err)?;
+
+    let size = data.len() as f64;
+    sqlx::query(
+        "INSERT INTO file_assets (id, attributes, asset, size, user_id, created_by_id, updated_by_id, entity_type, is_uploaded)
+         VALUES ($1, $2, $3, $4, $5, $5, $5, $6, true)",
+    )
+    .bind(id)
+    .bind(json!({"name": name, "type": typ, "size": size}))
+    .bind(&key)
+    .bind(size)
+    .bind(user.id)
+    .bind(&entity_type)
+    .execute(&st.db)
+    .await?;
+
+    let row: Value = sqlx::query_scalar(&format!(
+        "SELECT {FILE_ASSET_JSON} FROM file_assets f
+         LEFT JOIN workspaces w ON w.id = f.workspace_id
+         WHERE f.id = $1"
+    ))
+    .bind(id)
+    .fetch_one(&st.db)
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(row)))
+}
+
+/// Helper to load a user's asset by pk (UUID or asset path). Returns 403 if owned by another user.
+async fn check_user_asset_pk(st: &AppState, user: &CurrentUser, pk: &str) -> Result<(Uuid, Option<String>), ApiError> {
+    if pk.contains("..") || pk.starts_with('/') || pk.contains('\\') {
+        return Err(ApiError::bad("Invalid asset key"));
+    }
+    let parsed_uuid = Uuid::parse_str(pk).ok();
+    let row: Option<(Uuid, Option<Uuid>, Option<Uuid>, Option<String>)> = sqlx::query_as(
+        "SELECT id, created_by_id, user_id, entity_type FROM file_assets
+         WHERE ($1::uuid IS NOT NULL AND id = $1)
+            OR asset = $2
+            OR asset = $3
+            OR asset = $4",
+    )
+    .bind(parsed_uuid)
+    .bind(pk)
+    .bind(format!("users/{}/{}", user.id, pk))
+    .bind(format!("users/{}", pk))
+    .fetch_optional(&st.db)
+    .await?;
+
+    let (id, creator, uid, et) = row.ok_or_else(ApiError::not_found)?;
+    if creator != Some(user.id) && uid != Some(user.id) {
+        return Err(ApiError::forbidden());
+    }
+    Ok((id, et))
+}
+
+/// GET /api/users/file-assets/{pk}/
+async fn legacy_get_user_asset(State(st): State<AppState>, user: CurrentUser, Path(pk): Path<String>) -> ApiResult {
+    let (id, _) = check_user_asset_pk(&st, &user, &pk).await?;
+    json_row(
+        sqlx::query_scalar(&format!(
+            "SELECT {FILE_ASSET_JSON} FROM file_assets f
+             LEFT JOIN workspaces w ON w.id = f.workspace_id
+             WHERE f.id = $1 AND f.deleted_at IS NULL"
+        ))
+        .bind(id),
+        &st.db,
+    )
+    .await
+}
+
+/// DELETE /api/users/file-assets/{pk}/
+async fn legacy_delete_user_asset(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(pk): Path<String>,
+) -> ApiResult<StatusCode> {
+    let (id, et) = check_user_asset_pk(&st, &user, &pk).await?;
+    soft_delete(&st, id, et.as_deref().unwrap_or("")).await?;
+    no_content()
+}
+
+/// GET /api/workspaces/file-assets/{workspace_id}/{asset_key}/
+async fn legacy_get_workspace_asset(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((workspace_id, asset_key)): Path<(Uuid, String)>,
+) -> ApiResult {
+    let _ws = require_workspace_by_id(&st.db, &user, workspace_id).await?;
+    if asset_key.contains("..") || asset_key.starts_with('/') || asset_key.contains('\\') {
+        return Err(ApiError::bad("Invalid asset key"));
+    }
+    let full_key = format!("{workspace_id}/{asset_key}");
+    let rows: Vec<Value> = sqlx::query_scalar(&format!(
+        "SELECT {FILE_ASSET_JSON} FROM file_assets f
+         LEFT JOIN workspaces w ON w.id = f.workspace_id
+         WHERE (f.asset = $1 OR f.asset = $2)
+           AND f.workspace_id = $3
+           AND f.deleted_at IS NULL
+           AND (f.project_id IS NULL OR EXISTS (
+               SELECT 1 FROM project_members pm
+               WHERE pm.workspace_id = f.workspace_id AND pm.project_id = f.project_id
+                 AND pm.member_id = $4 AND pm.is_active AND pm.deleted_at IS NULL
+           ))
+         ORDER BY f.created_at DESC"
+    ))
+    .bind(&full_key)
+    .bind(&asset_key)
+    .bind(workspace_id)
+    .bind(user.id)
+    .fetch_all(&st.db)
+    .await?;
+
+    if rows.is_empty() {
+        Ok(Json(json!({"error": "Asset key does not exist", "status": false})))
+    } else {
+        Ok(Json(json!({"data": rows, "status": true})))
+    }
+}
+
+/// DELETE /api/workspaces/file-assets/{workspace_id}/{asset_key}/
+async fn legacy_delete_workspace_asset(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((workspace_id, asset_key)): Path<(Uuid, String)>,
+) -> ApiResult<StatusCode> {
+    let ws = require_workspace_by_id(&st.db, &user, workspace_id).await?;
+    if asset_key.contains("..") || asset_key.starts_with('/') || asset_key.contains('\\') {
+        return Err(ApiError::bad("Invalid asset key"));
+    }
+    let full_key = format!("{workspace_id}/{asset_key}");
+    let asset: Option<PermAsset> = sqlx::query_as(
+        "SELECT id, workspace_id, project_id, entity_type, created_by_id FROM file_assets
+         WHERE (asset = $1 OR asset = $2) AND workspace_id = $3 AND deleted_at IS NULL",
+    )
+    .bind(&full_key)
+    .bind(&asset_key)
+    .bind(workspace_id)
+    .fetch_optional(&st.db)
+    .await?;
+
+    let asset = asset.ok_or_else(ApiError::not_found)?;
+    if !can_modify_file_asset(&st.db, &user, ws.role, &asset).await? {
+        return Err(ApiError::forbidden());
+    }
+    soft_delete(&st, asset.id, asset.entity_type.as_deref().unwrap_or("")).await?;
+    no_content()
+}
+
+/// POST /api/workspaces/file-assets/{workspace_id}/{asset_key}/restore/
+async fn legacy_restore_workspace_asset(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((workspace_id, asset_key)): Path<(Uuid, String)>,
+) -> ApiResult<StatusCode> {
+    let ws = require_workspace_by_id(&st.db, &user, workspace_id).await?;
+    if asset_key.contains("..") || asset_key.starts_with('/') || asset_key.contains('\\') {
+        return Err(ApiError::bad("Invalid asset key"));
+    }
+    let full_key = format!("{workspace_id}/{asset_key}");
+    let asset: Option<PermAsset> = sqlx::query_as(
+        "SELECT id, workspace_id, project_id, entity_type, created_by_id FROM file_assets
+         WHERE (asset = $1 OR asset = $2) AND workspace_id = $3",
+    )
+    .bind(&full_key)
+    .bind(&asset_key)
+    .bind(workspace_id)
+    .fetch_optional(&st.db)
+    .await?;
+
+    let asset = asset.ok_or_else(ApiError::not_found)?;
+    if !can_modify_file_asset(&st.db, &user, ws.role, &asset).await? {
+        return Err(ApiError::forbidden());
+    }
+    sqlx::query("UPDATE file_assets SET is_deleted = false, deleted_at = NULL, updated_at = now() WHERE id = $1 AND workspace_id = $2")
+        .bind(asset.id)
+        .bind(workspace_id)
+        .execute(&st.db)
+        .await?;
+    no_content()
+}
+
+/// GET /api/workspaces/{slug}/file-assets/
+async fn legacy_list_workspace_assets(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(slug): Path<String>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    json_rows(
+        sqlx::query_scalar(&format!(
+            "SELECT {FILE_ASSET_JSON} FROM file_assets f
+             JOIN workspaces w ON w.id = f.workspace_id
+             WHERE f.workspace_id = $1 AND f.deleted_at IS NULL
+               AND (f.project_id IS NULL OR EXISTS (
+                   SELECT 1 FROM project_members pm
+                   WHERE pm.workspace_id = f.workspace_id AND pm.project_id = f.project_id
+                     AND pm.member_id = $2 AND pm.is_active AND pm.deleted_at IS NULL
+               ))
+             ORDER BY f.created_at DESC"
+        ))
+        .bind(ws.workspace_id)
+        .bind(user.id),
+        &st.db,
+    )
+    .await
+}
+
+/// POST /api/workspaces/{slug}/file-assets/
+async fn legacy_create_workspace_asset(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(slug): Path<String>,
+    req: axum::extract::Request,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    let content_type = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let id = Uuid::new_v4();
+    if content_type.starts_with("multipart/form-data") {
+        let mut form = Multipart::from_request(req, &st)
+            .await
+            .map_err(|_| ApiError::bad("Invalid multipart body"))?;
+        let mut file_data: Option<(String, String, Vec<u8>)> = None;
+        let mut entity_type: Option<String> = None;
+        let mut entity_identifier: Option<String> = None;
+        let mut project_id: Option<Uuid> = None;
+        let mut issue_id: Option<Uuid> = None;
+        let mut comment_id: Option<Uuid> = None;
+        let mut page_id: Option<Uuid> = None;
+
+        while let Some(field) = form
+            .next_field()
+            .await
+            .map_err(|_| ApiError::bad("Invalid multipart body"))?
+        {
+            match field.name() {
+                Some("entity_type") => {
+                    entity_type = field.text().await.ok();
+                }
+                Some("entity_identifier") => {
+                    entity_identifier = field.text().await.ok();
+                }
+                Some("project_id") => {
+                    let t = field.text().await.map_err(|_| ApiError::bad("Invalid field"))?;
+                    project_id = Uuid::parse_str(&t).ok();
+                }
+                Some("issue_id") => {
+                    let t = field.text().await.map_err(|_| ApiError::bad("Invalid field"))?;
+                    issue_id = Uuid::parse_str(&t).ok();
+                }
+                Some("comment_id") => {
+                    let t = field.text().await.map_err(|_| ApiError::bad("Invalid field"))?;
+                    comment_id = Uuid::parse_str(&t).ok();
+                }
+                Some("page_id") => {
+                    let t = field.text().await.map_err(|_| ApiError::bad("Invalid field"))?;
+                    page_id = Uuid::parse_str(&t).ok();
+                }
+                Some("asset" | "file") => {
+                    let name = sanitize_filename(field.file_name().unwrap_or("unnamed"));
+                    let typ = field.content_type().unwrap_or("application/octet-stream").to_string();
+                    let mut buf = Vec::new();
+                    let mut field = field;
+                    while let Some(chunk) = field.chunk().await.map_err(|_| ApiError::bad("Upload interrupted"))? {
+                        if buf.len() + chunk.len() > st.cfg.file_size_limit as usize {
+                            return Err(ApiError::bad("File size exceeds the allowed limit"));
+                        }
+                        buf.extend_from_slice(&chunk);
+                    }
+                    file_data = Some((name, typ, buf));
+                }
+                _ => {}
+            }
+        }
+
+        let (name, typ, data) = file_data.ok_or_else(|| ApiError::bad("Missing file field"))?;
+        let key = format!("{}/{}-{}", ws.workspace_id, id.simple(), name);
+        let path = disk_path(&st, &key)?;
+        if let Some(dir) = path.parent() {
+            tokio::fs::create_dir_all(dir).await.map_err(io_err)?;
+        }
+        tokio::fs::write(&path, &data).await.map_err(io_err)?;
+
+        let size = data.len() as f64;
+        if entity_type.as_deref() == Some("WORKSPACE_LOGO") && !ws.is_admin() {
+            return Err(ApiError::forbidden());
+        }
+        if let Some(pid) = project_id {
+            require_project(&st.db, &user, &slug, pid).await?;
+        }
+
+        sqlx::query(
+            "INSERT INTO file_assets (id, attributes, asset, size, workspace_id, created_by_id, updated_by_id,
+                                      entity_type, entity_identifier, project_id, issue_id, page_id, comment_id, is_uploaded)
+             VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8, $9, $10, $11, $12, true)",
+        )
+        .bind(id)
+        .bind(json!({"name": name, "type": typ, "size": size}))
+        .bind(&key)
+        .bind(size)
+        .bind(ws.workspace_id)
+        .bind(user.id)
+        .bind(entity_type.as_deref())
+        .bind(entity_identifier.as_deref())
+        .bind(project_id)
+        .bind(issue_id)
+        .bind(page_id)
+        .bind(comment_id)
+        .execute(&st.db)
+        .await?;
+    } else {
+        let b: Value = axum::Json::from_request(req, &st)
+            .await
+            .map_err(|_| ApiError::bad("Invalid JSON body"))?
+            .0;
+        let entity_type = s(&b, "entity_type");
+        if entity_type == Some("WORKSPACE_LOGO") && !ws.is_admin() {
+            return Err(ApiError::forbidden());
+        }
+        let project_id = uuid_of(&b, "project_id");
+        if let Some(pid) = project_id {
+            require_project(&st.db, &user, &slug, pid).await?;
+        }
+        let name = sanitize_filename(s(&b, "name").unwrap_or("unnamed"));
+        let typ = s(&b, "type").unwrap_or("application/octet-stream");
+        let size = b
+            .get("size")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+            .min(st.cfg.file_size_limit as f64);
+        let key = format!("{}/{}-{}", ws.workspace_id, id.simple(), name);
+
+        sqlx::query(
+            "INSERT INTO file_assets (id, attributes, asset, size, workspace_id, created_by_id, updated_by_id,
+                                      entity_type, entity_identifier, project_id, is_uploaded)
+             VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8, $9, false)",
+        )
+        .bind(id)
+        .bind(json!({"name": name, "type": typ, "size": size}))
+        .bind(&key)
+        .bind(size)
+        .bind(ws.workspace_id)
+        .bind(user.id)
+        .bind(entity_type)
+        .bind(s(&b, "entity_identifier"))
+        .bind(project_id)
+        .execute(&st.db)
+        .await?;
+    }
+
+    let row: Value = sqlx::query_scalar(&format!(
+        "SELECT {FILE_ASSET_JSON} FROM file_assets f
+         JOIN workspaces w ON w.id = f.workspace_id
+         WHERE f.id = $1"
+    ))
+    .bind(id)
+    .fetch_one(&st.db)
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(row)))
 }
 
 #[cfg(test)]

@@ -60,3 +60,54 @@ if [ -n "$ISSUE_ID" ]; then
   echo "✔ description asset has valid project_id ($db_pid) and no None in asset_url"
   call DELETE "/api/assets/v2/workspaces/$SLUG/$DESC_ASSET/"
 fi
+
+# --- Legacy file-assets endpoints ---
+# User file-assets: upload multipart
+code=$(curl -s -b "$jar" -o /tmp/legacy_user_upload.json -w '%{http_code}' \
+  -F "entity_type=USER_AVATAR" -F "asset=@-;filename=avatar.png" "$BASE/api/users/file-assets/" <<< "user avatar data")
+[[ "$code" == 201 ]] || { echo "✖ POST /api/users/file-assets/ -> $code" >&2; exit 1; }
+echo "✔ POST /api/users/file-assets/ -> $code"
+U_ASSET=$(jq -r '.id' /tmp/legacy_user_upload.json)
+U_KEY=$(jq -r '.asset' /tmp/legacy_user_upload.json)
+
+# User file-assets: list
+call GET "/api/users/file-assets/"
+jq -e --arg id "$U_ASSET" 'any(.[]; .id == $id)' <<<"$body" >/dev/null
+echo "✔ GET /api/users/file-assets/ lists created asset"
+
+# User file-assets: retrieve by pk
+call GET "/api/users/file-assets/$U_ASSET/"
+[[ "$(field '.id')" == "$U_ASSET" ]] || { echo "✖ GET /api/users/file-assets/{pk}/ failed" >&2; exit 1; }
+echo "✔ GET /api/users/file-assets/{pk}/ -> 200"
+
+# Workspace file-assets: POST upload
+code=$(curl -s -b "$jar" -o /tmp/legacy_ws_upload.json -w '%{http_code}' \
+  -F "entity_type=ISSUE_ATTACHMENT" -F "project_id=$PROJECT" -F "asset=@-;filename=legacy_doc.pdf" \
+  "$BASE/api/workspaces/$SLUG/file-assets/" <<< "workspace pdf data")
+[[ "$code" == 201 ]] || { echo "✖ POST /api/workspaces/{slug}/file-assets/ -> $code" >&2; exit 1; }
+echo "✔ POST /api/workspaces/{slug}/file-assets/ -> $code"
+WS_ASSET=$(jq -r '.id' /tmp/legacy_ws_upload.json)
+WS_FULL_KEY=$(jq -r '.asset' /tmp/legacy_ws_upload.json)
+# Extract asset_key part (after workspace_id/)
+WS_ASSET_KEY="${WS_FULL_KEY#*/}"
+
+# Workspace file-assets: GET list by slug
+call GET "/api/workspaces/$SLUG/file-assets/"
+jq -e --arg id "$WS_ASSET" 'any(.[]; .id == $id)' <<<"$body" >/dev/null
+echo "✔ GET /api/workspaces/{slug}/file-assets/ lists created asset"
+
+# Workspace file-assets: GET by workspace_id and asset_key
+call GET "/api/workspaces/file-assets/$WS_ID/$WS_ASSET_KEY/"
+jq -e --arg id "$WS_ASSET" '.data | any(.[]; .id == $id)' <<<"$body" >/dev/null
+echo "✔ GET /api/workspaces/file-assets/{workspace_id}/{asset_key}/ -> 200"
+
+# Workspace file-assets: DELETE and restore
+call DELETE "/api/workspaces/file-assets/$WS_ID/$WS_ASSET_KEY/"
+call POST "/api/workspaces/file-assets/$WS_ID/$WS_ASSET_KEY/restore/"
+call DELETE "/api/workspaces/file-assets/$WS_ID/$WS_ASSET_KEY/"
+echo "✔ DELETE and restore /api/workspaces/file-assets/{workspace_id}/{asset_key}/ -> ok"
+
+# User file-assets: DELETE own
+call DELETE "/api/users/file-assets/$U_ASSET/"
+echo "✔ DELETE /api/users/file-assets/{pk}/ -> 204"
+
