@@ -135,7 +135,12 @@ async fn insert_asset(st: &AppState, a: NewAsset<'_>, b: &Value) -> ApiResult {
         ));
     }
     let name = sanitize_filename(s(b, "name").unwrap_or("unnamed"));
-    let typ = s(b, "type").unwrap_or("image/jpeg");
+    let raw_typ = s(b, "type").unwrap_or("").trim();
+    let typ = if raw_typ.is_empty() {
+        if a.images_only { "image/jpeg" } else { "application/octet-stream" }
+    } else {
+        raw_typ
+    };
     if a.images_only && !IMAGE_TYPES.contains(&typ) {
         return Err(ApiError::bad_body(json!({
             "error": "Invalid file type. Only JPEG, PNG, WebP, JPG and GIF files are allowed.", "status": false
@@ -196,12 +201,32 @@ async fn create_workspace_asset(
             json!({"error": "Only workspace admins can upload a workspace logo."}),
         ));
     }
+    let (issue_id, target_user_id, page_id, comment_id) = entity_ids(entity_type, &b);
     let project_id = if entity_type == "PROJECT_COVER" {
         uuid_of(&b, "entity_identifier")
+    } else if let Some(pid) = uuid_of(&b, "project_id") {
+        Some(pid)
+    } else if let Some(iid) = issue_id {
+        sqlx::query_scalar("SELECT project_id FROM issues WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL")
+            .bind(iid)
+            .bind(ws.workspace_id)
+            .fetch_optional(&st.db)
+            .await?
+    } else if let Some(cid) = comment_id {
+        sqlx::query_scalar("SELECT project_id FROM issue_comments WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL")
+            .bind(cid)
+            .bind(ws.workspace_id)
+            .fetch_optional(&st.db)
+            .await?
+    } else if let Some(pgid) = page_id {
+        sqlx::query_scalar("SELECT project_id FROM project_pages WHERE page_id = $1 AND workspace_id = $2 AND deleted_at IS NULL LIMIT 1")
+            .bind(pgid)
+            .bind(ws.workspace_id)
+            .fetch_optional(&st.db)
+            .await?
     } else {
         None
     };
-    let (issue_id, target_user_id, page_id, comment_id) = entity_ids(entity_type, &b);
     insert_asset(
         &st,
         NewAsset {

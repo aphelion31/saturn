@@ -2,15 +2,32 @@
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{HeaderValue, Method, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use serde_json::json;
+use std::net::SocketAddr;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::common::AppState;
+
+/// Internal header carrying the TCP peer IP. Always overwritten from the socket, so clients cannot set it.
+pub const PEER_HEADER: &str = "x-saturn-peer";
+
+pub async fn peer_header(mut req: Request<Body>, next: Next) -> Response {
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .and_then(|c| HeaderValue::from_str(&c.0.ip().to_string()).ok());
+    let h = req.headers_mut();
+    h.remove(PEER_HEADER);
+    if let Some(v) = peer {
+        h.insert(PEER_HEADER, v);
+    }
+    next.run(req).await
+}
 
 /// The three Plane React Router apps, built as static SPAs (see scripts/build-web.sh):
 /// `web` at `/`, `admin` (god-mode) at `/god-mode`, `space` (public boards) at `/spaces`.

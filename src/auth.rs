@@ -10,8 +10,11 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
+use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::sync::OnceLock;
+use std::time::Instant;
 use uuid::Uuid;
 
 use crate::common::{ApiError, ApiResult, AppState, CurrentUser, MaybeUser};
@@ -65,8 +68,86 @@ fn code(name: &str) -> u32 {
         "ADMIN_AUTHENTICATION_FAILED" => 5175,
         "ADMIN_USER_ALREADY_EXIST" => 5180,
         "ADMIN_USER_DOES_NOT_EXIST" => 5185,
+        "RATE_LIMIT_EXCEEDED" => 5900,
         _ => 5999,
     }
+}
+
+struct Bucket {
+    tokens: f64,
+    last: Instant,
+}
+
+static AUTH_BUCKETS: OnceLock<DashMap<String, Bucket>> = OnceLock::new();
+
+fn rate_limit_max() -> Option<f64> {
+    match std::env::var("SATURN_RATE_LIMIT").as_deref() {
+        Ok("0") => None,
+        Ok(v) => v.parse::<f64>().ok().filter(|&n| n > 0.0).or(Some(10.0)),
+        Err(_) => Some(10.0),
+    }
+}
+
+/// Rate-limit key. The TCP peer address (set by `web::peer_header`, never client supplied), unless
+/// `TRUST_PROXY=1` says a reverse proxy sets `X-Forwarded-For` (then its first hop). Without that
+/// opt-in clients could rotate the header to dodge the limit.
+fn client_ip(headers: &HeaderMap) -> String {
+    let peer = headers
+        .get(crate::web::PEER_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let forwarded = || {
+        headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
+            .map(|v| v.trim().to_string())
+    };
+    let trust = matches!(std::env::var("TRUST_PROXY").as_deref(), Ok("1" | "true"));
+    trust
+        .then(forwarded)
+        .flatten()
+        .or(peer)
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn check_rate_limit(headers: &HeaderMap, scope: &str) -> bool {
+    let Some(cap) = rate_limit_max() else {
+        return true;
+    };
+    check_rate_limit_with_cap(AUTH_BUCKETS.get_or_init(DashMap::new), headers, scope, cap, Instant::now())
+}
+
+fn check_rate_limit_with_cap(
+    buckets: &DashMap<String, Bucket>,
+    headers: &HeaderMap,
+    scope: &str,
+    cap: f64,
+    now: Instant,
+) -> bool {
+    let key = format!("{scope}:{}", client_ip(headers));
+    if buckets.len() > 10_000 {
+        buckets.retain(|_, b| now.duration_since(b.last).as_secs_f64() < 120.0);
+    }
+    let mut entry = buckets.entry(key).or_insert_with(|| Bucket { tokens: cap, last: now });
+    let elapsed = now.duration_since(entry.last).as_secs_f64();
+    entry.tokens = (entry.tokens + elapsed * (cap / 60.0)).min(cap);
+    entry.last = now;
+    if entry.tokens >= 1.0 {
+        entry.tokens -= 1.0;
+        true
+    } else {
+        false
+    }
+}
+
+fn rate_limit_response() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({"error_code": code("RATE_LIMIT_EXCEEDED"), "error_message": "RATE_LIMIT_EXCEEDED"})),
+    )
+        .into_response()
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -148,6 +229,11 @@ fn valid_email(e: &str) -> bool {
 }
 
 /// ponytail: Plane uses zxcvbn score >= 3. Saturn checks length and character variety instead.
+fn parse_bool(s: Option<&str>) -> bool {
+    s.map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "on" | "yes"))
+        .unwrap_or(false)
+}
+
 fn strong(p: &str) -> bool {
     let classes = [
         p.chars().any(|c| c.is_ascii_lowercase()),
@@ -288,7 +374,8 @@ pub async fn create_user(
         .await?;
     sqlx::query(
         "INSERT INTO user_notification_preferences (user_id, property_change, state_change, comment, mention, issue_completed)
-         VALUES ($1, true, true, true, true, true)",
+         SELECT $1, true, true, true, true, true
+         WHERE NOT EXISTS (SELECT 1 FROM user_notification_preferences WHERE user_id = $1 AND deleted_at IS NULL)",
     )
     .bind(id)
     .execute(&mut *tx)
@@ -308,7 +395,10 @@ struct EmailCheck {
     email: Option<String>,
 }
 
-async fn email_check(State(st): State<AppState>, Json(b): Json<EmailCheck>) -> Response {
+async fn email_check(State(st): State<AppState>, headers: HeaderMap, Json(b): Json<EmailCheck>) -> Response {
+    if !check_rate_limit(&headers, "email-check") {
+        return rate_limit_response();
+    }
     let fail = |n: &str| {
         (
             StatusCode::BAD_REQUEST,
@@ -348,6 +438,9 @@ struct AuthForm {
 }
 
 async fn sign_in(st: AppState, headers: HeaderMap, f: AuthForm, app: App) -> Result<Response, ApiError> {
+    if !check_rate_limit(&headers, "sign-in") {
+        return Ok(rate_limit_response());
+    }
     let next = safe_next(f.next_path.as_deref());
     if !setup_done(&st).await? {
         return Ok(err_redirect(&st, app, &next, "INSTANCE_NOT_CONFIGURED", None));
@@ -373,7 +466,13 @@ async fn sign_in(st: AppState, headers: HeaderMap, f: AuthForm, app: App) -> Res
     .fetch_optional(&st.db)
     .await?;
     let Some((id, hash, active, bot, logged_out_before)) = row else {
-        return Ok(err_redirect(&st, app, &next, "USER_DOES_NOT_EXIST", Some(&email)));
+        return Ok(err_redirect(
+            &st,
+            app,
+            &next,
+            "AUTHENTICATION_FAILED_SIGN_IN",
+            Some(&email),
+        ));
     };
     if bot || !session::check_password(&password, &hash) {
         return Ok(err_redirect(
@@ -392,6 +491,15 @@ async fn sign_in(st: AppState, headers: HeaderMap, f: AuthForm, app: App) -> Res
         .execute(&st.db)
         .await?;
     join_accepted_invites(&st, id, &email).await?;
+    let uagent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    sqlx::query("UPDATE users SET last_login_uagent = $2 WHERE id = $1")
+        .bind(id)
+        .bind(uagent)
+        .execute(&st.db)
+        .await?;
     let key = session::create(&st, id, false, device_info(&headers, &st, app)).await?;
     let path = if !next.is_empty() {
         next.clone()
@@ -416,6 +524,9 @@ async fn sign_in(st: AppState, headers: HeaderMap, f: AuthForm, app: App) -> Res
 }
 
 async fn sign_up(st: AppState, headers: HeaderMap, f: AuthForm, app: App) -> Result<Response, ApiError> {
+    if !check_rate_limit(&headers, "sign-up") {
+        return Ok(rate_limit_response());
+    }
     let next = safe_next(f.next_path.as_deref());
     if !setup_done(&st).await? {
         return Ok(err_redirect(&st, app, &next, "INSTANCE_NOT_CONFIGURED", None));
@@ -645,12 +756,13 @@ async fn admin_sign_up(
         .bind(instance_id)
         .execute(&st.db)
         .await?;
+    let telemetry_enabled = parse_bool(f.is_telemetry_enabled.as_deref());
     sqlx::query(
         "UPDATE instances SET is_setup_done = true, instance_name = $2, is_telemetry_enabled = $3, updated_at = now() WHERE id = $1",
     )
     .bind(instance_id)
     .bind(if company.is_empty() { "Saturn".to_string() } else { company })
-    .bind(f.is_telemetry_enabled.as_deref() == Some("True"))
+    .bind(telemetry_enabled)
     .execute(&st.db)
     .await?;
     let key = session::create(&st, id, true, device_info(&headers, &st, App::Admin)).await?;
@@ -666,6 +778,9 @@ async fn admin_sign_in(
     headers: HeaderMap,
     Form(f): Form<AuthForm>,
 ) -> Result<Response, ApiError> {
+    if !check_rate_limit(&headers, "admin-sign-in") {
+        return Ok(rate_limit_response());
+    }
     let email = f.email.unwrap_or_default().trim().to_lowercase();
     let password = f.password.unwrap_or_default();
     let back = |n: &str| err_redirect(&st, App::Admin, "", n, Some(&email));
@@ -684,11 +799,20 @@ async fn admin_sign_in(
             .fetch_optional(&st.db)
             .await?;
     let Some((id, hash, active)) = row else {
-        return Ok(back("ADMIN_USER_DOES_NOT_EXIST"));
+        return Ok(back("ADMIN_AUTHENTICATION_FAILED"));
     };
     if !active || !session::check_password(&password, &hash) || !is_instance_admin(&st, id).await? {
         return Ok(back("ADMIN_AUTHENTICATION_FAILED"));
     }
+    let uagent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    sqlx::query("UPDATE users SET last_login_uagent = $2 WHERE id = $1")
+        .bind(id)
+        .bind(uagent)
+        .execute(&st.db)
+        .await?;
     let key = session::create(&st, id, true, device_info(&headers, &st, App::Admin)).await?;
     let to = format!("{}general/", base(&st, App::Admin));
     Ok(redirect_with_cookie(
@@ -744,6 +868,42 @@ mod tests {
         assert_eq!(safe_next(Some("https://evil.com/x")), "/x");
         assert_eq!(safe_next(Some("/a/../b")), "");
         assert_eq!(safe_next(Some("relative")), "");
+    }
+
+    #[test]
+    fn rate_limiting_token_bucket() {
+        let buckets = DashMap::new();
+        let peer = |ip: &str, xff: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(crate::web::PEER_HEADER, ip.parse().unwrap());
+            h.insert("x-forwarded-for", xff.parse().unwrap());
+            h
+        };
+        let now = Instant::now();
+
+        // Rotating X-Forwarded-For does not create new buckets: the peer is the key.
+        for i in 0..10 {
+            let h = peer("192.168.1.1", &format!("10.0.0.{i}"));
+            assert!(check_rate_limit_with_cap(&buckets, &h, "test", 10.0, now));
+        }
+        assert!(!check_rate_limit_with_cap(&buckets, &peer("192.168.1.1", "10.9.9.9"), "test", 10.0, now));
+
+        // A different peer is not throttled.
+        assert!(check_rate_limit_with_cap(&buckets, &peer("192.168.1.2", "10.0.0.1"), "test", 10.0, now));
+    }
+
+    #[test]
+    fn telemetry_bool_parsing() {
+        assert!(parse_bool(Some("true")));
+        assert!(parse_bool(Some("True")));
+        assert!(parse_bool(Some("TRUE")));
+        assert!(parse_bool(Some("1")));
+        assert!(parse_bool(Some("on")));
+        assert!(!parse_bool(Some("false")));
+        assert!(!parse_bool(Some("False")));
+        assert!(!parse_bool(Some("0")));
+        assert!(!parse_bool(Some("off")));
+        assert!(!parse_bool(None));
     }
 
     #[test]

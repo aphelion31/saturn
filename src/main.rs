@@ -59,6 +59,7 @@ pub fn app(state: AppState) -> Router {
         .merge(api)
         .merge(web::spa_routes(&state))
         .layer(middleware::from_fn(web::security_headers))
+        .layer(middleware::from_fn(web::peer_header))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -139,6 +140,10 @@ async fn main() -> anyhow::Result<()> {
     let addr = env("BIND", "0.0.0.0:3000");
     tracing::info!("saturn listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app(state)).await?;
+    axum::serve(
+        listener,
+        app(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
