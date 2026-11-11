@@ -20,6 +20,17 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/v1/users/me/", get(me))
         .route("/api/v1/workspaces/{slug}/members/", get(workspace_members))
+        .route("/api/v1/workspaces/{slug}/", get(v1_workspace))
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/members/",
+            get(v1_project_members).post(v1_create_project_member),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/members/{pk}/",
+            get(v1_project_member)
+                .patch(v1_update_project_member)
+                .delete(v1_delete_project_member),
+        )
         .route(
             "/api/v1/workspaces/{slug}/projects/",
             get(projects).post(create_project),
@@ -1930,6 +1941,28 @@ async fn v1_projects_lite(
     .fetch_all(&st.db)
     .await?;
     paginate(rows, &q)
+}
+
+// Same body as workspaces.rs WS_JSON (private there). Keep in sync.
+const WS_V1_JSON: &str = "to_jsonb(w) - 'owner_id' - 'created_by_id' - 'updated_by_id' - 'logo_asset_id'
+    || jsonb_build_object('owner', w.owner_id, 'created_by', w.created_by_id, 'updated_by', w.updated_by_id,
+       'logo_asset', w.logo_asset_id, 'logo_url', NULLIF(w.logo, ''),
+       'total_members', (SELECT count(*) FROM workspace_members m JOIN users u ON u.id = m.member_id
+                         WHERE m.workspace_id = w.id AND m.is_active AND m.deleted_at IS NULL AND NOT u.is_bot))";
+
+/// Plane WorkSpaceViewSet.retrieve: workspace detail for any member (role included).
+async fn v1_workspace(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    json_row(
+        sqlx::query_scalar(&format!(
+            "SELECT {WS_V1_JSON} || jsonb_build_object('role', $2::smallint) FROM workspaces w
+             WHERE w.id = $1 AND w.deleted_at IS NULL"
+        ))
+        .bind(ws.workspace_id)
+        .bind(ws.role),
+        &st.db,
+    )
+    .await
 }
 
 async fn v1_project_members(

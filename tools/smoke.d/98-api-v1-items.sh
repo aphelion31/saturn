@@ -30,4 +30,15 @@ v1 GET "$V1/$ITEM/activities/"
 v1 GET "/api/v1/workspaces/$SLUG/work-items/$IDENT/"
 v1 GET "/api/v1/workspaces/$SLUG/work-items/search/?search=V1%20smoke"
 jq -e '.issues | length >= 1' <<<"$body" >/dev/null
+# relations (Plane IssueRelationListCreateAPIEndpoint) and attachments list/delete
+v1 POST "$V1/" '{"name":"V1 relation peer"}'
+PEER=$(field '.id')
+v1 POST "$V1/$ITEM/relations/" '{"relation_type":"blocking","issues":["'"$PEER"'"]}'
+v1 GET "$V1/$ITEM/relations/"
+jq -e '.blocking | length == 1' <<<"$body" >/dev/null
+v1 GET "$V1/$PEER/relations/"
+jq -e '.blocked_by | length == 1' <<<"$body" >/dev/null
+v1 GET "$V1/$ITEM/attachments/"
+jq -e 'type == "array"' <<<"$body" >/dev/null
+v1 DELETE "$V1/$PEER/"
 v1 DELETE "$V1/$ITEM/"

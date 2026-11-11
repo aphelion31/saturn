@@ -63,3 +63,9 @@ call_v1 DELETE "/api/v1/workspaces/$SLUG/projects/$PROJECT/intake-issues/$V1_II/
 call_v1 GET "/api/v1/workspaces/$SLUG/projects/$PROJECT/estimates/"
 V1_EST=$(field '.id')
 call_v1 GET "/api/v1/workspaces/$SLUG/projects/$PROJECT/estimates/$V1_EST/estimate-points/"
+
+# 5. Workspace detail & project members alias (Plane urls/member.py)
+call_v1 GET "/api/v1/workspaces/$SLUG/"
+call_v1 GET "/api/v1/workspaces/$SLUG/projects/$PROJECT/members/"
+MEMBER_PK=$(field '.[0].id')
+call_v1 GET "/api/v1/workspaces/$SLUG/projects/$PROJECT/members/$MEMBER_PK/"
