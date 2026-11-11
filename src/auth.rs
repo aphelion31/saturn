@@ -186,13 +186,13 @@ fn rate_limit_response() -> Response {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum App {
+pub(crate) enum App {
     Web,
     Space,
     Admin,
 }
 
-fn base(st: &AppState, app: App) -> String {
+pub(crate) fn base(st: &AppState, app: App) -> String {
     let w = st.cfg.web_url.trim_end_matches('/');
     match app {
         App::Web => w.to_string(),
@@ -202,7 +202,7 @@ fn base(st: &AppState, app: App) -> String {
 }
 
 /// Same rules as Plane's `validate_next_path`: relative path only, no `//`, no `..`.
-fn safe_next(p: Option<&str>) -> String {
+pub(crate) fn safe_next(p: Option<&str>) -> String {
     let Some(p) = p else { return String::new() };
     if p.len() > 500 {
         return String::new();
@@ -219,7 +219,7 @@ fn safe_next(p: Option<&str>) -> String {
 }
 
 /// `get_safe_redirect_url(base, next_path, params)`.
-fn redirect_url(st: &AppState, app: App, next: &str, params: &[(&str, String)]) -> String {
+pub(crate) fn redirect_url(st: &AppState, app: App, next: &str, params: &[(&str, String)]) -> String {
     let b = base(st, app);
     let b = b.trim_end_matches('/');
     let mut q = url::form_urlencoded::Serializer::new(String::new());
@@ -298,7 +298,7 @@ async fn setup_done(st: &AppState) -> Result<bool, ApiError> {
     Ok(v.map(|(b,)| b).unwrap_or(false))
 }
 
-fn device_info(headers: &HeaderMap, st: &AppState, app: App) -> Value {
+pub(crate) fn device_info(headers: &HeaderMap, st: &AppState, app: App) -> Value {
     let ua = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
@@ -313,7 +313,7 @@ fn device_info(headers: &HeaderMap, st: &AppState, app: App) -> Value {
 }
 
 /// Where to go after sign in, as `get_redirection_path`.
-async fn landing(st: &AppState, user_id: Uuid, email: &str) -> Result<String, ApiError> {
+pub(crate) async fn landing(st: &AppState, user_id: Uuid, email: &str) -> Result<String, ApiError> {
     let row: Option<(bool, Option<Uuid>)> =
         sqlx::query_as("SELECT is_onboarded, last_workspace_id FROM profiles WHERE user_id = $1")
             .bind(user_id)
@@ -348,7 +348,7 @@ async fn landing(st: &AppState, user_id: Uuid, email: &str) -> Result<String, Ap
 }
 
 /// Join workspaces and projects whose invites this email already accepted (`process_workspace_project_invitations`).
-async fn join_accepted_invites(st: &AppState, user_id: Uuid, email: &str) -> Result<(), ApiError> {
+pub(crate) async fn join_accepted_invites(st: &AppState, user_id: Uuid, email: &str) -> Result<(), ApiError> {
     sqlx::query(
         "INSERT INTO workspace_members (workspace_id, member_id, role)
          SELECT workspace_id, $1, role FROM workspace_member_invites WHERE email = $2 AND accepted AND deleted_at IS NULL
@@ -1170,13 +1170,13 @@ async fn instance_info(State(st): State<AppState>) -> ApiResult {
     let cfg = json!({
         "enable_signup": on(config_value(&st, "ENABLE_SIGNUP", "0").await),
         "is_workspace_creation_disabled": on(config_value(&st, "DISABLE_WORKSPACE_CREATION", "0").await),
-        "is_google_enabled": false,
-        "is_github_enabled": false,
-        "is_gitlab_enabled": false,
-        "is_gitea_enabled": false,
+        "is_google_enabled": crate::oauth::enabled(&st, "google").await,
+        "is_github_enabled": crate::oauth::enabled(&st, "github").await,
+        "is_gitlab_enabled": crate::oauth::enabled(&st, "gitlab").await,
+        "is_gitea_enabled": crate::oauth::enabled(&st, "gitea").await,
         "is_magic_login_enabled": on(config_value(&st, "ENABLE_MAGIC_LINK_LOGIN", "0").await),
         "is_email_password_enabled": true,
-        "github_app_name": "",
+        "github_app_name": config_value(&st, "GITHUB_APP_NAME", "").await,
         "slack_client_id": null,
         "has_unsplash_configured": !config_value(&st, "UNSPLASH_ACCESS_KEY", "").await.is_empty(),
         "has_llm_configured": false,
