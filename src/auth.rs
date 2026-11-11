@@ -148,6 +148,11 @@ fn valid_email(e: &str) -> bool {
 }
 
 /// ponytail: Plane uses zxcvbn score >= 3. Saturn checks length and character variety instead.
+fn parse_bool(s: Option<&str>) -> bool {
+    s.map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "on" | "yes"))
+        .unwrap_or(false)
+}
+
 fn strong(p: &str) -> bool {
     let classes = [
         p.chars().any(|c| c.is_ascii_lowercase()),
@@ -654,12 +659,13 @@ async fn admin_sign_up(
         .bind(instance_id)
         .execute(&st.db)
         .await?;
+    let telemetry_enabled = parse_bool(f.is_telemetry_enabled.as_deref());
     sqlx::query(
         "UPDATE instances SET is_setup_done = true, instance_name = $2, is_telemetry_enabled = $3, updated_at = now() WHERE id = $1",
     )
     .bind(instance_id)
     .bind(if company.is_empty() { "Saturn".to_string() } else { company })
-    .bind(f.is_telemetry_enabled.as_deref() == Some("True"))
+    .bind(telemetry_enabled)
     .execute(&st.db)
     .await?;
     let key = session::create(&st, id, true, device_info(&headers, &st, App::Admin)).await?;
@@ -762,6 +768,20 @@ mod tests {
         assert_eq!(safe_next(Some("https://evil.com/x")), "/x");
         assert_eq!(safe_next(Some("/a/../b")), "");
         assert_eq!(safe_next(Some("relative")), "");
+    }
+
+    #[test]
+    fn telemetry_bool_parsing() {
+        assert!(parse_bool(Some("true")));
+        assert!(parse_bool(Some("True")));
+        assert!(parse_bool(Some("TRUE")));
+        assert!(parse_bool(Some("1")));
+        assert!(parse_bool(Some("on")));
+        assert!(!parse_bool(Some("false")));
+        assert!(!parse_bool(Some("False")));
+        assert!(!parse_bool(Some("0")));
+        assert!(!parse_bool(Some("off")));
+        assert!(!parse_bool(None));
     }
 
     #[test]
