@@ -1,5 +1,5 @@
 use axum::{
-    Router,
+    Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     routing::get,
@@ -19,30 +19,123 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/v1/users/me/", get(me))
         .route("/api/v1/workspaces/{slug}/members/", get(workspace_members))
-        .route("/api/v1/workspaces/{slug}/projects/", get(projects))
-        .route("/api/v1/workspaces/{slug}/projects/{project_id}/", get(project))
+        .route(
+            "/api/v1/workspaces/{slug}/projects/",
+            get(projects).post(create_project),
+        )
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/",
+            get(project).patch(update_project).delete(delete_project),
+        )
         .route(
             "/api/v1/workspaces/{slug}/projects/{project_id}/archive/",
             axum::routing::post(archive_project).delete(unarchive_project),
         )
-        .route("/api/v1/workspaces/{slug}/projects/{project_id}/states/", get(states))
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/states/",
+            get(states).post(create_state),
+        )
         .route(
             "/api/v1/workspaces/{slug}/projects/{project_id}/states/{state_id}/",
-            get(state),
+            get(state).patch(update_state).delete(delete_state),
         )
-        .route("/api/v1/workspaces/{slug}/projects/{project_id}/labels/", get(labels))
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/labels/",
+            get(labels).post(create_label),
+        )
         .route(
             "/api/v1/workspaces/{slug}/projects/{project_id}/labels/{label_id}/",
-            get(label),
+            get(label).patch(update_label).delete(delete_label),
         )
 }
 
 async fn set_archived(st: AppState, user: CurrentUser, slug: String, id: Uuid, archive: bool) -> ApiResult<StatusCode> {
     let p = require_project(&st.db, &user, &slug, id).await?;
     p.require(&[ADMIN, MEMBER])?;
+    let mut tx = st.db.begin().await?;
     let result = sqlx::query("UPDATE projects SET archived_at=CASE WHEN $3 THEN now() ELSE NULL END, updated_at=now(), updated_by_id=$4 WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL")
-        .bind(id).bind(p.workspace_id()).bind(archive).bind(user.id).execute(&st.db).await?;
+        .bind(id).bind(p.workspace_id()).bind(archive).bind(user.id).execute(&mut *tx).await?;
     if result.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    if archive {
+        sqlx::query(
+            "UPDATE user_favorites SET deleted_at=now() WHERE project_id=$1 AND workspace_id=$2 AND deleted_at IS NULL",
+        )
+        .bind(id)
+        .bind(p.workspace_id())
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    no_content()
+}
+
+async fn create_project(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(slug): Path<String>,
+    Json(b): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER])?;
+    let name = s(&b, "name")
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.len() <= 255)
+        .ok_or_else(|| ApiError::bad("Invalid name"))?;
+    let identifier = s(&b, "identifier")
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.len() <= 12 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .ok_or_else(|| ApiError::bad("Invalid identifier"))?;
+    for field in ["project_lead", "default_assignee"] {
+        if let Some(v) = b.get(field).filter(|v| !v.is_null()) {
+            let id = v
+                .as_str()
+                .and_then(|v| Uuid::parse_str(v).ok())
+                .ok_or_else(|| ApiError::bad("Invalid workspace member"))?;
+            let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id=$1 AND member_id=$2 AND is_active AND deleted_at IS NULL)").bind(ws.workspace_id).bind(id).fetch_one(&st.db).await?;
+            if !exists {
+                return Err(ApiError::bad("Invalid workspace member"));
+            }
+        }
+    }
+    let mut tx = st.db.begin().await?;
+    let id = crate::projects::create_project(&mut tx, ws.workspace_id, user.id, name, identifier, &b).await?;
+    tx.commit().await?;
+    let Json(value) = project(State(st), user, Path((slug, id))).await?;
+    created(value)
+}
+
+async fn update_project(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, id)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, id).await?;
+    p.require(&[ADMIN])?;
+    if b.get("name")
+        .is_some_and(|v| v.as_str().is_none_or(|x| x.trim().is_empty() || x.len() > 255))
+    {
+        return Err(ApiError::bad("Invalid name"));
+    }
+    let row = sqlx::query("UPDATE projects SET name=COALESCE($3,name),description=COALESCE($4,description),updated_by_id=$5,updated_at=now() WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL AND archived_at IS NULL")
+        .bind(id).bind(p.workspace_id()).bind(s(&b,"name")).bind(s(&b,"description")).bind(user.id).execute(&st.db).await?;
+    if row.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    project(State(st), user, Path((slug, id))).await
+}
+
+async fn delete_project(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, id)): Path<(String, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, id).await?;
+    p.require(&[ADMIN])?;
+    let row=sqlx::query("UPDATE projects SET deleted_at=now(),updated_at=now(),updated_by_id=$3 WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL").bind(id).bind(p.workspace_id()).bind(user.id).execute(&st.db).await?;
+    if row.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
     no_content()
@@ -67,6 +160,171 @@ async fn unarchive_project(
 const STATE_JSON: &str = "(to_jsonb(s) - 'workspace_id' - 'project_id' - 'created_by_id' - 'updated_by_id') || jsonb_build_object('workspace',s.workspace_id,'project',s.project_id,'created_by',s.created_by_id,'updated_by',s.updated_by_id)";
 const LABEL_JSON: &str = "(to_jsonb(l) - 'workspace_id' - 'project_id' - 'created_by_id' - 'updated_by_id' - 'parent_id') || jsonb_build_object('workspace',l.workspace_id,'project',l.project_id,'created_by',l.created_by_id,'updated_by',l.updated_by_id,'parent',l.parent_id)";
 const PROJECT_JSON: &str = "(to_jsonb(p) - 'workspace_id' - 'created_by_id' - 'updated_by_id' - 'default_assignee_id' - 'project_lead_id' - 'estimate_id' - 'default_state_id' - 'cover_image_asset_id') || jsonb_build_object('workspace',p.workspace_id,'created_by',p.created_by_id,'updated_by',p.updated_by_id,'default_assignee',p.default_assignee_id,'project_lead',p.project_lead_id,'estimate',p.estimate_id,'default_state',p.default_state_id,'cover_image_asset',p.cover_image_asset_id,'cover_image_url',p.cover_image,'is_member',pm.id IS NOT NULL,'member_role',pm.role,'sort_order',pup.sort_order,'total_members',(SELECT count(*) FROM project_members m WHERE m.workspace_id=p.workspace_id AND m.project_id=p.id AND m.is_active AND m.deleted_at IS NULL),'total_cycles',(SELECT count(*) FROM cycles c WHERE c.workspace_id=p.workspace_id AND c.project_id=p.id AND c.deleted_at IS NULL),'total_modules',(SELECT count(*) FROM modules m WHERE m.workspace_id=p.workspace_id AND m.project_id=p.id AND m.deleted_at IS NULL),'is_deployed',EXISTS(SELECT 1 FROM deploy_boards d WHERE d.workspace_id=p.workspace_id AND d.project_id=p.id AND d.deleted_at IS NULL))";
+
+fn check_state(b: &Value) -> ApiResult<()> {
+    if let Some(group) = b.get("group") {
+        if !["backlog", "unstarted", "started", "completed", "cancelled"].contains(&group.as_str().unwrap_or("")) {
+            return Err(ApiError::bad("Invalid state group"));
+        }
+    }
+    for key in ["name", "color"] {
+        if b.get(key)
+            .is_some_and(|v| v.as_str().is_none_or(|s| s.trim().is_empty() || s.len() > 255))
+        {
+            return Err(ApiError::bad(format!("Invalid {key}")));
+        }
+    }
+    Ok(())
+}
+
+async fn create_state(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN])?;
+    check_state(&b)?;
+    let name = s(&b, "name").ok_or_else(|| ApiError::bad("Name required"))?;
+    let color = s(&b, "color").ok_or_else(|| ApiError::bad("Color required"))?;
+    let mut tx = st.db.begin().await?;
+    let id: Uuid=sqlx::query_scalar("INSERT INTO states (name,color,slug,\"group\",description,project_id,workspace_id,created_by_id,updated_by_id,sequence,\"default\",external_id,external_source) VALUES ($1,$2,$3,$4,COALESCE($5,''),$6,$7,$8,$8,COALESCE($9,(SELECT COALESCE(max(sequence),50535)+15000 FROM states WHERE project_id=$6 AND workspace_id=$7 AND deleted_at IS NULL)),$10,$11,$12) RETURNING id")
+        .bind(name).bind(color).bind(crate::states::slugify(name)).bind(s(&b,"group").unwrap_or("backlog")).bind(s(&b,"description")).bind(pid).bind(p.workspace_id()).bind(user.id).bind(b.get("sequence").and_then(Value::as_f64)).bind(b.get("default").and_then(Value::as_bool).unwrap_or(false)).bind(s(&b,"external_id")).bind(s(&b,"external_source")).fetch_one(&mut *tx).await?;
+    if b.get("default").and_then(Value::as_bool) == Some(true) {
+        sqlx::query("UPDATE states SET \"default\"=false WHERE project_id=$1 AND workspace_id=$2 AND id<>$3 AND deleted_at IS NULL").bind(pid).bind(p.workspace_id()).bind(id).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    state(State(st), user, Path((slug, pid, id))).await
+}
+
+async fn update_state(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, id)): Path<(String, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN])?;
+    check_state(&b)?;
+    let mut tx = st.db.begin().await?;
+    let result=sqlx::query("UPDATE states SET name=COALESCE($4,name),color=COALESCE($5,color),\"group\"=COALESCE($6,\"group\"),description=COALESCE($7,description),sequence=COALESCE($8,sequence),\"default\"=COALESCE($9,\"default\"),updated_by_id=$10,updated_at=now() WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL AND NOT is_triage")
+        .bind(id).bind(pid).bind(p.workspace_id()).bind(s(&b,"name")).bind(s(&b,"color")).bind(s(&b,"group")).bind(s(&b,"description")).bind(b.get("sequence").and_then(Value::as_f64)).bind(b.get("default").and_then(Value::as_bool)).bind(user.id).execute(&mut *tx).await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    if b.get("default").and_then(Value::as_bool) == Some(true) {
+        sqlx::query("UPDATE states SET \"default\"=false WHERE project_id=$1 AND workspace_id=$2 AND id<>$3 AND deleted_at IS NULL").bind(pid).bind(p.workspace_id()).bind(id).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    state(State(st), user, Path((slug, pid, id))).await
+}
+
+async fn delete_state(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, id)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN])?;
+    let default:bool=sqlx::query_scalar("SELECT \"default\" FROM states WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL AND NOT is_triage").bind(id).bind(pid).bind(p.workspace_id()).fetch_one(&st.db).await?;
+    if default {
+        return Err(ApiError::bad("Default state cannot be deleted"));
+    }
+    let used:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM issues WHERE state_id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL)").bind(id).bind(pid).bind(p.workspace_id()).fetch_one(&st.db).await?;
+    if used {
+        return Err(ApiError::bad("The state is not empty"));
+    }
+    sqlx::query("UPDATE states SET deleted_at=now(),updated_by_id=$4 WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL").bind(id).bind(pid).bind(p.workspace_id()).bind(user.id).execute(&st.db).await?;
+    no_content()
+}
+
+async fn validate_label_parent(
+    st: &AppState,
+    b: &Value,
+    pid: Uuid,
+    wid: Uuid,
+    id: Option<Uuid>,
+) -> ApiResult<Option<Uuid>> {
+    let Some(value) = b.get("parent").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let parent = value
+        .as_str()
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| ApiError::bad("Invalid parent"))?;
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM labels WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL)",
+    )
+    .bind(parent)
+    .bind(pid)
+    .bind(wid)
+    .fetch_one(&st.db)
+    .await?;
+    if !exists || Some(parent) == id {
+        return Err(ApiError::bad("Invalid parent"));
+    }
+    Ok(Some(parent))
+}
+
+async fn create_label(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN])?;
+    let name = s(&b, "name")
+        .filter(|v| !v.trim().is_empty() && v.len() <= 255)
+        .ok_or_else(|| ApiError::bad("Invalid name"))?;
+    let color = s(&b, "color")
+        .filter(|v| !v.is_empty() && v.len() <= 255)
+        .ok_or_else(|| ApiError::bad("Invalid color"))?;
+    let parent = validate_label_parent(&st, &b, pid, p.workspace_id(), None).await?;
+    let id:Uuid=sqlx::query_scalar("INSERT INTO labels (name,color,description,parent_id,project_id,workspace_id,created_by_id,updated_by_id,external_id,external_source,sort_order) VALUES ($1,$2,COALESCE($3,''),$4,$5,$6,$7,$7,$8,$9,COALESCE($10,65535)) RETURNING id")
+        .bind(name).bind(color).bind(s(&b,"description")).bind(parent).bind(pid).bind(p.workspace_id()).bind(user.id).bind(s(&b,"external_id")).bind(s(&b,"external_source")).bind(b.get("sort_order").and_then(Value::as_f64)).fetch_one(&st.db).await?;
+    let Json(value) = label(State(st), user, Path((slug, pid, id))).await?;
+    created(value)
+}
+
+async fn update_label(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, id)): Path<(String, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN])?;
+    for key in ["name", "color"] {
+        if b.get(key)
+            .is_some_and(|v| v.as_str().is_none_or(|s| s.trim().is_empty() || s.len() > 255))
+        {
+            return Err(ApiError::bad(format!("Invalid {key}")));
+        }
+    }
+    let parent = validate_label_parent(&st, &b, pid, p.workspace_id(), Some(id)).await?;
+    let row=sqlx::query("UPDATE labels SET name=COALESCE($4,name),color=COALESCE($5,color),description=COALESCE($6,description),parent_id=CASE WHEN $7 THEN $8 ELSE parent_id END,sort_order=COALESCE($9,sort_order),external_id=CASE WHEN $10 THEN $11 ELSE external_id END,external_source=CASE WHEN $12 THEN $13 ELSE external_source END,updated_by_id=$14,updated_at=now() WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL")
+        .bind(id).bind(pid).bind(p.workspace_id()).bind(s(&b,"name")).bind(s(&b,"color")).bind(s(&b,"description")).bind(b.get("parent").is_some()).bind(parent).bind(b.get("sort_order").and_then(Value::as_f64)).bind(b.get("external_id").is_some()).bind(s(&b,"external_id")).bind(b.get("external_source").is_some()).bind(s(&b,"external_source")).bind(user.id).execute(&st.db).await?;
+    if row.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    label(State(st), user, Path((slug, pid, id))).await
+}
+
+async fn delete_label(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pid, id)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, pid).await?;
+    p.require(&[ADMIN])?;
+    let row=sqlx::query("UPDATE labels SET deleted_at=now(),updated_by_id=$4 WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL").bind(id).bind(pid).bind(p.workspace_id()).bind(user.id).execute(&st.db).await?;
+    if row.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
+}
 
 async fn projects(
     State(st): State<AppState>,
