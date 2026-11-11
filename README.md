@@ -17,8 +17,26 @@ PostgreSQL as the only dependency.
 ## Benchmark
 
 <!-- BENCHMARK:START -->
-Measured on the same machine against the same PostgreSQL. See [`tools/bench.sh`](tools/bench.sh).
-Results are filled in by the benchmark run.
+Measured with [`tools/bench.sh`](tools/bench.sh) on 2026-11-11: Apple M3 (8 cores, 8 GB), macOS 27.0.1,
+PostgreSQL 18.6, Redis 8.10, RabbitMQ (Homebrew). Both backends ran alone against the same PostgreSQL, each
+with its own copy of the same seeded database (one admin, one workspace, one project, 2000 work items).
+Load: [oha](https://github.com/hatoo/oha), 15 s, 32 concurrent connections, signed-in session cookie.
+Plane ran its production settings with gunicorn (2 uvicorn workers), Celery worker and beat, and the Node live
+server; Saturn ran its release build.
+
+| Metric | Plane (Django + Celery + Redis + RabbitMQ + Node live) | Saturn (Rust) |
+| --- | --- | --- |
+| Backend processes | 21 (+ Redis, RabbitMQ) | 1 |
+| Memory at idle (RSS) | 533 MB (+ 31 MB Redis/RabbitMQ) | 12 MB |
+| Memory after load (RSS) | 379 MB | 19 MB |
+| Startup to first response | 1.45 s | 0.03 s |
+| Backend install size | 284 MB Python venv (plus Node for live) | 10 MB binary |
+| `GET /api/users/me/` | 351 req/s, p50 90.4 ms, p99 234.9 ms | 8545 req/s, p50 3.7 ms, p99 5.3 ms |
+| `GET .../issues/?per_page=100` | 17 req/s, p50 2032.8 ms, p99 3142.2 ms | 985 req/s, p50 30.3 ms, p99 79.3 ms |
+
+Every request in both runs answered 200. Memory is a single RSS sample of the whole process tree (Plane's idle
+sample came 8 s after start, while its workers were still warming up, so it reads higher than after load).
+Numbers depend on the machine; rerun `tools/bench.sh <plane-checkout>` to measure your own.
 <!-- BENCHMARK:END -->
 
 ## Layout
