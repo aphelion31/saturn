@@ -14,6 +14,7 @@ mod analytics;
 mod api_v1_items;
 mod assets;
 mod cycles;
+mod external;
 mod issues;
 mod modules;
 mod notifications;
@@ -61,6 +62,7 @@ pub fn app(state: AppState) -> Router {
         .merge(analytics::routes())
         .merge(api_v1_items::routes())
         .merge(user_dash::routes())
+        .merge(external::routes())
         .route("/api/{*rest}", any(web::not_implemented))
         .route("/auth/{*rest}", any(web::not_implemented))
         .layer(middleware::from_fn_with_state(state.clone(), web::origin_check));
