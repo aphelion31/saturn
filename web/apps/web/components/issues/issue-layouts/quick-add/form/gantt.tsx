@@ -28,6 +28,7 @@ export const GanttQuickAddIssueForm = observer(function GanttQuickAddIssueForm(p
             aria-invalid={hasError}
             data-invalid={hasError || undefined}
             type="text"
+            maxLength={255}
             autoComplete="off"
             placeholder={isEpic ? t("epic.title.label") : t("issue.title.label")}
             {...register("name", {
