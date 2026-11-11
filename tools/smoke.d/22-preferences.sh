@@ -1,4 +1,10 @@
 # Sidebar and home preferences (src/workspaces.rs)
+# Plane #9283: self-hosted asset URLs are valid profile covers.
+cover='/api/assets/v2/static/00000000-0000-0000-0000-000000000001/'
+call PATCH /api/users/me/ "{\"cover_image\":\"$cover\"}"
+[[ $(field "['cover_image']") == "$cover" ]]
+call GET /api/users/me/
+[[ $(field "['cover_image']") == "$cover" ]]
 call PATCH /api/users/me/ '{"user_timezone":"America/New_York"}'
 [[ $(field "['user_timezone']") == America/New_York ]]
 call GET /api/users/me/profile/
