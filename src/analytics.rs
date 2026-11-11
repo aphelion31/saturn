@@ -35,6 +35,20 @@ pub fn routes() -> Router<AppState> {
             get(project_advance_charts),
         )
         .route("/api/workspaces/{slug}/project-stats/", get(project_stats))
+        .route("/api/workspaces/{slug}/analytics/", get(analytics))
+        .route("/api/workspaces/{slug}/default-analytics/", get(default_analytics))
+        .route(
+            "/api/workspaces/{slug}/analytic-view/",
+            get(view_list).post(view_create),
+        )
+        .route(
+            "/api/workspaces/{slug}/analytic-view/{pk}/",
+            get(view_retrieve).patch(view_update).delete(view_destroy),
+        )
+        .route(
+            "/api/workspaces/{slug}/saved-analytic-view/{analytic_id}/",
+            get(saved_view_run),
+        )
 }
 
 type Q = HashMap<String, String>;
@@ -1046,4 +1060,740 @@ async fn project_stats(
     };
     let _ = sql;
     Ok(Json(Value::Array(rows)))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Legacy analytics & saved views
+// ---------------------------------------------------------------------------------------------
+
+const ANALYTIC_VIEW_JSON: &str = "jsonb_build_object(
+    'id', v.id,
+    'name', v.name,
+    'description', v.description,
+    'query', v.query,
+    'query_dict', v.query_dict,
+    'workspace', v.workspace_id,
+    'workspace_id', v.workspace_id,
+    'created_by', v.created_by_id,
+    'updated_by', v.updated_by_id,
+    'created_at', v.created_at,
+    'updated_at', v.updated_at
+)";
+
+const VIEW_FIELDS: &[(&str, &str)] = &[("name", "text"), ("description", "text"), ("query_dict", "jsonb")];
+
+const VALID_ANALYTICS_FIELDS: &[&str] = &[
+    "state_id",
+    "state__group",
+    "labels__id",
+    "assignees__id",
+    "estimate_point__value",
+    "issue_cycle__cycle_id",
+    "issue_module__module_id",
+    "priority",
+    "start_date",
+    "target_date",
+    "created_at",
+    "completed_at",
+];
+
+const VALID_YAXIS: &[&str] = &["issue_count", "estimate"];
+
+struct PlotField {
+    expr: &'static str,
+    join_sql: &'static str,
+}
+
+fn get_plot_field(name: &str, alias: &str) -> Option<PlotField> {
+    match (name, alias) {
+        ("state_id", _) => Some(PlotField {
+            expr: "i.state_id::text",
+            join_sql: "",
+        }),
+        ("state__group", "x") => Some(PlotField {
+            expr: "s_x.group",
+            join_sql: "LEFT JOIN states s_x ON s_x.id = i.state_id",
+        }),
+        ("state__group", "seg") => Some(PlotField {
+            expr: "s_seg.group",
+            join_sql: "LEFT JOIN states s_seg ON s_seg.id = i.state_id",
+        }),
+        ("labels__id", "x") => Some(PlotField {
+            expr: "l_x.id::text",
+            join_sql: "JOIN issue_labels il_x ON il_x.issue_id = i.id AND il_x.deleted_at IS NULL JOIN labels l_x ON l_x.id = il_x.label_id",
+        }),
+        ("labels__id", "seg") => Some(PlotField {
+            expr: "l_seg.id::text",
+            join_sql: "JOIN issue_labels il_seg ON il_seg.issue_id = i.id AND il_seg.deleted_at IS NULL JOIN labels l_seg ON l_seg.id = il_seg.label_id",
+        }),
+        ("assignees__id", "x") => Some(PlotField {
+            expr: "u_x.id::text",
+            join_sql: "JOIN issue_assignees ia_x ON ia_x.issue_id = i.id AND ia_x.deleted_at IS NULL JOIN users u_x ON u_x.id = ia_x.assignee_id",
+        }),
+        ("assignees__id", "seg") => Some(PlotField {
+            expr: "u_seg.id::text",
+            join_sql: "JOIN issue_assignees ia_seg ON ia_seg.issue_id = i.id AND ia_seg.deleted_at IS NULL JOIN users u_seg ON u_seg.id = ia_seg.assignee_id",
+        }),
+        ("estimate_point__value", "x") => Some(PlotField {
+            expr: "ep_x.value",
+            join_sql: "JOIN estimate_points ep_x ON ep_x.id = i.estimate_point_id",
+        }),
+        ("estimate_point__value", "seg") => Some(PlotField {
+            expr: "ep_seg.value",
+            join_sql: "JOIN estimate_points ep_seg ON ep_seg.id = i.estimate_point_id",
+        }),
+        ("issue_cycle__cycle_id", "x") => Some(PlotField {
+            expr: "ci_x.cycle_id::text",
+            join_sql: "JOIN cycle_issues ci_x ON ci_x.issue_id = i.id AND ci_x.deleted_at IS NULL",
+        }),
+        ("issue_cycle__cycle_id", "seg") => Some(PlotField {
+            expr: "ci_seg.cycle_id::text",
+            join_sql: "JOIN cycle_issues ci_seg ON ci_seg.issue_id = i.id AND ci_seg.deleted_at IS NULL",
+        }),
+        ("issue_module__module_id", "x") => Some(PlotField {
+            expr: "mi_x.module_id::text",
+            join_sql: "JOIN module_issues mi_x ON mi_x.issue_id = i.id AND mi_x.deleted_at IS NULL",
+        }),
+        ("issue_module__module_id", "seg") => Some(PlotField {
+            expr: "mi_seg.module_id::text",
+            join_sql: "JOIN module_issues mi_seg ON mi_seg.issue_id = i.id AND mi_seg.deleted_at IS NULL",
+        }),
+        ("priority", _) => Some(PlotField {
+            expr: "i.priority",
+            join_sql: "",
+        }),
+        ("start_date", _) => Some(PlotField {
+            expr: "to_char(i.start_date, 'YYYY-FMMM')",
+            join_sql: "",
+        }),
+        ("target_date", _) => Some(PlotField {
+            expr: "to_char(i.target_date, 'YYYY-FMMM')",
+            join_sql: "",
+        }),
+        ("created_at", _) => Some(PlotField {
+            expr: "to_char(i.created_at, 'YYYY-FMMM')",
+            join_sql: "",
+        }),
+        ("completed_at", _) => Some(PlotField {
+            expr: "to_char(i.completed_at, 'YYYY-FMMM')",
+            join_sql: "",
+        }),
+        _ => None,
+    }
+}
+
+async fn run_graph_plot(
+    db: &sqlx::PgPool,
+    base: &Base,
+    x_axis: &str,
+    y_axis: &str,
+    segment: Option<&str>,
+) -> ApiResult<Value> {
+    if !VALID_ANALYTICS_FIELDS.contains(&x_axis) || !VALID_YAXIS.contains(&y_axis) {
+        return Err(ApiError::bad_body(json!({
+            "error": "x-axis and y-axis dimensions are required and the values should be valid"
+        })));
+    }
+    if let Some(seg) = segment {
+        if !VALID_ANALYTICS_FIELDS.contains(&seg) || seg == x_axis {
+            return Err(ApiError::bad_body(json!({
+                "error": "Both segment and x axis cannot be same and segment should be valid"
+            })));
+        }
+    }
+
+    let x_def = get_plot_field(x_axis, "x").ok_or_else(|| ApiError::bad("Invalid x_axis dimension"))?;
+
+    let mut grouped_data: HashMap<String, Vec<Value>> = HashMap::new();
+
+    if let Some(seg) = segment {
+        let seg_def = get_plot_field(seg, "seg").ok_or_else(|| ApiError::bad("Invalid segment dimension"))?;
+
+        if y_axis == "issue_count" {
+            let sql = format!(
+                "SELECT {} AS dimension, {} AS segment, count(*)::bigint AS count
+                 FROM issues i
+                 {}
+                 {}
+                 WHERE {} AND {} IS NOT NULL
+                 GROUP BY dimension, segment
+                 ORDER BY dimension",
+                x_def.expr, seg_def.expr, x_def.join_sql, seg_def.join_sql, base.sql, x_def.expr
+            );
+            let mut qq = sqlx::query_as::<_, (String, Option<String>, i64)>(&sql);
+            for a in &base.args {
+                qq = match a {
+                    Arg::Uuid(v) => qq.bind(*v),
+                    Arg::Uuids(v) => qq.bind(v.clone()),
+                    Arg::Text(v) => qq.bind(v.clone()),
+                    Arg::Texts(v) => qq.bind(v.clone()),
+                    Arg::Bool(v) => qq.bind(*v),
+                };
+            }
+            let rows = qq.fetch_all(db).await?;
+            for (dim, s, c) in rows {
+                grouped_data.entry(dim.clone()).or_default().push(json!({
+                    "dimension": dim,
+                    "segment": s,
+                    "count": c
+                }));
+            }
+        } else {
+            let sql = format!(
+                "SELECT {} AS dimension, {} AS segment,
+                        COALESCE(sum(CASE WHEN ep_est.value ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN ep_est.value::float8 ELSE 0 END), 0)::float8 AS estimate
+                 FROM issues i
+                 {}
+                 {}
+                 LEFT JOIN estimate_points ep_est ON ep_est.id = i.estimate_point_id
+                 WHERE {} AND {} IS NOT NULL
+                 GROUP BY dimension, segment
+                 ORDER BY dimension",
+                x_def.expr, seg_def.expr, x_def.join_sql, seg_def.join_sql, base.sql, x_def.expr
+            );
+            let mut qq = sqlx::query_as::<_, (String, Option<String>, f64)>(&sql);
+            for a in &base.args {
+                qq = match a {
+                    Arg::Uuid(v) => qq.bind(*v),
+                    Arg::Uuids(v) => qq.bind(v.clone()),
+                    Arg::Text(v) => qq.bind(v.clone()),
+                    Arg::Texts(v) => qq.bind(v.clone()),
+                    Arg::Bool(v) => qq.bind(*v),
+                };
+            }
+            let rows = qq.fetch_all(db).await?;
+            for (dim, s, est) in rows {
+                grouped_data.entry(dim.clone()).or_default().push(json!({
+                    "dimension": dim,
+                    "segment": s,
+                    "estimate": est
+                }));
+            }
+        }
+    } else if y_axis == "issue_count" {
+        let sql = format!(
+            "SELECT {} AS dimension, count(*)::bigint AS count
+             FROM issues i
+             {}
+             WHERE {} AND {} IS NOT NULL
+             GROUP BY dimension
+             ORDER BY dimension",
+            x_def.expr, x_def.join_sql, base.sql, x_def.expr
+        );
+        let mut qq = sqlx::query_as::<_, (String, i64)>(&sql);
+        for a in &base.args {
+            qq = match a {
+                Arg::Uuid(v) => qq.bind(*v),
+                Arg::Uuids(v) => qq.bind(v.clone()),
+                Arg::Text(v) => qq.bind(v.clone()),
+                Arg::Texts(v) => qq.bind(v.clone()),
+                Arg::Bool(v) => qq.bind(*v),
+            };
+        }
+        let rows = qq.fetch_all(db).await?;
+        for (dim, c) in rows {
+            grouped_data.entry(dim.clone()).or_default().push(json!({
+                "dimension": dim,
+                "count": c
+            }));
+        }
+    } else {
+        let sql = format!(
+            "SELECT {} AS dimension,
+                    COALESCE(sum(CASE WHEN ep_est.value ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN ep_est.value::float8 ELSE 0 END), 0)::float8 AS estimate
+             FROM issues i
+             {}
+             LEFT JOIN estimate_points ep_est ON ep_est.id = i.estimate_point_id
+             WHERE {} AND {} IS NOT NULL
+             GROUP BY dimension
+             ORDER BY dimension",
+            x_def.expr, x_def.join_sql, base.sql, x_def.expr
+        );
+        let mut qq = sqlx::query_as::<_, (String, f64)>(&sql);
+        for a in &base.args {
+            qq = match a {
+                Arg::Uuid(v) => qq.bind(*v),
+                Arg::Uuids(v) => qq.bind(v.clone()),
+                Arg::Text(v) => qq.bind(v.clone()),
+                Arg::Texts(v) => qq.bind(v.clone()),
+                Arg::Bool(v) => qq.bind(*v),
+            };
+        }
+        let rows = qq.fetch_all(db).await?;
+        for (dim, est) in rows {
+            grouped_data.entry(dim.clone()).or_default().push(json!({
+                "dimension": dim,
+                "estimate": est
+            }));
+        }
+    }
+
+    let mut out = Map::new();
+    if x_axis == "priority" {
+        for p in ["low", "medium", "high", "urgent", "none"] {
+            if let Some(items) = grouped_data.remove(p) {
+                out.insert(p.to_string(), Value::Array(items));
+            }
+        }
+    } else {
+        let mut keys: Vec<String> = grouped_data.keys().cloned().collect();
+        keys.sort_by(|a, b| (a == "none", a).cmp(&(b == "none", b)));
+        for k in keys {
+            if let Some(items) = grouped_data.remove(&k) {
+                out.insert(k, Value::Array(items));
+            }
+        }
+    }
+
+    Ok(Value::Object(out))
+}
+
+async fn analytics(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(slug): Path<String>,
+    Query(q): Query<Q>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER])?;
+
+    let x_axis = qv(&q, "x_axis").unwrap_or_default();
+    let y_axis = qv(&q, "y_axis").unwrap_or_default();
+    let segment = qv(&q, "segment");
+
+    let mut base = issue_base(ws.workspace_id, user.id, &q, None);
+    crate::workitems::apply_filters(&mut base, &q);
+
+    let distribution = run_graph_plot(&st.db, &base, x_axis, y_axis, segment).await?;
+    let total = count(&st.db, "issues i", &base, "TRUE").await?;
+
+    let state_details = if x_axis == "state_id" || segment == Some("state_id") {
+        let sql = format!(
+            "SELECT jsonb_build_object('state_id', s.id, 'state__name', s.name, 'state__color', s.color)
+             FROM issues i
+             JOIN states s ON s.id = i.state_id
+             WHERE {}
+             GROUP BY s.id, s.name, s.color
+             ORDER BY s.id",
+            base.sql
+        );
+        Value::Array(fetch_json_rows(&st.db, &sql, &base).await?)
+    } else {
+        json!({})
+    };
+
+    let label_details = if x_axis == "labels__id" || segment == Some("labels__id") {
+        let sql = format!(
+            "SELECT jsonb_build_object('labels__id', l.id, 'labels__color', l.color, 'labels__name', l.name)
+             FROM issues i
+             JOIN issue_labels il ON il.issue_id = i.id AND il.deleted_at IS NULL
+             JOIN labels l ON l.id = il.label_id
+             WHERE {}
+             GROUP BY l.id, l.color, l.name
+             ORDER BY l.id",
+            base.sql
+        );
+        Value::Array(fetch_json_rows(&st.db, &sql, &base).await?)
+    } else {
+        json!({})
+    };
+
+    let assignee_details = if x_axis == "assignees__id" || segment == Some("assignees__id") {
+        let sql = format!(
+            "SELECT jsonb_build_object(
+                'assignees__id', u.id,
+                'assignees__display_name', u.display_name,
+                'assignees__first_name', u.first_name,
+                'assignees__last_name', u.last_name,
+                'assignees__avatar_url', CASE
+                    WHEN u.avatar_asset_id IS NOT NULL THEN '/api/assets/v2/static/' || u.avatar_asset_id::text || '/'
+                    ELSE NULLIF(u.avatar, '')
+                END
+             )
+             FROM issues i
+             JOIN issue_assignees ia ON ia.issue_id = i.id AND ia.deleted_at IS NULL
+             JOIN users u ON u.id = ia.assignee_id
+             WHERE {} AND (u.avatar != '' OR u.avatar_asset_id IS NOT NULL)
+             GROUP BY u.id, u.display_name, u.first_name, u.last_name, u.avatar_asset_id, u.avatar
+             ORDER BY u.id",
+            base.sql
+        );
+        Value::Array(fetch_json_rows(&st.db, &sql, &base).await?)
+    } else {
+        json!({})
+    };
+
+    let cycle_details = if x_axis == "issue_cycle__cycle_id" || segment == Some("issue_cycle__cycle_id") {
+        let sql = format!(
+            "SELECT jsonb_build_object('issue_cycle__cycle_id', c.id, 'issue_cycle__cycle__name', c.name)
+             FROM issues i
+             JOIN cycle_issues ci ON ci.issue_id = i.id AND ci.deleted_at IS NULL
+             JOIN cycles c ON c.id = ci.cycle_id
+             WHERE {}
+             GROUP BY c.id, c.name
+             ORDER BY c.id",
+            base.sql
+        );
+        Value::Array(fetch_json_rows(&st.db, &sql, &base).await?)
+    } else {
+        json!({})
+    };
+
+    let module_details = if x_axis == "issue_module__module_id" || segment == Some("issue_module__module_id") {
+        let sql = format!(
+            "SELECT jsonb_build_object('issue_module__module_id', m.id, 'issue_module__module__name', m.name)
+             FROM issues i
+             JOIN module_issues mi ON mi.issue_id = i.id AND mi.deleted_at IS NULL
+             JOIN modules m ON m.id = mi.module_id
+             WHERE {}
+             GROUP BY m.id, m.name
+             ORDER BY m.id",
+            base.sql
+        );
+        Value::Array(fetch_json_rows(&st.db, &sql, &base).await?)
+    } else {
+        json!({})
+    };
+
+    Ok(Json(json!({
+        "total": total,
+        "distribution": distribution,
+        "extras": {
+            "state_details": state_details,
+            "assignee_details": assignee_details,
+            "label_details": label_details,
+            "cycle_details": cycle_details,
+            "module_details": module_details
+        }
+    })))
+}
+
+async fn default_analytics(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(slug): Path<String>,
+    Query(q): Query<Q>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER, GUEST])?;
+
+    let mut base = issue_base(ws.workspace_id, user.id, &q, None);
+    crate::workitems::apply_filters(&mut base, &q);
+
+    let total_issues = count(&st.db, "issues i", &base, "TRUE").await?;
+
+    let sql_classified = format!(
+        "SELECT jsonb_build_object('state_group', s.group, 'state_count', count(*)::bigint)
+         FROM issues i
+         LEFT JOIN states s ON s.id = i.state_id
+         WHERE {}
+         GROUP BY s.group
+         ORDER BY s.group NULLS LAST",
+        base.sql
+    );
+    let total_issues_classified = fetch_json_rows(&st.db, &sql_classified, &base).await?;
+
+    let open_extra =
+        "EXISTS (SELECT 1 FROM states s WHERE s.id = i.state_id AND s.group IN ('backlog', 'unstarted', 'started'))";
+    let open_issues = count(&st.db, "issues i", &base, open_extra).await?;
+
+    let sql_open_classified = format!(
+        "SELECT jsonb_build_object('state_group', s.group, 'state_count', count(*)::bigint)
+         FROM issues i
+         LEFT JOIN states s ON s.id = i.state_id
+         WHERE {} AND s.group IN ('backlog', 'unstarted', 'started')
+         GROUP BY s.group
+         ORDER BY s.group NULLS LAST",
+        base.sql
+    );
+    let open_issues_classified = fetch_json_rows(&st.db, &sql_open_classified, &base).await?;
+
+    let current_year = Utc::now().year();
+    let sql_month_wise = format!(
+        "SELECT jsonb_build_object('month', EXTRACT(month FROM i.completed_at)::integer, 'count', count(*)::bigint)
+         FROM issues i
+         WHERE {} AND EXTRACT(year FROM i.completed_at) = {current_year}
+         GROUP BY EXTRACT(month FROM i.completed_at)
+         ORDER BY EXTRACT(month FROM i.completed_at)",
+        base.sql
+    );
+    let issue_completed_month_wise = fetch_json_rows(&st.db, &sql_month_wise, &base).await?;
+
+    let sql_created_user = format!(
+        "SELECT jsonb_build_object(
+            'created_by__first_name', u.first_name,
+            'created_by__last_name', u.last_name,
+            'created_by__display_name', u.display_name,
+            'created_by__id', u.id,
+            'created_by__avatar_url', CASE
+                WHEN u.avatar_asset_id IS NOT NULL THEN '/api/assets/v2/static/' || u.avatar_asset_id::text || '/'
+                ELSE NULLIF(u.avatar, '')
+            END,
+            'count', count(*)::bigint
+         )
+         FROM issues i
+         JOIN users u ON u.id = i.created_by_id
+         WHERE {} AND i.created_by_id IS NOT NULL
+         GROUP BY u.id, u.first_name, u.last_name, u.display_name, u.avatar_asset_id, u.avatar
+         ORDER BY count(*) DESC
+         LIMIT 5",
+        base.sql
+    );
+    let most_issue_created_user = fetch_json_rows(&st.db, &sql_created_user, &base).await?;
+
+    let sql_closed_user = format!(
+        "SELECT jsonb_build_object(
+            'assignees__first_name', u.first_name,
+            'assignees__last_name', u.last_name,
+            'assignees__display_name', u.display_name,
+            'assignees__id', u.id,
+            'assignees__avatar_url', CASE
+                WHEN u.avatar_asset_id IS NOT NULL THEN '/api/assets/v2/static/' || u.avatar_asset_id::text || '/'
+                ELSE NULLIF(u.avatar, '')
+            END,
+            'count', count(DISTINCT i.id)::bigint
+         )
+         FROM issues i
+         JOIN issue_assignees ia ON ia.issue_id = i.id AND ia.deleted_at IS NULL
+         JOIN users u ON u.id = ia.assignee_id
+         WHERE {} AND i.completed_at IS NOT NULL
+         GROUP BY u.id, u.first_name, u.last_name, u.display_name, u.avatar_asset_id, u.avatar
+         ORDER BY count(DISTINCT i.id) DESC
+         LIMIT 5",
+        base.sql
+    );
+    let most_issue_closed_user = fetch_json_rows(&st.db, &sql_closed_user, &base).await?;
+
+    let sql_pending_user = format!(
+        "SELECT jsonb_build_object(
+            'assignees__first_name', u.first_name,
+            'assignees__last_name', u.last_name,
+            'assignees__display_name', u.display_name,
+            'assignees__id', u.id,
+            'assignees__avatar_url', CASE
+                WHEN u.avatar_asset_id IS NOT NULL THEN '/api/assets/v2/static/' || u.avatar_asset_id::text || '/'
+                ELSE NULLIF(u.avatar, '')
+            END,
+            'count', count(DISTINCT i.id)::bigint
+         )
+         FROM issues i
+         JOIN issue_assignees ia ON ia.issue_id = i.id AND ia.deleted_at IS NULL
+         JOIN users u ON u.id = ia.assignee_id
+         WHERE {} AND i.completed_at IS NULL
+         GROUP BY u.id, u.first_name, u.last_name, u.display_name, u.avatar_asset_id, u.avatar
+         ORDER BY count(DISTINCT i.id) DESC",
+        base.sql
+    );
+    let pending_issue_user = fetch_json_rows(&st.db, &sql_pending_user, &base).await?;
+
+    let sql_open_est = format!(
+        "SELECT sum(i.point)::float8 FROM issues i LEFT JOIN states s ON s.id = i.state_id WHERE {} AND s.group IN ('backlog', 'unstarted', 'started')",
+        base.sql
+    );
+    let mut qq_open = sqlx::query_scalar::<_, Option<f64>>(&sql_open_est);
+    for a in &base.args {
+        qq_open = match a {
+            Arg::Uuid(v) => qq_open.bind(*v),
+            Arg::Uuids(v) => qq_open.bind(v.clone()),
+            Arg::Text(v) => qq_open.bind(v.clone()),
+            Arg::Texts(v) => qq_open.bind(v.clone()),
+            Arg::Bool(v) => qq_open.bind(*v),
+        };
+    }
+    let open_estimate_sum: Option<f64> = qq_open.fetch_one(&st.db).await?;
+
+    let sql_tot_est = format!("SELECT sum(i.point)::float8 FROM issues i WHERE {}", base.sql);
+    let mut qq_tot = sqlx::query_scalar::<_, Option<f64>>(&sql_tot_est);
+    for a in &base.args {
+        qq_tot = match a {
+            Arg::Uuid(v) => qq_tot.bind(*v),
+            Arg::Uuids(v) => qq_tot.bind(v.clone()),
+            Arg::Text(v) => qq_tot.bind(v.clone()),
+            Arg::Texts(v) => qq_tot.bind(v.clone()),
+            Arg::Bool(v) => qq_tot.bind(*v),
+        };
+    }
+    let total_estimate_sum: Option<f64> = qq_tot.fetch_one(&st.db).await?;
+
+    Ok(Json(json!({
+        "total_issues": total_issues,
+        "total_issues_classified": total_issues_classified,
+        "open_issues": open_issues,
+        "open_issues_classified": open_issues_classified,
+        "issue_completed_month_wise": issue_completed_month_wise,
+        "most_issue_created_user": most_issue_created_user,
+        "most_issue_closed_user": most_issue_closed_user,
+        "pending_issue_user": pending_issue_user,
+        "open_estimate_sum": open_estimate_sum,
+        "total_estimate_sum": total_estimate_sum,
+    })))
+}
+
+async fn view_list(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN])?;
+    json_rows(
+        sqlx::query_scalar(&format!(
+            "SELECT {ANALYTIC_VIEW_JSON} FROM analytic_views v WHERE v.workspace_id = $1 AND v.deleted_at IS NULL ORDER BY v.created_at DESC"
+        ))
+        .bind(ws.workspace_id),
+        &st.db,
+    )
+    .await
+}
+
+async fn view_create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(slug): Path<String>,
+    Json(b): Json<Value>,
+) -> ApiResult<(axum::http::StatusCode, Json<Value>)> {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN])?;
+
+    let name = s(&b, "name")
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| ApiError::bad_body(json!({"name": ["This field is required."]})))?;
+    let description = s(&b, "description").unwrap_or("");
+    let query_dict = b.get("query_dict").cloned().unwrap_or_else(|| json!({}));
+
+    let row: Value = sqlx::query_scalar(&format!(
+        "INSERT INTO analytic_views AS v (id, name, description, query, query_dict, workspace_id, created_by_id, updated_by_id, created_at, updated_at)
+         VALUES (gen_random_uuid(), $1, $2, '{{}}'::jsonb, $3, $4, $5, $5, now(), now())
+         RETURNING {ANALYTIC_VIEW_JSON}"
+    ))
+    .bind(name)
+    .bind(description)
+    .bind(query_dict)
+    .bind(ws.workspace_id)
+    .bind(user.id)
+    .fetch_one(&st.db)
+    .await?;
+
+    created(row)
+}
+
+async fn view_retrieve(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pk)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN])?;
+    json_row(
+        sqlx::query_scalar(&format!(
+            "SELECT {ANALYTIC_VIEW_JSON} FROM analytic_views v WHERE v.id = $1 AND v.workspace_id = $2 AND v.deleted_at IS NULL"
+        ))
+        .bind(pk)
+        .bind(ws.workspace_id),
+        &st.db,
+    )
+    .await
+}
+
+async fn view_update(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pk)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN])?;
+
+    let mut sets = crate::users::patch_sets(&b, VIEW_FIELDS, 3);
+    if sets.is_empty() {
+        return view_retrieve(State(st), user, Path((slug, pk))).await;
+    }
+    sets.push("updated_at = now()".into());
+    sets.push("updated_by_id = $2".into());
+
+    let sql = format!(
+        "UPDATE analytic_views v SET {} WHERE v.id = $1 AND v.workspace_id = $4 AND v.deleted_at IS NULL RETURNING {ANALYTIC_VIEW_JSON}",
+        sets.join(", ")
+    );
+    json_row(
+        sqlx::query_scalar(&sql)
+            .bind(pk)
+            .bind(user.id)
+            .bind(&b)
+            .bind(ws.workspace_id),
+        &st.db,
+    )
+    .await
+}
+
+async fn view_destroy(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, pk)): Path<(String, Uuid)>,
+) -> ApiResult<axum::http::StatusCode> {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN])?;
+
+    let res = sqlx::query(
+        "UPDATE analytic_views SET deleted_at = now() WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(ws.workspace_id)
+    .execute(&st.db)
+    .await?;
+
+    if res.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
+}
+
+async fn saved_view_run(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, analytic_id)): Path<(String, Uuid)>,
+    Query(q): Query<Q>,
+) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER])?;
+
+    let row: Option<(Value,)> = sqlx::query_as(
+        "SELECT v.query_dict FROM analytic_views v WHERE v.id = $1 AND v.workspace_id = $2 AND v.deleted_at IS NULL",
+    )
+    .bind(analytic_id)
+    .bind(ws.workspace_id)
+    .fetch_optional(&st.db)
+    .await?;
+
+    let (query_dict,) = row.ok_or_else(ApiError::not_found)?;
+
+    let x_axis_str = query_dict
+        .get("x_axis")
+        .and_then(Value::as_str)
+        .or_else(|| qv(&q, "x_axis"))
+        .unwrap_or("priority");
+    let y_axis_str = query_dict
+        .get("y_axis")
+        .and_then(Value::as_str)
+        .or_else(|| qv(&q, "y_axis"))
+        .unwrap_or("issue_count");
+    let segment = qv(&q, "segment").or_else(|| query_dict.get("segment").and_then(Value::as_str));
+
+    let mut base = issue_base(ws.workspace_id, user.id, &q, None);
+    crate::workitems::apply_filters(&mut base, &q);
+
+    if let Value::Object(dict_map) = &query_dict {
+        let mut string_map = HashMap::new();
+        for (k, v) in dict_map {
+            if let Some(s) = v.as_str() {
+                string_map.insert(k.clone(), s.to_string());
+            }
+        }
+        crate::workitems::apply_filters(&mut base, &string_map);
+    }
+
+    let distribution = run_graph_plot(&st.db, &base, x_axis_str, y_axis_str, segment).await?;
+    let total = count(&st.db, "issues i", &base, "TRUE").await?;
+
+    Ok(Json(json!({
+        "total": total,
+        "distribution": distribution
+    })))
 }
