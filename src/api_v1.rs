@@ -1,6 +1,7 @@
 use axum::{
     Router,
     extract::{Path, Query, State},
+    http::StatusCode,
     routing::get,
 };
 
@@ -20,6 +21,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/workspaces/{slug}/members/", get(workspace_members))
         .route("/api/v1/workspaces/{slug}/projects/", get(projects))
         .route("/api/v1/workspaces/{slug}/projects/{project_id}/", get(project))
+        .route(
+            "/api/v1/workspaces/{slug}/projects/{project_id}/archive/",
+            axum::routing::post(archive_project).delete(unarchive_project),
+        )
         .route("/api/v1/workspaces/{slug}/projects/{project_id}/states/", get(states))
         .route(
             "/api/v1/workspaces/{slug}/projects/{project_id}/states/{state_id}/",
@@ -30,6 +35,33 @@ pub fn routes() -> Router<AppState> {
             "/api/v1/workspaces/{slug}/projects/{project_id}/labels/{label_id}/",
             get(label),
         )
+}
+
+async fn set_archived(st: AppState, user: CurrentUser, slug: String, id: Uuid, archive: bool) -> ApiResult<StatusCode> {
+    let p = require_project(&st.db, &user, &slug, id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let result = sqlx::query("UPDATE projects SET archived_at=CASE WHEN $3 THEN now() ELSE NULL END, updated_at=now(), updated_by_id=$4 WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL")
+        .bind(id).bind(p.workspace_id()).bind(archive).bind(user.id).execute(&st.db).await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
+}
+
+async fn archive_project(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, id)): Path<(String, Uuid)>,
+) -> ApiResult<StatusCode> {
+    set_archived(st, user, slug, id, true).await
+}
+
+async fn unarchive_project(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, id)): Path<(String, Uuid)>,
+) -> ApiResult<StatusCode> {
+    set_archived(st, user, slug, id, false).await
 }
 
 const STATE_JSON: &str = "(to_jsonb(s) - 'workspace_id' - 'project_id' - 'created_by_id' - 'updated_by_id') || jsonb_build_object('workspace',s.workspace_id,'project',s.project_id,'created_by',s.created_by_id,'updated_by',s.updated_by_id)";
