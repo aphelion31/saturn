@@ -348,15 +348,11 @@ fn parse_cursor(c: Option<&str>) -> (i64, bool) {
 /// Paginated, optionally grouped work-item list with Plane's response envelope.
 pub async fn list(db: &PgPool, mut base: Base, q: &HashMap<String, String>, scope: Scope) -> ApiResult {
     apply_filters(&mut base, q);
-    let per_page: i64 = match q.get("per_page") {
-        Some(value) => value
-            .parse::<i64>()
-            .ok()
-            .filter(|n| *n > 0)
-            .ok_or_else(|| crate::common::ApiError::bad("Invalid per_page"))?
-            .min(1000),
-        None => 1000,
-    };
+    let per_page: i64 = q
+        .get("per_page")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000)
+        .clamp(1, 1000);
     let (page, _) = parse_cursor(q.get("cursor").map(String::as_str));
     let order = order_sql(q.get("order_by").map(String::as_str).unwrap_or("-created_at"));
     let group_by = q
