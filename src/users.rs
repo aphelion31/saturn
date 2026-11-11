@@ -131,7 +131,25 @@ async fn me(State(st): State<AppState>, user: CurrentUser) -> ApiResult {
     .await
 }
 
+pub async fn validate_timezone(db: &sqlx::PgPool, body: &Value, field: &str) -> Result<(), ApiError> {
+    if let Some(value) = body.get(field) {
+        let valid = if let Some(name) = value.as_str() {
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM pg_timezone_names WHERE name = $1)")
+                .bind(name)
+                .fetch_one(db)
+                .await?
+        } else {
+            false
+        };
+        if !valid {
+            return Err(ApiError::bad_body(json!({field: ["Enter a valid timezone."]})));
+        }
+    }
+    Ok(())
+}
+
 async fn update_me(State(st): State<AppState>, user: CurrentUser, Json(b): Json<Value>) -> ApiResult {
+    validate_timezone(&st.db, &b, "user_timezone").await?;
     if let Some(dn) = s(&b, "display_name")
         && dn.trim().is_empty()
     {
@@ -199,7 +217,7 @@ async fn settings(State(st): State<AppState>, user: CurrentUser) -> ApiResult {
 }
 
 /// ProfileSerializer is `fields = "__all__"`: every column, with the FK as `user`.
-const PROFILE_JSON: &str = "to_jsonb(p) - 'user_id' || jsonb_build_object('user', p.user_id)";
+const PROFILE_JSON: &str = "to_jsonb(p) - 'user_id' || jsonb_build_object('user', p.user_id, 'user_timezone', (SELECT u.user_timezone FROM users u WHERE u.id = p.user_id))";
 
 async fn ensure_profile(st: &AppState, user_id: Uuid) -> Result<(), ApiError> {
     sqlx::query(
@@ -263,19 +281,28 @@ pub fn patch_sets(body: &Value, fields: &[(&str, &str)], param: usize) -> Vec<St
 }
 
 async fn update_profile(State(st): State<AppState>, user: CurrentUser, Json(b): Json<Value>) -> ApiResult {
+    validate_timezone(&st.db, &b, "user_timezone").await?;
     ensure_profile(&st, user.id).await?;
+    let mut tx = st.db.begin().await?;
+    if let Some(timezone) = s(&b, "user_timezone") {
+        sqlx::query("UPDATE users SET user_timezone = $2, updated_at = now() WHERE id = $1")
+            .bind(user.id)
+            .bind(timezone)
+            .execute(&mut *tx)
+            .await?;
+    }
     let mut sets = patch_sets(&b, PROFILE_FIELDS, 2);
     sets.push("updated_at = now()".into());
-    json_row(
-        sqlx::query_scalar(&format!(
-            "UPDATE profiles p SET {} WHERE p.user_id = $1 RETURNING {PROFILE_JSON}",
-            sets.join(", ")
-        ))
-        .bind(user.id)
-        .bind(&b),
-        &st.db,
-    )
-    .await
+    let result: Value = sqlx::query_scalar(&format!(
+        "UPDATE profiles p SET {} WHERE p.user_id = $1 RETURNING {PROFILE_JSON}",
+        sets.join(", ")
+    ))
+    .bind(user.id)
+    .bind(&b)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Json(result))
 }
 
 async fn instance_admin(State(st): State<AppState>, user: CurrentUser) -> ApiResult {

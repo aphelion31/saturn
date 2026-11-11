@@ -206,6 +206,7 @@ async fn update(
 ) -> ApiResult {
     let ws = require_workspace(&st.db, &user, &slug).await?;
     ws.require(&[ADMIN])?;
+    crate::users::validate_timezone(&st.db, &b, "timezone").await?;
     if let Some(n) = s(&b, "name")
         && (n.trim().is_empty() || n.chars().count() > 80)
     {
@@ -418,12 +419,25 @@ async fn member_remove(
             "User is a part of some projects where they are the only admin, they should either leave that project or promote another user to admin.",
         ));
     }
-    deactivate_member(&st.db, ws.workspace_id, target.0, target.1).await?;
+    deactivate_member(&st.db, ws.workspace_id, target.0, target.1, true).await?;
     no_content()
 }
 
-async fn deactivate_member(db: &sqlx::PgPool, workspace_id: Uuid, wm_id: Uuid, member: Uuid) -> Result<(), ApiError> {
+async fn deactivate_member(
+    db: &sqlx::PgPool,
+    workspace_id: Uuid,
+    wm_id: Uuid,
+    member: Uuid,
+    revoke: bool,
+) -> Result<(), ApiError> {
     let mut tx = db.begin().await?;
+    if revoke {
+        sqlx::query("UPDATE workspace_member_invites SET deleted_at = now() WHERE workspace_id = $1 AND deleted_at IS NULL AND lower(email) = (SELECT lower(email) FROM users WHERE id = $2)")
+            .bind(workspace_id)
+            .bind(member)
+            .execute(&mut *tx)
+            .await?;
+    }
     sqlx::query("UPDATE project_members SET is_active = false, updated_at = now() WHERE workspace_id = $1 AND member_id = $2 AND is_active")
         .bind(workspace_id)
         .bind(member)
@@ -466,7 +480,7 @@ async fn leave(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<S
     .bind(user.id)
     .fetch_one(&st.db)
     .await?;
-    deactivate_member(&st.db, ws.workspace_id, wm.0, user.id).await?;
+    deactivate_member(&st.db, ws.workspace_id, wm.0, user.id, false).await?;
     no_content()
 }
 
@@ -1218,7 +1232,8 @@ async fn user_profile(
     let ws = require_workspace(&st.db, &user, &slug).await?;
     let row: Option<Value> = sqlx::query_scalar(
         "SELECT jsonb_build_object('email', u.email, 'first_name', u.first_name, 'last_name', u.last_name,
-            'avatar_url', NULLIF(u.avatar, ''), 'cover_image_url', u.cover_image, 'date_joined', u.date_joined)
+            'avatar_url', NULLIF(u.avatar, ''), 'cover_image_url', u.cover_image, 'date_joined', u.date_joined,
+            'user_timezone', u.user_timezone)
          FROM workspace_members m JOIN users u ON u.id = m.member_id
          WHERE m.workspace_id = $1 AND m.member_id = $2 AND m.is_active AND m.deleted_at IS NULL",
     )
