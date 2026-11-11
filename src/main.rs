@@ -18,6 +18,7 @@ mod pages;
 mod projects;
 mod public;
 mod states;
+mod user_dash;
 mod users;
 mod views;
 mod workspaces;
@@ -54,6 +55,7 @@ pub fn app(state: AppState) -> Router {
         .merge(public::routes())
         .merge(analytics::routes())
         .merge(api_v1_items::routes())
+        .merge(user_dash::routes())
         .route("/api/{*rest}", any(web::not_implemented))
         .route("/auth/{*rest}", any(web::not_implemented))
         .layer(middleware::from_fn_with_state(state.clone(), web::origin_check));
