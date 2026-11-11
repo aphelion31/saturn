@@ -762,7 +762,7 @@ async fn list(
     State(st): State<AppState>,
     user: CurrentUser,
     Path((slug, project_id)): Path<(String, Uuid)>,
-    Query(q): Query<HashMap<String, String>>,
+    Query(mut q): Query<HashMap<String, String>>,
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER, GUEST])?;
@@ -772,12 +772,41 @@ async fn list(
             return Err(ApiError::bad("Invalid per_page parameter."));
         }
     }
+    let requested_group_by = q.get("group_by").cloned();
+    if let Some(ref g) = requested_group_by {
+        let mapped = match g.as_str() {
+            "state" => "state_id",
+            "labels" | "label_ids" => "labels__id",
+            "assignees" | "assignee_ids" => "assignees__id",
+            "cycle" | "cycles" => "cycle_id",
+            "module" | "modules" | "module_ids" => "issue_module__module_id",
+            other => other,
+        };
+        q.insert("group_by".to_string(), mapped.to_string());
+    }
+    if let Some(sg) = q.get("sub_group_by").cloned() {
+        let mapped = match sg.as_str() {
+            "state" => "state_id",
+            "labels" | "label_ids" => "labels__id",
+            "assignees" | "assignee_ids" => "assignees__id",
+            "cycle" | "cycles" => "cycle_id",
+            "module" | "modules" | "module_ids" => "issue_module__module_id",
+            other => other,
+        };
+        q.insert("sub_group_by".to_string(), mapped.to_string());
+    }
     let mut base = Base::new(
         format!("i.project_id = $1 AND i.workspace_id = $2 AND {ACTIVE}"),
         vec![Arg::Uuid(project_id), Arg::Uuid(p.workspace_id())],
     );
     scoped(&p, &mut base);
-    workitems::list(&st.db, base, &q, Scope::Project(project_id)).await
+    let mut resp = workitems::list(&st.db, base, &q, Scope::Project(project_id)).await?;
+    if let Some(orig) = requested_group_by {
+        if let Some(obj) = resp.0.as_object_mut() {
+            obj.insert("grouped_by".to_string(), json!(orig));
+        }
+    }
+    Ok(resp)
 }
 
 async fn retrieve(State(st): State<AppState>, user: CurrentUser, Path((slug, project_id, pk)): ItemPath) -> ApiResult {

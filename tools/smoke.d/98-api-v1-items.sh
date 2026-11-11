@@ -22,6 +22,11 @@ jq -e '.completed_at | startswith("2026-01-03")' <<<"$body" >/dev/null
 v1 DELETE "$V1/$COMP_ITEM/"
 v1 GET "$V1/?per_page=5"
 jq -e '.results and .next_cursor and (has("total_results"))' <<<"$body" >/dev/null
+# 9765: work-items list honors group_by and returns grouped_by
+v1 GET "$V1/?group_by=state"
+jq -e '.grouped_by == "state" and (.results | type == "object")' <<<"$body" >/dev/null
+v1 GET "$V1/?group_by=priority"
+jq -e '.grouped_by == "priority" and (.results | type == "object")' <<<"$body" >/dev/null
 # 9429: non-positive or non-numeric per_page rejected with 400
 c=$(curl -s -o /dev/null -w '%{http_code}' -H "X-Api-Key: $TOKEN" "$BASE$V1/?per_page=0")
 [[ "$c" == "400" ]] || { echo "✖ per_page=0 -> $c" >&2; exit 1; }
