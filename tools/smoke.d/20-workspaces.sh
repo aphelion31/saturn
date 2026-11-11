@@ -1,7 +1,7 @@
 # Workspaces (src/workspaces.rs)
 # Plane #10001: workspace draft endpoints are not implemented in Saturn.
 code=$(curl -s -o /dev/null -w '%{http_code}' -b "$jar" "$BASE/api/workspaces/$SLUG/draft-issues/00000000-0000-0000-0000-000000000001/")
-[[ "$code" == 404 || "$code" == 405 ]]
+[[ "$code" == 501 ]]
 call GET /api/users/me/workspaces/
 call GET "/api/workspace-slug-check/?slug=smoke-$RANDOM"
 call GET "/api/workspaces/$SLUG/"
