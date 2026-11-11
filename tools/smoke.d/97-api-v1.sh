@@ -70,6 +70,11 @@ call_v1 GET "/api/v1/workspaces/$SLUG/projects/$PROJECT/estimates/$V1_EST/estima
 
 # 5. Workspace detail & project members alias (Plane urls/member.py)
 call_v1 GET "/api/v1/workspaces/$SLUG/"
+# 10214: project PATCH/POST with foreign project_lead rejected with 400
+c=$(curl -s -o /dev/null -w '%{http_code}' -X PATCH -H "X-Api-Key: $V1_TOKEN" -H 'content-type: application/json' -d '{"project_lead":"00000000-0000-0000-0000-000000000000"}' "$BASE/api/v1/workspaces/$SLUG/projects/$PROJECT/")
+[[ "$c" == "400" ]] || { echo "✖ foreign lead patch -> $c" >&2; exit 1; }
+c=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "X-Api-Key: $V1_TOKEN" -H 'content-type: application/json' -d '{"name":"Bad Lead Proj","identifier":"BLP","project_lead":"00000000-0000-0000-0000-000000000000"}' "$BASE/api/v1/workspaces/$SLUG/projects/")
+[[ "$c" == "400" ]] || { echo "✖ foreign lead post -> $c" >&2; exit 1; }
 call_v1 GET "/api/v1/workspaces/$SLUG/projects/$PROJECT/members/"
 MEMBER_PK=$(field '.[0].id')
 call_v1 GET "/api/v1/workspaces/$SLUG/projects/$PROJECT/members/$MEMBER_PK/"

@@ -267,8 +267,47 @@ async fn update_project(
     {
         return Err(ApiError::bad("Invalid name"));
     }
-    let row = sqlx::query("UPDATE projects SET name=COALESCE($3,name),description=COALESCE($4,description),updated_by_id=$5,updated_at=now() WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL AND archived_at IS NULL")
-        .bind(id).bind(p.workspace_id()).bind(s(&b,"name")).bind(s(&b,"description")).bind(user.id).execute(&st.db).await?;
+    for field in ["project_lead", "default_assignee"] {
+        if let Some(v) = b.get(field).filter(|v| !v.is_null()) {
+            let mid = v
+                .as_str()
+                .and_then(|v| Uuid::parse_str(v).ok())
+                .ok_or_else(|| ApiError::bad("Invalid workspace member"))?;
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id=$1 AND member_id=$2 AND is_active AND deleted_at IS NULL)",
+            )
+            .bind(p.workspace_id())
+            .bind(mid)
+            .fetch_one(&st.db)
+            .await?;
+            if !exists {
+                return Err(ApiError::bad("Invalid workspace member"));
+            }
+        }
+    }
+    let has_lead = b.get("project_lead").is_some();
+    let lead_id = uuid_of(&b, "project_lead");
+    let has_assignee = b.get("default_assignee").is_some();
+    let assignee_id = uuid_of(&b, "default_assignee");
+
+    let row = sqlx::query(
+        "UPDATE projects SET name=COALESCE($3,name), description=COALESCE($4,description),
+            project_lead_id=CASE WHEN $5 THEN $6 ELSE project_lead_id END,
+            default_assignee_id=CASE WHEN $7 THEN $8 ELSE default_assignee_id END,
+            updated_by_id=$9, updated_at=now()
+         WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL AND archived_at IS NULL",
+    )
+    .bind(id)
+    .bind(p.workspace_id())
+    .bind(s(&b, "name"))
+    .bind(s(&b, "description"))
+    .bind(has_lead)
+    .bind(lead_id)
+    .bind(has_assignee)
+    .bind(assignee_id)
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
     if row.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
