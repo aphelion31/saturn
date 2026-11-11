@@ -54,6 +54,9 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -b "$MEMBER_JAR" -X POST "$BASE/ap
 echo "✔ member leave -> 204"
 call POST "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/members/" '{"members":[{"member_id":"'"$SMOKE_USER"'","role":15}]}'
 call DELETE "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/members/$MEMBERSHIP/"
+psql "${DATABASE_URL:-postgres://localhost/saturn}" -X -q -v ON_ERROR_STOP=1 -v project="$SMOKE_PROJECT" <<< "UPDATE projects SET network=2 WHERE id=:'project'::uuid"
+code=$(curl -s -o /dev/null -w '%{http_code}' -b "$MEMBER_JAR" -X POST -H 'content-type: application/json' -d '{"project_ids":["'"$SMOKE_PROJECT"'"]}' "$BASE/api/users/me/workspaces/$SLUG/projects/invitations/")
+[[ "$code" == 403 ]] || { echo "✖ removed member rejoin -> $code" >&2; exit 1; }
 rm -f "$MEMBER_JAR"
 call GET "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/project-deploy-boards/"
 call POST "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/project-deploy-boards/" '{"is_comments_enabled":true}'
