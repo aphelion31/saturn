@@ -615,6 +615,9 @@ async fn comment_retrieve(
     Path((anchor, issue_id, pk)): Path<(String, Uuid, Uuid)>,
 ) -> ApiResult {
     let b = require_anchor(&st.db, &anchor).await?;
+    if !issue_in_board_scope(&st.db, &b, issue_id).await? {
+        return Err(ApiError::not_found());
+    }
     let current_user_id = user.0.map(|u| u.id).unwrap_or(Uuid::nil());
 
     let row: Option<(Value,)> = sqlx::query_as(
@@ -689,6 +692,9 @@ async fn comment_update(
     let b = require_anchor(&st.db, &anchor).await?;
     if !b.is_comments_enabled {
         return Err(ApiError::bad("Comments are not enabled for this project"));
+    }
+    if !issue_in_board_scope(&st.db, &b, issue_id).await? {
+        return Err(ApiError::not_found());
     }
 
     let existing: Option<(Option<String>, Option<Value>)> = sqlx::query_as(
@@ -768,6 +774,9 @@ async fn comment_destroy(
     let b = require_anchor(&st.db, &anchor).await?;
     if !b.is_comments_enabled {
         return Err(ApiError::bad("Comments are not enabled for this project"));
+    }
+    if !issue_in_board_scope(&st.db, &b, issue_id).await? {
+        return Err(ApiError::not_found());
     }
 
     let res = sqlx::query(

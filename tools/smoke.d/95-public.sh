@@ -26,6 +26,15 @@ if [[ -n "$PUB_ISSUE" ]]; then
   PUB_COMMENT_ID=$(field '.id')
 fi
 
+# Plane #9498/#9441: public comment endpoints only accept comments on issues of that board's project
+FOREIGN_ISSUE=$(psql "$DB" -Atc "select id from issues where project_id != '$PROJECT' and deleted_at is null limit 1")
+if [[ -z "$FOREIGN_ISSUE" ]]; then
+  FOREIGN_ISSUE="00000000-0000-0000-0000-000000000000"
+fi
+code=$(curl -s -b "$jar" -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' -d '{"comment_html":"<p>leak</p>"}' "$BASE/api/public/anchor/$ANCHOR/issues/$FOREIGN_ISSUE/comments/")
+[[ "$code" == 404 ]] || { echo "✖ comment on foreign issue -> $code (expected 404)" >&2; exit 1; }
+echo "✔ Plane #9498/#9441: public comment on foreign project issue rejected -> 404"
+
 # Plane #9506: public board voting respects is_votes_enabled
 if [[ -n "${PUB_ISSUE:-}" ]]; then
   psql "$DB" -X -q -c "UPDATE deploy_boards SET is_votes_enabled=false WHERE anchor='$ANCHOR'"
