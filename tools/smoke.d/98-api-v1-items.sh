@@ -27,6 +27,9 @@ v1 PATCH "$V1/$ITEM/" '{"name":"V1 smoke renamed"}'
 # 9947: start_date > target_date rejected with 400
 c=$(curl -s -o /dev/null -w '%{http_code}' -X PATCH -H "X-Api-Key: $TOKEN" -H 'content-type: application/json' -d '{"start_date":"2026-05-10","target_date":"2026-05-01"}' "$BASE$V1/$ITEM/")
 [[ "$c" == "400" ]] || { echo "✖ start>target -> $c" >&2; exit 1; }
+# 9115: PATCH archived_at on non-completed/non-cancelled work item rejected with 400
+c=$(curl -s -o /dev/null -w '%{http_code}' -X PATCH -H "X-Api-Key: $TOKEN" -H 'content-type: application/json' -d '{"archived_at":"2026-01-01"}' "$BASE$V1/$ITEM/")
+[[ "$c" == "400" ]] || { echo "✖ archive open item -> $c" >&2; exit 1; }
 v1 POST "$V1/$ITEM/comments/" '{"comment_html":"<p>smoke</p>"}'
 CMT=$(field '.id')
 v1 GET "$V1/$ITEM/comments/"
