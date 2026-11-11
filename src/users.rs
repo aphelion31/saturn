@@ -2,16 +2,29 @@
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
-    routing::{get, patch},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, patch, post},
 };
+use rand::Rng;
 use serde_json::{Value, json};
+use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::auth::{token_matches, valid_email};
 use crate::common::*;
+use crate::session;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/api/users/session/", get(session_info))
+        .route("/api/users/me/accounts/", get(accounts_list))
+        .route(
+            "/api/users/me/accounts/{pk}/",
+            get(account_retrieve).delete(account_delete),
+        )
+        .route("/api/users/me/email/generate-code/", post(generate_email_code))
+        .route("/api/users/me/email/", patch(update_email))
         .route("/api/users/me/", get(me).patch(update_me))
         .route("/api/users/me/settings/", get(settings))
         .route("/api/users/me/profile/", get(profile).patch(update_profile))
@@ -361,6 +374,247 @@ async fn tour_completed(State(st): State<AppState>, user: CurrentUser, Json(b): 
         .execute(&st.db)
         .await?;
     Ok(Json(json!({"message": "Updated successfully"})))
+}
+
+// --- session, login accounts, email change (UserSessionEndpoint, AccountEndpoint, UserEndpoint) ---
+
+/// `GET /api/users/session/`: `{"is_authenticated": false}` when signed out, Plane's shape.
+async fn session_info(State(st): State<AppState>, MaybeUser(user): MaybeUser) -> ApiResult {
+    let Some(user) = user else {
+        return Ok(Json(json!({"is_authenticated": false})));
+    };
+    let Json(me) = json_row(
+        sqlx::query_scalar(&format!("SELECT {USER_ME_JSON} FROM users u WHERE u.id = $1")).bind(user.id),
+        &st.db,
+    )
+    .await?;
+    Ok(Json(json!({"is_authenticated": true, "user": me})))
+}
+
+/// AccountSerializer without the secrets: no access_token, refresh_token, id_token or metadata.
+const ACCOUNT_JSON: &str = "jsonb_build_object('id', a.id, 'provider', a.provider,
+    'provider_account_id', a.provider_account_id, 'user', a.user_id, 'created_at', a.created_at,
+    'updated_at', a.updated_at, 'last_connected_at', a.last_connected_at,
+    'access_token_expired_at', a.access_token_expired_at, 'refresh_token_expired_at', a.refresh_token_expired_at)";
+
+async fn accounts_list(State(st): State<AppState>, user: CurrentUser) -> ApiResult {
+    json_rows(
+        sqlx::query_scalar(&format!(
+            "SELECT {ACCOUNT_JSON} FROM accounts a WHERE a.user_id = $1 ORDER BY a.created_at"
+        ))
+        .bind(user.id),
+        &st.db,
+    )
+    .await
+}
+
+async fn account_retrieve(State(st): State<AppState>, user: CurrentUser, Path(pk): Path<Uuid>) -> ApiResult {
+    json_row(
+        sqlx::query_scalar(&format!(
+            "SELECT {ACCOUNT_JSON} FROM accounts a WHERE a.id = $1 AND a.user_id = $2"
+        ))
+        .bind(pk)
+        .bind(user.id),
+        &st.db,
+    )
+    .await
+}
+
+/// Hard delete, as Plane. Refused when it would leave a user with no way to sign in: the password is
+/// an auto-set random one (`is_password_autoset`) and this is the last linked account.
+/// The user row is locked so two concurrent deletes cannot both pass the check.
+async fn account_delete(State(st): State<AppState>, user: CurrentUser, Path(pk): Path<Uuid>) -> ApiResult<StatusCode> {
+    let mut tx = st.db.begin().await?;
+    let (autoset,): (bool,) = sqlx::query_as("SELECT is_password_autoset FROM users WHERE id = $1 FOR UPDATE")
+        .bind(user.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM accounts WHERE user_id = $1")
+        .bind(user.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let (owned,): (bool,) = sqlx::query_as("SELECT EXISTS (SELECT 1 FROM accounts WHERE id = $1 AND user_id = $2)")
+        .bind(pk)
+        .bind(user.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if !owned {
+        return Err(ApiError::not_found());
+    }
+    if autoset && count <= 1 {
+        return Err(ApiError::bad(
+            "You cannot delete your only login method. Set a password first.",
+        ));
+    }
+    sqlx::query("DELETE FROM accounts WHERE id = $1 AND user_id = $2")
+        .bind(pk)
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    no_content()
+}
+
+/// Increment a fixed-window counter kept in `saturn_magic_codes` (same pattern as the sign-up code issue count).
+async fn bump_counter(db: &PgPool, key: &str) -> Result<i32, ApiError> {
+    let (n,): (i32,) = sqlx::query_as(
+        "INSERT INTO saturn_magic_codes (key, token, attempts, expires_at) VALUES ($1, '', 1, now() + interval '1 hour')
+         ON CONFLICT (key) DO UPDATE SET
+            attempts = CASE WHEN saturn_magic_codes.expires_at <= now() THEN 1 ELSE saturn_magic_codes.attempts + 1 END,
+            expires_at = CASE WHEN saturn_magic_codes.expires_at <= now() THEN now() + interval '1 hour'
+                              ELSE saturn_magic_codes.expires_at END
+         RETURNING attempts",
+    )
+    .bind(key)
+    .fetch_one(db)
+    .await?;
+    Ok(n)
+}
+
+/// Plane's throttle answers 429 (DRF `Throttled`).
+fn throttled() -> ApiError {
+    ApiError(
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({"detail": "Request was throttled. Try again later."}),
+    )
+}
+
+/// Plane's `_validate_new_email`, same messages.
+async fn check_new_email(st: &AppState, user: &CurrentUser, email: &str) -> Result<(), ApiError> {
+    if email.is_empty() {
+        return Err(ApiError::bad("Email is required"));
+    }
+    if !valid_email(email) {
+        return Err(ApiError::bad("Invalid email format"));
+    }
+    if email == user.email {
+        return Err(ApiError::bad("New email must be different from current email"));
+    }
+    let (taken,): (bool,) = sqlx::query_as("SELECT EXISTS (SELECT 1 FROM users WHERE email = $1 AND id <> $2)")
+        .bind(email)
+        .bind(user.id)
+        .fetch_one(&st.db)
+        .await?;
+    if taken {
+        return Err(ApiError::bad("An account with this email already exists"));
+    }
+    Ok(())
+}
+
+/// `POST /api/users/me/email/generate-code/`. 3 requests per user per hour (checked before validation,
+/// as DRF throttles run first), 5 codes per target address per hour, code valid 10 minutes.
+/// The code is never logged.
+async fn generate_email_code(State(st): State<AppState>, user: CurrentUser, Json(b): Json<Value>) -> ApiResult {
+    let email = s(&b, "email").unwrap_or("").trim().to_lowercase();
+    if bump_counter(&st.db, &format!("email_change_user:{}", user.id)).await? > 3 {
+        return Err(throttled());
+    }
+    check_new_email(&st, &user, &email).await?;
+    if bump_counter(&st.db, &format!("email_change_issued:{email}")).await? > 5 {
+        return Err(throttled());
+    }
+    let token = format!("{:06}", rand::thread_rng().gen_range(100000..1000000));
+    sqlx::query(
+        "INSERT INTO saturn_magic_codes (key, token, attempts, expires_at)
+         VALUES ($1, $2, 0, now() + interval '10 minutes')
+         ON CONFLICT (key) DO UPDATE SET token = $2, attempts = 0, expires_at = now() + interval '10 minutes'",
+    )
+    .bind(format!("email_change:{}:{email}", user.id))
+    .bind(&token)
+    .execute(&st.db)
+    .await?;
+    crate::outbound::send_mail_bg(
+        &st,
+        email.clone(),
+        format!("Your Plane email verification code is {token}"),
+        format!("<p>Your Plane email verification code is <strong>{token}</strong>. It expires in 10 minutes.</p>"),
+        format!("Your Plane email verification code is {token}. It expires in 10 minutes."),
+    );
+    Ok(Json(json!({"message": "Verification code sent to email"})))
+}
+
+/// `PATCH /api/users/me/email/` `{email, code}`. Wrong code: 5 tries then the code is deleted. A success
+/// consumes the code, updates the email, unverifies it, ends the session (Plane logs the user out) and
+/// notifies both addresses.
+async fn update_email(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Json(b): Json<Value>,
+) -> Result<Response, ApiError> {
+    let email = s(&b, "email").unwrap_or("").trim().to_lowercase();
+    let code = s(&b, "code").unwrap_or("").trim().to_string();
+    check_new_email(&st, &user, &email).await?;
+    if code.is_empty() {
+        return Err(ApiError::bad("Verification code is required"));
+    }
+    let key = format!("email_change:{}:{email}", user.id);
+    let mut tx = st.db.begin().await?;
+    let record: Option<(String, i32)> = sqlx::query_as(
+        "SELECT token, attempts FROM saturn_magic_codes WHERE key = $1 AND expires_at > now() FOR UPDATE",
+    )
+    .bind(&key)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((expected, attempts)) = record else {
+        return Err(ApiError::bad("Verification code has expired or is invalid"));
+    };
+    if !token_matches(&expected, &code) {
+        if attempts + 1 >= 5 {
+            sqlx::query("DELETE FROM saturn_magic_codes WHERE key = $1")
+                .bind(&key)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            sqlx::query("UPDATE saturn_magic_codes SET attempts = attempts + 1 WHERE key = $1")
+                .bind(&key)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        return Err(ApiError::bad("Invalid verification code"));
+    }
+    sqlx::query("DELETE FROM saturn_magic_codes WHERE key = $1")
+        .bind(&key)
+        .execute(&mut *tx)
+        .await?;
+    let updated: Value = match sqlx::query_scalar(&format!(
+        "UPDATE users u SET email = $2, is_email_verified = false, updated_at = now()
+         WHERE u.id = $1 RETURNING {USER_ME_JSON}"
+    ))
+    .bind(user.id)
+    .bind(&email)
+    .fetch_one(&mut *tx)
+    .await
+    {
+        Ok(v) => v,
+        // Lost a race with another sign-up for the same address (unique index on users.email).
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
+            return Err(ApiError::bad("An account with this email already exists"));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    tx.commit().await?;
+
+    let mut headers = HeaderMap::new();
+    if let Some(key) = &user.session_key {
+        session::destroy(&st, key).await?;
+        headers.insert(
+            header::SET_COOKIE,
+            session::set_cookie(&st, session::COOKIE, None, 0).parse().unwrap(),
+        );
+    }
+    for to in [email.clone(), user.email.clone()] {
+        crate::outbound::send_mail_bg(
+            &st,
+            to,
+            "Your Plane account email was changed".into(),
+            "<p>The email address on your Plane account was changed. If this was not you, contact your administrator.</p>"
+                .into(),
+            "The email address on your Plane account was changed. If this was not you, contact your administrator."
+                .into(),
+        );
+    }
+    Ok((headers, Json(updated)).into_response())
 }
 
 /// `saturn seed <email> <password> [workspace-name]`: instance admin, onboarded user, workspace, project.

@@ -256,7 +256,7 @@ fn redirect_with_cookie(to: &str, cookie: String) -> Response {
         .into_response()
 }
 
-fn valid_email(e: &str) -> bool {
+pub(crate) fn valid_email(e: &str) -> bool {
     let Some((local, domain)) = e.split_once('@') else {
         return false;
     };
@@ -430,7 +430,7 @@ struct EmailCheck {
     email: Option<String>,
 }
 
-fn token_matches(expected: &str, supplied: &str) -> bool {
+pub(crate) fn token_matches(expected: &str, supplied: &str) -> bool {
     let mut mac = Hmac::<Sha256>::new_from_slice(b"saturn-token-comparison").expect("HMAC key");
     mac.update(expected.as_bytes());
     let digest = mac.finalize().into_bytes();
