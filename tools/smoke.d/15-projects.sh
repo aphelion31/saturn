@@ -49,6 +49,13 @@ REL_HIDDEN=$(field '.id')
 call POST "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/issues/$REL_SOURCE/issue-relation/" '{"relation_type":"relates_to","issues":["'"$REL_HIDDEN"'"]}'
 rel_body=$(curl -fsS -b "$MEMBER_JAR" "$BASE/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/issues/$REL_SOURCE/issue-relation/")
 jq -e --arg id "$REL_HIDDEN" 'all(.relates_to[]; .id != $id)' <<<"$rel_body" >/dev/null
+COMPLETE_STATE=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -X -q -v ON_ERROR_STOP=1 -At -v project="$SMOKE_PROJECT" <<< "SELECT id FROM states WHERE project_id=:'project'::uuid AND \"group\"='completed' AND deleted_at IS NULL LIMIT 1")
+call PATCH "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/issues/$REL_SOURCE/" '{"state_id":"'"$COMPLETE_STATE"'"}'
+call POST "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/issues/" '{"name":"Child","parent_id":"'"$REL_SOURCE"'"}'
+CHILD=$(field '.id')
+child_body=$(curl -fsS -b "$MEMBER_JAR" "$BASE/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/issues/$CHILD/")
+[[ "$(jq -r '.parent_id' <<<"$child_body")" == "$REL_SOURCE" ]]
+curl -fsS -b "$MEMBER_JAR" "$BASE/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/issues/$REL_SOURCE/" >/dev/null
 call PATCH "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/members/$MEMBERSHIP/" '{"role":5}'
 call PATCH "/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/members/$MEMBERSHIP/" '{"role":15}'
 code=$(curl -s -o /dev/null -w '%{http_code}' -b "$MEMBER_JAR" -X PATCH -H 'content-type: application/json' -d '{"role":20}' "$BASE/api/workspaces/$SLUG/projects/$SMOKE_PROJECT/members/$MEMBERSHIP/")
