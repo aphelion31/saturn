@@ -88,15 +88,28 @@ fn rate_limit_max() -> Option<f64> {
     }
 }
 
+/// Rate-limit key. The TCP peer address (set by `web::peer_header`, never client supplied), unless
+/// `TRUST_PROXY=1` says a reverse proxy sets `X-Forwarded-For` (then its first hop). Without that
+/// opt-in clients could rotate the header to dodge the limit.
 fn client_ip(headers: &HeaderMap) -> String {
-    headers
-        .get("x-forwarded-for")
+    let peer = headers
+        .get(crate::web::PEER_HEADER)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
-        .unwrap_or("unknown")
-        .trim()
-        .to_string()
+        .map(str::to_string);
+    let forwarded = || {
+        headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
+            .map(|v| v.trim().to_string())
+    };
+    let trust = matches!(std::env::var("TRUST_PROXY").as_deref(), Ok("1" | "true"));
+    trust
+        .then(forwarded)
+        .flatten()
+        .or(peer)
+        .unwrap_or_else(|| "unknown".into())
 }
 
 fn check_rate_limit(headers: &HeaderMap, scope: &str) -> bool {
@@ -860,20 +873,23 @@ mod tests {
     #[test]
     fn rate_limiting_token_bucket() {
         let buckets = DashMap::new();
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "192.168.1.1".parse().unwrap());
+        let peer = |ip: &str, xff: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(crate::web::PEER_HEADER, ip.parse().unwrap());
+            h.insert("x-forwarded-for", xff.parse().unwrap());
+            h
+        };
         let now = Instant::now();
 
-        for _ in 0..10 {
-            assert!(check_rate_limit_with_cap(&buckets, &headers, "test", 10.0, now));
+        // Rotating X-Forwarded-For does not create new buckets: the peer is the key.
+        for i in 0..10 {
+            let h = peer("192.168.1.1", &format!("10.0.0.{i}"));
+            assert!(check_rate_limit_with_cap(&buckets, &h, "test", 10.0, now));
         }
-        // 11th request in the same instant should be rate-limited
-        assert!(!check_rate_limit_with_cap(&buckets, &headers, "test", 10.0, now));
+        assert!(!check_rate_limit_with_cap(&buckets, &peer("192.168.1.1", "10.9.9.9"), "test", 10.0, now));
 
-        // Different IP is not throttled
-        let mut headers2 = HeaderMap::new();
-        headers2.insert("x-forwarded-for", "192.168.1.2".parse().unwrap());
-        assert!(check_rate_limit_with_cap(&buckets, &headers2, "test", 10.0, now));
+        // A different peer is not throttled.
+        assert!(check_rate_limit_with_cap(&buckets, &peer("192.168.1.2", "10.0.0.1"), "test", 10.0, now));
     }
 
     #[test]
