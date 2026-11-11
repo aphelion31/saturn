@@ -113,7 +113,7 @@ export DATABASE_URL=postgres://localhost/plane_bench REDIS_URL=redis://localhost
 (cd "$PLANE/apps/api" && $UV run python manage.py migrate -v 0 >/dev/null 2>&1)
 # Same seed as Saturn: reuse Saturn's seed against the Plane-migrated database (same schema).
 DATABASE_URL=postgres://localhost/plane_bench SECRET_KEY=$SECRET "$ROOT/target/release/saturn" seed "$EMAIL" "$PASSWORD" Bench >/dev/null 2>&1
-psql -qd plane_bench -c "DROP TABLE saturn_migrations"
+psql -qd plane_bench -c "DROP TABLE IF EXISTS saturn_migrations, saturn_magic_codes"
 fixture plane_bench
 PROJECT=$(psql -Atd plane_bench -c "select id from projects limit 1")
 redis-cli -n 9 flushdb >/dev/null
