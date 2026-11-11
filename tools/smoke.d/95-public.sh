@@ -26,6 +26,18 @@ if [[ -n "$PUB_ISSUE" ]]; then
   PUB_COMMENT_ID=$(field '.id')
 fi
 
+# Plane #9506: public board voting respects is_votes_enabled
+if [[ -n "${PUB_ISSUE:-}" ]]; then
+  psql "$DB" -X -q -c "UPDATE deploy_boards SET is_votes_enabled=false WHERE anchor='$ANCHOR'"
+  code=$(curl -s -b "$jar" -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' -d '{"vote":1}' "$BASE/api/public/anchor/$ANCHOR/issues/$PUB_ISSUE/votes/")
+  [[ "$code" == 400 ]] || { echo "✖ vote on votes-disabled board -> $code (expected 400)" >&2; exit 1; }
+  psql "$DB" -X -q -c "UPDATE deploy_boards SET is_votes_enabled=true WHERE anchor='$ANCHOR'"
+  call POST "/api/public/anchor/$ANCHOR/issues/$PUB_ISSUE/votes/" '{"vote":1}'
+  call GET "/api/public/anchor/$ANCHOR/issues/$PUB_ISSUE/votes/"
+  call DELETE "/api/public/anchor/$ANCHOR/issues/$PUB_ISSUE/votes/"
+  echo "✔ Plane #9506: public board voting respects is_votes_enabled"
+fi
+
 # Published project boards
 call GET "/api/public/workspaces/$SLUG/project-boards/"
 jq -e --arg pid "$PROJECT" 'any(.[]; .id == $pid)' <<<"$body" >/dev/null

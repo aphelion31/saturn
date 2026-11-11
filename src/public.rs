@@ -1133,8 +1133,8 @@ async fn issue_vote_create(
                 issue_id, project_id, updated_by_id, workspace_id
             )
             VALUES ($1, now(), now(), $2, $3, $3, $4, $5, $3, $6)
-            ON CONFLICT (issue_id, actor_id) DO UPDATE
-            SET vote = EXCLUDED.vote, updated_at = now(), deleted_at = NULL
+            ON CONFLICT (issue_id, actor_id) WHERE deleted_at IS NULL DO UPDATE
+            SET vote = EXCLUDED.vote, updated_at = now()
             RETURNING *
         )
         SELECT jsonb_build_object(
@@ -1173,6 +1173,9 @@ async fn issue_vote_destroy(
     Path((anchor, issue_id)): Path<(String, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
     let b = require_anchor(&st.db, &anchor).await?;
+    if !b.is_votes_enabled {
+        return Err(ApiError::bad("Votes are not enabled for this project board"));
+    }
 
     let res = sqlx::query(
         "UPDATE issue_votes
@@ -1673,7 +1676,13 @@ async fn public_bulk_assets(
         .and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
-                .filter_map(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok()))
+                .filter_map(|v| {
+                    v.as_str().and_then(|s| {
+                        let clean = s.split('?').next().unwrap_or(s).trim_end_matches('/');
+                        let last = clean.split('/').last().unwrap_or(clean);
+                        Uuid::parse_str(last).ok()
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default();
