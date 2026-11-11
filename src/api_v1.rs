@@ -2315,7 +2315,13 @@ async fn v1_create_intake_issue(
 
     let issue = b.get("issue").cloned().unwrap_or_else(|| json!({}));
     let name = match issue.get("name") {
-        Some(Value::String(n)) if !n.trim().is_empty() => n.trim().to_string(),
+        Some(Value::String(n)) if !n.trim().is_empty() => {
+            let trimmed = n.trim();
+            if trimmed.chars().count() > 255 {
+                return Err(ApiError::bad("Name must be at most 255 characters"));
+            }
+            trimmed.to_string()
+        }
         _ => return Err(ApiError::bad("Name is required")),
     };
     let priority = s(&issue, "priority").unwrap_or("none");

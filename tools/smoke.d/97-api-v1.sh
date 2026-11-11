@@ -54,6 +54,10 @@ call_v1 GET "/api/v1/workspaces/$SLUG/projects/$PROJECT/project-members-lite/"
 
 # 4. Intake issues & Estimates
 call_v1 GET "/api/v1/workspaces/$SLUG/projects/$PROJECT/intake-issues/"
+# 9940: over-length intake name rejected with 400
+LONG_NAME=$(printf 'a%.0s' {1..300})
+c=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "X-Api-Key: $V1_TOKEN" -H 'content-type: application/json' -d "{\"issue\":{\"name\":\"$LONG_NAME\"}}" "$BASE/api/v1/workspaces/$SLUG/projects/$PROJECT/intake-issues/")
+[[ "$c" == "400" ]] || { echo "✖ long intake name -> $c" >&2; exit 1; }
 call_v1 POST "/api/v1/workspaces/$SLUG/projects/$PROJECT/intake-issues/" '{"issue":{"name":"Smoke V1 Intake '$RANDOM'"}}'
 V1_II=$(field '.issue')
 call_v1 GET "/api/v1/workspaces/$SLUG/projects/$PROJECT/intake-issues/$V1_II/"
