@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::{delete, get, patch, post},
+    routing::{delete, get},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -65,6 +65,15 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/public/anchor/{anchor}/issues/{issue_id}/votes/",
             get(issue_votes_list).post(issue_vote_create).delete(issue_vote_destroy),
+        )
+        // Intake issues list & create
+        .route(
+            "/api/public/anchor/{anchor}/intakes/{intake_id}/intake-issues/",
+            get(intake_issues_list).post(intake_issue_create),
+        )
+        .route(
+            "/api/public/anchor/{anchor}/intakes/{intake_id}/inbox-issues/",
+            get(intake_issues_list).post(intake_issue_create),
         )
         // Workspace project anchor reverse-lookup
         .route(
@@ -227,7 +236,7 @@ async fn project_members(
     Path(anchor): Path<String>,
 ) -> ApiResult {
     let b = require_anchor(&st.db, &anchor).await?;
-    let members: Vec<Value> = sqlx::query_scalar(
+    let members: Value = sqlx::query_scalar(
         "SELECT COALESCE(jsonb_agg(jsonb_build_object(
             'id', pm.id,
             'member', pm.member_id,
@@ -244,7 +253,7 @@ async fn project_members(
     .fetch_one(&st.db)
     .await?;
 
-    Ok(Json(members.into_iter().next().unwrap_or_else(|| json!([]))))
+    Ok(Json(members))
 }
 
 /// GET /api/public/anchor/{anchor}/states/
@@ -254,7 +263,7 @@ async fn states(
     Path(anchor): Path<String>,
 ) -> ApiResult {
     let b = require_anchor(&st.db, &anchor).await?;
-    let rows: Vec<Value> = sqlx::query_scalar(
+    let rows: Value = sqlx::query_scalar(
         "SELECT COALESCE(jsonb_agg(jsonb_build_object(
             'id', s.id,
             'name', s.name,
@@ -271,7 +280,7 @@ async fn states(
     .fetch_one(&st.db)
     .await?;
 
-    Ok(Json(rows.into_iter().next().unwrap_or_else(|| json!([]))))
+    Ok(Json(rows))
 }
 
 /// GET /api/public/anchor/{anchor}/labels/
@@ -281,7 +290,7 @@ async fn labels(
     Path(anchor): Path<String>,
 ) -> ApiResult {
     let b = require_anchor(&st.db, &anchor).await?;
-    let rows: Vec<Value> = sqlx::query_scalar(
+    let rows: Value = sqlx::query_scalar(
         "SELECT COALESCE(jsonb_agg(jsonb_build_object(
             'id', l.id,
             'name', l.name,
@@ -297,7 +306,7 @@ async fn labels(
     .fetch_one(&st.db)
     .await?;
 
-    Ok(Json(rows.into_iter().next().unwrap_or_else(|| json!([]))))
+    Ok(Json(rows))
 }
 
 /// GET /api/public/anchor/{anchor}/cycles/
@@ -307,7 +316,7 @@ async fn cycles(
     Path(anchor): Path<String>,
 ) -> ApiResult {
     let b = require_anchor(&st.db, &anchor).await?;
-    let rows: Vec<Value> = sqlx::query_scalar(
+    let rows: Value = sqlx::query_scalar(
         "SELECT COALESCE(jsonb_agg(jsonb_build_object(
             'id', c.id,
             'name', c.name
@@ -321,7 +330,7 @@ async fn cycles(
     .fetch_one(&st.db)
     .await?;
 
-    Ok(Json(rows.into_iter().next().unwrap_or_else(|| json!([]))))
+    Ok(Json(rows))
 }
 
 /// GET /api/public/anchor/{anchor}/modules/
@@ -331,7 +340,7 @@ async fn modules(
     Path(anchor): Path<String>,
 ) -> ApiResult {
     let b = require_anchor(&st.db, &anchor).await?;
-    let rows: Vec<Value> = sqlx::query_scalar(
+    let rows: Value = sqlx::query_scalar(
         "SELECT COALESCE(jsonb_agg(jsonb_build_object(
             'id', m.id,
             'name', m.name
@@ -345,7 +354,7 @@ async fn modules(
     .fetch_one(&st.db)
     .await?;
 
-    Ok(Json(rows.into_iter().next().unwrap_or_else(|| json!([]))))
+    Ok(Json(rows))
 }
 
 /// GET /api/public/anchor/{anchor}/issues/
@@ -456,7 +465,7 @@ async fn comments_list(
     }
     let current_user_id = user.0.map(|u| u.id).unwrap_or(Uuid::nil());
 
-    let rows: Vec<Value> = sqlx::query_scalar(
+    let rows: Value = sqlx::query_scalar(
         "SELECT COALESCE(jsonb_agg(jsonb_build_object(
             'id', c.id,
             'comment_html', c.comment_html,
@@ -513,7 +522,7 @@ async fn comments_list(
     .fetch_one(&st.db)
     .await?;
 
-    Ok(Json(rows.into_iter().next().unwrap_or_else(|| json!([]))))
+    Ok(Json(rows))
 }
 
 #[derive(Deserialize)]
@@ -538,9 +547,10 @@ async fn comment_create(
     }
 
     let id = Uuid::new_v4();
-    let comment_html = body.comment_html.unwrap_or_else(|| "<p></p>".to_string());
+    let raw_html = body.comment_html.unwrap_or_else(|| "<p></p>".to_string());
+    let comment_html = sanitize_html(&raw_html)?;
     let comment_json = body.comment_json.unwrap_or_else(|| json!({}));
-    let comment_stripped = html_to_stripped(&comment_html);
+    let comment_stripped = strip_tags(&comment_html);
 
     let row: (Value,) = sqlx::query_as(
         "WITH ins AS (
@@ -690,9 +700,10 @@ async fn comment_update(
     .await?;
 
     let (old_html, old_json) = existing.ok_or_else(ApiError::not_found)?;
-    let new_html = body.comment_html.or(old_html).unwrap_or_else(|| "<p></p>".to_string());
+    let raw_html = body.comment_html.or(old_html).unwrap_or_else(|| "<p></p>".to_string());
+    let new_html = sanitize_html(&raw_html)?;
     let new_json = body.comment_json.or(old_json).unwrap_or_else(|| json!({}));
-    let new_stripped = html_to_stripped(&new_html);
+    let new_stripped = strip_tags(&new_html);
 
     let row: (Value,) = sqlx::query_as(
         "WITH upd AS (
@@ -785,7 +796,7 @@ async fn issue_reactions_list(
         return Ok(Json(json!([])));
     }
 
-    let rows: Vec<Value> = sqlx::query_scalar(
+    let rows: Value = sqlx::query_scalar(
         "SELECT COALESCE(jsonb_agg(jsonb_build_object(
             'id', r.id,
             'actor', r.actor_id,
@@ -814,7 +825,7 @@ async fn issue_reactions_list(
     .fetch_one(&st.db)
     .await?;
 
-    Ok(Json(rows.into_iter().next().unwrap_or_else(|| json!([]))))
+    Ok(Json(rows))
 }
 
 #[derive(Deserialize)]
@@ -921,7 +932,7 @@ async fn comment_reactions_list(
         return Ok(Json(json!([])));
     }
 
-    let rows: Vec<Value> = sqlx::query_scalar(
+    let rows: Value = sqlx::query_scalar(
         "SELECT COALESCE(jsonb_agg(jsonb_build_object(
             'id', cr.id,
             'actor', cr.actor_id,
@@ -945,7 +956,7 @@ async fn comment_reactions_list(
     .fetch_one(&st.db)
     .await?;
 
-    Ok(Json(rows.into_iter().next().unwrap_or_else(|| json!([]))))
+    Ok(Json(rows))
 }
 
 /// POST /api/public/anchor/{anchor}/comments/{comment_id}/reactions/
@@ -1058,7 +1069,7 @@ async fn issue_votes_list(
         return Ok(Json(json!([])));
     }
 
-    let rows: Vec<Value> = sqlx::query_scalar(
+    let rows: Value = sqlx::query_scalar(
         "SELECT COALESCE(jsonb_agg(jsonb_build_object(
             'issue', v.issue_id,
             'vote', v.vote,
@@ -1084,7 +1095,7 @@ async fn issue_votes_list(
     .fetch_one(&st.db)
     .await?;
 
-    Ok(Json(rows.into_iter().next().unwrap_or_else(|| json!([]))))
+    Ok(Json(rows))
 }
 
 #[derive(Deserialize)]
@@ -1177,6 +1188,218 @@ async fn issue_vote_destroy(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Deserialize)]
+struct IntakeIssueCreateIn {
+    issue: IntakeIssuePayload,
+}
+
+#[derive(Deserialize)]
+struct IntakeIssuePayload {
+    name: String,
+    description_html: Option<String>,
+    description_json: Option<Value>,
+    priority: Option<String>,
+}
+
+/// GET /api/public/anchor/{anchor}/intakes/{intake_id}/intake-issues/
+async fn intake_issues_list(
+    State(st): State<AppState>,
+    _user: MaybeUser,
+    Path((anchor, intake_id)): Path<(String, Uuid)>,
+) -> ApiResult {
+    let b = require_anchor(&st.db, &anchor).await?;
+    if b.intake_id != Some(intake_id) {
+        return Err(ApiError::bad("Intake is not enabled for this Project Board"));
+    }
+
+    let rows: Value = sqlx::query_scalar(
+        "SELECT COALESCE(jsonb_agg(jsonb_build_object(
+            'id', i.id,
+            'name', i.name,
+            'priority', i.priority,
+            'sequence_id', i.sequence_id,
+            'project_id', i.project_id,
+            'created_at', i.created_at,
+            'bridge_id', ii.id,
+            'issue_intake', jsonb_build_array(jsonb_build_object(
+                'id', ii.id,
+                'status', ii.status,
+                'duplicate_to', ii.duplicate_to_id,
+                'snoozed_till', ii.snoozed_till,
+                'source', ii.source
+            )),
+            'state_detail', (SELECT jsonb_build_object('id', s.id, 'name', s.name, 'color', s.color, 'group', s.group)
+                             FROM states s WHERE s.id = i.state_id),
+            'project_detail', (SELECT jsonb_build_object('id', p.id, 'name', p.name, 'identifier', p.identifier)
+                               FROM projects p WHERE p.id = i.project_id)
+        ) ORDER BY ii.created_at DESC), '[]'::jsonb)
+        FROM intake_issues ii
+        JOIN issues i ON i.id = ii.issue_id
+        WHERE ii.intake_id = $1 AND ii.project_id = $2 AND ii.workspace_id = $3
+          AND ii.deleted_at IS NULL AND i.deleted_at IS NULL",
+    )
+    .bind(intake_id)
+    .bind(b.project_id)
+    .bind(b.workspace_id)
+    .fetch_one(&st.db)
+    .await?;
+
+    Ok(Json(rows))
+}
+
+/// POST /api/public/anchor/{anchor}/intakes/{intake_id}/intake-issues/
+async fn intake_issue_create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((anchor, intake_id)): Path<(String, Uuid)>,
+    Json(body): Json<IntakeIssueCreateIn>,
+) -> ApiResult {
+    let b = require_anchor(&st.db, &anchor).await?;
+    if b.intake_id.is_none() {
+        return Err(ApiError::bad("Intake is not enabled for this Project Board"));
+    }
+    if b.intake_id != Some(intake_id) {
+        return Err(ApiError::bad("Intake does not belong to this Project Board"));
+    }
+    if body.issue.name.trim().is_empty() {
+        return Err(ApiError::bad("Name is required"));
+    }
+    if body.issue.name.chars().count() > 255 {
+        return Err(ApiError::bad("Name must be at most 255 characters"));
+    }
+    let priority = body.issue.priority.clone().unwrap_or_else(|| "low".to_string());
+    if !["low", "medium", "high", "urgent", "none"].contains(&priority.as_str()) {
+        return Err(ApiError::bad("Invalid priority"));
+    }
+
+    let mut tx = st.db.begin().await?;
+
+    // Triage state
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1::text))")
+        .bind(b.project_id)
+        .execute(&mut *tx)
+        .await?;
+
+    let triage: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM states WHERE project_id = $1 AND \"group\" = 'triage' AND deleted_at IS NULL LIMIT 1",
+    )
+    .bind(b.project_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let triage = match triage {
+        Some(t) => t,
+        None => {
+            sqlx::query_scalar(
+                "INSERT INTO states (id, name, color, \"group\", \"default\", sequence, project_id, workspace_id,
+                     created_by_id, updated_by_id, created_at, updated_at)
+                 VALUES (gen_random_uuid(), 'Triage', '#4E5355', 'triage', false, 65000, $1, $2, $3, $3, now(), now())
+                 RETURNING id",
+            )
+            .bind(b.project_id)
+            .bind(b.workspace_id)
+            .bind(user.id)
+            .fetch_one(&mut *tx)
+            .await?
+        }
+    };
+
+    let seq: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(max(sequence), 0) + 1 FROM issue_sequences WHERE project_id = $1",
+    )
+    .bind(b.project_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let issue_id = Uuid::new_v4();
+    let raw_desc_html = body.issue.description_html.unwrap_or_else(|| "<p></p>".to_string());
+    let desc_html = sanitize_html(&raw_desc_html)?;
+    let desc_json = body.issue.description_json.unwrap_or_else(|| json!({}));
+    let stripped = strip_tags(&desc_html);
+
+    sqlx::query(
+        "INSERT INTO issues (id, name, description_html, description_stripped, description_json, priority,
+             sequence_id, project_id, workspace_id, state_id, sort_order, is_draft, created_by_id, updated_by_id,
+             created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 65535, false, $11, $11, now(), now())",
+    )
+    .bind(issue_id)
+    .bind(&body.issue.name)
+    .bind(&desc_html)
+    .bind(&stripped)
+    .bind(&desc_json)
+    .bind(&priority)
+    .bind(seq as i32)
+    .bind(b.project_id)
+    .bind(b.workspace_id)
+    .bind(triage)
+    .bind(user.id)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO issue_sequences (id, sequence, deleted, issue_id, project_id, workspace_id,
+             created_by_id, updated_by_id, created_at, updated_at)
+         VALUES (gen_random_uuid(), $1, false, $2, $3, $4, $5, $5, now(), now())",
+    )
+    .bind(seq)
+    .bind(issue_id)
+    .bind(b.project_id)
+    .bind(b.workspace_id)
+    .bind(user.id)
+    .execute(&mut *tx)
+    .await?;
+
+    let ii_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO intake_issues (id, status, source, intake_id, issue_id, project_id, workspace_id,
+             created_by_id, updated_by_id, created_at, updated_at, extra)
+         VALUES ($1, -2, 'IN_APP', $2, $3, $4, $5, $6, $6, now(), now(), '{}'::jsonb)",
+    )
+    .bind(ii_id)
+    .bind(intake_id)
+    .bind(issue_id)
+    .bind(b.project_id)
+    .bind(b.workspace_id)
+    .bind(user.id)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    let out: (Value,) = sqlx::query_as(
+        "SELECT jsonb_build_object(
+            'id', i.id,
+            'name', i.name,
+            'priority', i.priority,
+            'sequence_id', i.sequence_id,
+            'project_id', i.project_id,
+            'created_at', i.created_at,
+            'bridge_id', ii.id,
+            'issue_intake', jsonb_build_array(jsonb_build_object(
+                'id', ii.id,
+                'status', ii.status,
+                'duplicate_to', ii.duplicate_to_id,
+                'snoozed_till', ii.snoozed_till,
+                'source', ii.source
+            )),
+            'state_detail', (SELECT jsonb_build_object('id', s.id, 'name', s.name, 'color', s.color, 'group', s.group)
+                             FROM states s WHERE s.id = i.state_id),
+            'project_detail', (SELECT jsonb_build_object('id', p.id, 'name', p.name, 'identifier', p.identifier)
+                               FROM projects p WHERE p.id = i.project_id)
+        )
+        FROM intake_issues ii
+        JOIN issues i ON i.id = ii.issue_id
+        WHERE ii.id = $1",
+    )
+    .bind(ii_id)
+    .fetch_one(&st.db)
+    .await?;
+
+    // Plane answers 200 here, not 201
+    Ok(Json(out.0))
+}
+
 /// GET /api/public/workspaces/{slug}/projects/{project_id}/anchor/
 async fn workspace_project_anchor(
     State(st): State<AppState>,
@@ -1216,20 +1439,4 @@ async fn workspace_project_anchor(
 
     let (val,) = row.ok_or_else(ApiError::not_found)?;
     Ok(Json(val))
-}
-
-/// Strip basic HTML tags for `comment_stripped`.
-fn html_to_stripped(html: &str) -> String {
-    let mut out = String::new();
-    let mut in_tag = false;
-    for c in html.chars() {
-        if c == '<' {
-            in_tag = true;
-        } else if c == '>' {
-            in_tag = false;
-        } else if !in_tag {
-            out.push(c);
-        }
-    }
-    out
 }
