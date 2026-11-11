@@ -1,3 +1,4 @@
+mod api_v1;
 mod auth;
 mod common;
 mod instance;
@@ -33,6 +34,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
 
 pub fn app(state: AppState) -> Router {
     let api = Router::new()
+        .merge(api_v1::routes())
         .merge(auth::routes())
         .merge(instance::routes())
         .merge(users::routes())
