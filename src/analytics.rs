@@ -533,8 +533,10 @@ async fn project_advance_charts(
         "work-items" => {
             if let Some(c) = cycle_id {
                 let dates: Option<(Option<chrono::DateTime<Utc>>, Option<chrono::DateTime<Utc>>)> =
-                    sqlx::query_as("SELECT start_date, end_date FROM cycles WHERE id = $1 AND deleted_at IS NULL")
+                    sqlx::query_as("SELECT start_date, end_date FROM cycles WHERE id = $1 AND workspace_id = $2 AND project_id = $3 AND deleted_at IS NULL")
                         .bind(c)
+                        .bind(ws.workspace_id)
+                        .bind(project_id)
                         .fetch_optional(&st.db)
                         .await?;
                 let (Some(s), Some(e)) = dates.unwrap_or((None, None)) else {
@@ -543,8 +545,10 @@ async fn project_advance_charts(
                 daily_completion_chart(&st.db, &base, s.date_naive(), e.date_naive()).await
             } else if let Some(m) = module_id {
                 let dates: Option<(Option<NaiveDate>, Option<NaiveDate>)> =
-                    sqlx::query_as("SELECT start_date, target_date FROM modules WHERE id = $1 AND deleted_at IS NULL")
+                    sqlx::query_as("SELECT start_date, target_date FROM modules WHERE id = $1 AND workspace_id = $2 AND project_id = $3 AND deleted_at IS NULL")
                         .bind(m)
+                        .bind(ws.workspace_id)
+                        .bind(project_id)
                         .fetch_optional(&st.db)
                         .await?;
                 let (Some(s), Some(e)) = dates.unwrap_or((None, None)) else {
