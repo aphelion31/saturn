@@ -1,5 +1,6 @@
 mod api_v1;
 mod auth;
+mod oauth;
 mod common;
 mod instance;
 mod outbound;
@@ -41,6 +42,7 @@ pub fn app(state: AppState) -> Router {
     let api = Router::new()
         .merge(api_v1::routes())
         .merge(auth::routes())
+        .merge(oauth::routes())
         .merge(instance::routes())
         .merge(users::routes())
         .merge(workspaces::routes())
@@ -66,7 +68,9 @@ pub fn app(state: AppState) -> Router {
         .merge(web::spa_routes(&state))
         .layer(middleware::from_fn(web::security_headers))
         .layer(middleware::from_fn(web::peer_header))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(tower_http::trace::TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
+            tracing::info_span!("http", method = %request.method(), path = %request.uri().path())
+        }))
         .with_state(state)
 }
 
