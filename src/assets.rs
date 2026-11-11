@@ -35,6 +35,10 @@ pub fn routes() -> Router<AppState> {
             get(legacy_get_workspace_asset).delete(legacy_delete_workspace_asset),
         )
         .route(
+            "/api/workspaces/file-assets/{workspace_id}/{asset_key}",
+            get(legacy_get_workspace_asset).delete(legacy_delete_workspace_asset),
+        )
+        .route(
             "/api/workspaces/file-assets/{workspace_id}/{asset_key}/restore/",
             post(legacy_restore_workspace_asset),
         )
@@ -776,7 +780,11 @@ async fn bulk_assets(
         .iter()
         .map(|v| {
             v.as_str()
-                .and_then(|s| Uuid::parse_str(s).ok())
+                .and_then(|s| {
+                    let clean = s.split('?').next().unwrap_or(s).trim_end_matches('/');
+                    let last = clean.split('/').last().unwrap_or(clean);
+                    Uuid::parse_str(last).ok()
+                })
                 .ok_or_else(|| ApiError::bad("Invalid asset id"))
         })
         .collect::<Result<_, _>>()?;
@@ -1209,10 +1217,11 @@ async fn legacy_upload_user_asset(
 
 /// Helper to load a user's asset by pk (UUID or asset path). Returns 403 if owned by another user.
 async fn check_user_asset_pk(st: &AppState, user: &CurrentUser, pk: &str) -> Result<(Uuid, Option<String>), ApiError> {
-    if pk.contains("..") || pk.starts_with('/') || pk.contains('\\') {
+    let clean_pk = pk.split('?').next().unwrap_or(pk);
+    if clean_pk.contains("..") || clean_pk.starts_with('/') || clean_pk.contains('\\') {
         return Err(ApiError::bad("Invalid asset key"));
     }
-    let parsed_uuid = Uuid::parse_str(pk).ok();
+    let parsed_uuid = Uuid::parse_str(clean_pk).ok();
     let row: Option<(Uuid, Option<Uuid>, Option<Uuid>, Option<String>)> = sqlx::query_as(
         "SELECT id, created_by_id, user_id, entity_type FROM file_assets
          WHERE ($1::uuid IS NOT NULL AND id = $1)
@@ -1221,9 +1230,9 @@ async fn check_user_asset_pk(st: &AppState, user: &CurrentUser, pk: &str) -> Res
             OR asset = $4",
     )
     .bind(parsed_uuid)
-    .bind(pk)
-    .bind(format!("users/{}/{}", user.id, pk))
-    .bind(format!("users/{}", pk))
+    .bind(clean_pk)
+    .bind(format!("users/{}/{}", user.id, clean_pk))
+    .bind(format!("users/{}", clean_pk))
     .fetch_optional(&st.db)
     .await?;
 
@@ -1267,10 +1276,11 @@ async fn legacy_get_workspace_asset(
     Path((workspace_id, asset_key)): Path<(Uuid, String)>,
 ) -> ApiResult {
     let _ws = require_workspace_by_id(&st.db, &user, workspace_id).await?;
-    if asset_key.contains("..") || asset_key.starts_with('/') || asset_key.contains('\\') {
+    let clean_key = asset_key.split('?').next().unwrap_or(&asset_key);
+    if clean_key.contains("..") || clean_key.starts_with('/') || clean_key.contains('\\') {
         return Err(ApiError::bad("Invalid asset key"));
     }
-    let full_key = format!("{workspace_id}/{asset_key}");
+    let full_key = format!("{workspace_id}/{clean_key}");
     let rows: Vec<Value> = sqlx::query_scalar(&format!(
         "SELECT {FILE_ASSET_JSON} FROM file_assets f
          LEFT JOIN workspaces w ON w.id = f.workspace_id
@@ -1285,7 +1295,7 @@ async fn legacy_get_workspace_asset(
          ORDER BY f.created_at DESC"
     ))
     .bind(&full_key)
-    .bind(&asset_key)
+    .bind(clean_key)
     .bind(workspace_id)
     .bind(user.id)
     .fetch_all(&st.db)
@@ -1305,16 +1315,17 @@ async fn legacy_delete_workspace_asset(
     Path((workspace_id, asset_key)): Path<(Uuid, String)>,
 ) -> ApiResult<StatusCode> {
     let ws = require_workspace_by_id(&st.db, &user, workspace_id).await?;
-    if asset_key.contains("..") || asset_key.starts_with('/') || asset_key.contains('\\') {
+    let clean_key = asset_key.split('?').next().unwrap_or(&asset_key);
+    if clean_key.contains("..") || clean_key.starts_with('/') || clean_key.contains('\\') {
         return Err(ApiError::bad("Invalid asset key"));
     }
-    let full_key = format!("{workspace_id}/{asset_key}");
+    let full_key = format!("{workspace_id}/{clean_key}");
     let asset: Option<PermAsset> = sqlx::query_as(
         "SELECT id, workspace_id, project_id, entity_type, created_by_id FROM file_assets
          WHERE (asset = $1 OR asset = $2) AND workspace_id = $3 AND deleted_at IS NULL",
     )
     .bind(&full_key)
-    .bind(&asset_key)
+    .bind(clean_key)
     .bind(workspace_id)
     .fetch_optional(&st.db)
     .await?;
@@ -1334,16 +1345,17 @@ async fn legacy_restore_workspace_asset(
     Path((workspace_id, asset_key)): Path<(Uuid, String)>,
 ) -> ApiResult<StatusCode> {
     let ws = require_workspace_by_id(&st.db, &user, workspace_id).await?;
-    if asset_key.contains("..") || asset_key.starts_with('/') || asset_key.contains('\\') {
+    let clean_key = asset_key.split('?').next().unwrap_or(&asset_key);
+    if clean_key.contains("..") || clean_key.starts_with('/') || clean_key.contains('\\') {
         return Err(ApiError::bad("Invalid asset key"));
     }
-    let full_key = format!("{workspace_id}/{asset_key}");
+    let full_key = format!("{workspace_id}/{clean_key}");
     let asset: Option<PermAsset> = sqlx::query_as(
         "SELECT id, workspace_id, project_id, entity_type, created_by_id FROM file_assets
          WHERE (asset = $1 OR asset = $2) AND workspace_id = $3",
     )
     .bind(&full_key)
-    .bind(&asset_key)
+    .bind(clean_key)
     .bind(workspace_id)
     .fetch_optional(&st.db)
     .await?;
@@ -1407,12 +1419,7 @@ async fn legacy_create_workspace_asset(
             .await
             .map_err(|_| ApiError::bad("Invalid multipart body"))?;
         let mut file_data: Option<(String, String, Vec<u8>)> = None;
-        let mut entity_type: Option<String> = None;
-        let mut entity_identifier: Option<String> = None;
-        let mut project_id: Option<Uuid> = None;
-        let mut issue_id: Option<Uuid> = None;
-        let mut comment_id: Option<Uuid> = None;
-        let mut page_id: Option<Uuid> = None;
+        let mut client_attrs: Option<Value> = None;
 
         while let Some(field) = form
             .next_field()
@@ -1420,27 +1427,10 @@ async fn legacy_create_workspace_asset(
             .map_err(|_| ApiError::bad("Invalid multipart body"))?
         {
             match field.name() {
-                Some("entity_type") => {
-                    entity_type = field.text().await.ok();
-                }
-                Some("entity_identifier") => {
-                    entity_identifier = field.text().await.ok();
-                }
-                Some("project_id") => {
-                    let t = field.text().await.map_err(|_| ApiError::bad("Invalid field"))?;
-                    project_id = Uuid::parse_str(&t).ok();
-                }
-                Some("issue_id") => {
-                    let t = field.text().await.map_err(|_| ApiError::bad("Invalid field"))?;
-                    issue_id = Uuid::parse_str(&t).ok();
-                }
-                Some("comment_id") => {
-                    let t = field.text().await.map_err(|_| ApiError::bad("Invalid field"))?;
-                    comment_id = Uuid::parse_str(&t).ok();
-                }
-                Some("page_id") => {
-                    let t = field.text().await.map_err(|_| ApiError::bad("Invalid field"))?;
-                    page_id = Uuid::parse_str(&t).ok();
+                Some("attributes") => {
+                    if let Ok(t) = field.text().await {
+                        client_attrs = serde_json::from_str(&t).ok();
+                    }
                 }
                 Some("asset" | "file") => {
                     let name = sanitize_filename(field.file_name().unwrap_or("unnamed"));
@@ -1455,6 +1445,7 @@ async fn legacy_create_workspace_asset(
                     }
                     file_data = Some((name, typ, buf));
                 }
+                // Plane #10212: all other fields (project, issue, entity_type, is_uploaded, etc.) are read-only
                 _ => {}
             }
         }
@@ -1468,30 +1459,18 @@ async fn legacy_create_workspace_asset(
         tokio::fs::write(&path, &data).await.map_err(io_err)?;
 
         let size = data.len() as f64;
-        if entity_type.as_deref() == Some("WORKSPACE_LOGO") && !ws.is_admin() {
-            return Err(ApiError::forbidden());
-        }
-        if let Some(pid) = project_id {
-            require_project(&st.db, &user, &slug, pid).await?;
-        }
+        let attrs = client_attrs.unwrap_or_else(|| json!({"name": name, "type": typ, "size": size}));
 
         sqlx::query(
-            "INSERT INTO file_assets (id, attributes, asset, size, workspace_id, created_by_id, updated_by_id,
-                                      entity_type, entity_identifier, project_id, issue_id, page_id, comment_id, is_uploaded)
-             VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8, $9, $10, $11, $12, true)",
+            "INSERT INTO file_assets (id, attributes, asset, size, workspace_id, created_by_id, updated_by_id, is_uploaded)
+             VALUES ($1, $2, $3, $4, $5, $6, $6, true)",
         )
         .bind(id)
-        .bind(json!({"name": name, "type": typ, "size": size}))
+        .bind(attrs)
         .bind(&key)
         .bind(size)
         .bind(ws.workspace_id)
         .bind(user.id)
-        .bind(entity_type.as_deref())
-        .bind(entity_identifier.as_deref())
-        .bind(project_id)
-        .bind(issue_id)
-        .bind(page_id)
-        .bind(comment_id)
         .execute(&st.db)
         .await?;
     } else {
@@ -1499,14 +1478,6 @@ async fn legacy_create_workspace_asset(
             .await
             .map_err(|_| ApiError::bad("Invalid JSON body"))?
             .0;
-        let entity_type = s(&b, "entity_type");
-        if entity_type == Some("WORKSPACE_LOGO") && !ws.is_admin() {
-            return Err(ApiError::forbidden());
-        }
-        let project_id = uuid_of(&b, "project_id");
-        if let Some(pid) = project_id {
-            require_project(&st.db, &user, &slug, pid).await?;
-        }
         let name = sanitize_filename(s(&b, "name").unwrap_or("unnamed"));
         let typ = s(&b, "type").unwrap_or("application/octet-stream");
         let size = b
@@ -1515,21 +1486,21 @@ async fn legacy_create_workspace_asset(
             .unwrap_or(0.0)
             .min(st.cfg.file_size_limit as f64);
         let key = format!("{}/{}-{}", ws.workspace_id, id.simple(), name);
+        let attrs = b
+            .get("attributes")
+            .cloned()
+            .unwrap_or_else(|| json!({"name": name, "type": typ, "size": size}));
 
         sqlx::query(
-            "INSERT INTO file_assets (id, attributes, asset, size, workspace_id, created_by_id, updated_by_id,
-                                      entity_type, entity_identifier, project_id, is_uploaded)
-             VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8, $9, false)",
+            "INSERT INTO file_assets (id, attributes, asset, size, workspace_id, created_by_id, updated_by_id, is_uploaded)
+             VALUES ($1, $2, $3, $4, $5, $6, $6, false)",
         )
         .bind(id)
-        .bind(json!({"name": name, "type": typ, "size": size}))
+        .bind(attrs)
         .bind(&key)
         .bind(size)
         .bind(ws.workspace_id)
         .bind(user.id)
-        .bind(entity_type)
-        .bind(s(&b, "entity_identifier"))
-        .bind(project_id)
         .execute(&st.db)
         .await?;
     }
