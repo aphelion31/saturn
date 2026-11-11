@@ -5,10 +5,11 @@ import assert from 'node:assert/strict';
 
 const base = process.env.BASE || 'http://127.0.0.1:3314';
 const email = `oauth-${Date.now()}@example.com`;
+const providerId = Date.now();
 const server = http.createServer((req, res) => {
   res.setHeader('Content-Type', 'application/json');
   if (req.url === '/login/oauth/access_token' && req.method === 'POST') res.end(JSON.stringify({ access_token: 'test-access-token' }));
-  else if (req.url === '/api/v1/user') res.end(JSON.stringify({ id: 42, full_name: 'Test User' }));
+  else if (req.url === '/api/v1/user') res.end(JSON.stringify({ id: providerId, full_name: 'Test User' }));
   else if (req.url === '/api/v1/user/emails') res.end(JSON.stringify([{ email, primary: true, verified: true }]));
   else { res.statusCode = 404; res.end('{}'); }
 });
