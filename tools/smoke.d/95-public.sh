@@ -63,9 +63,12 @@ got=$(curl -s "$BASE/api/public/assets/v2/anchor/$ANCHOR/$PUB_ASSET_ID/")
 [[ "$got" == "public image data" ]] || { echo "✖ public download returned: $got" >&2; exit 1; }
 echo "✔ public asset download roundtrip -> 200"
 
-# Plane #10099: public Space asset writes scoped to the uploader
+# Plane #10099: public Space asset writes scoped to the uploader. A second user (same password hash as the
+# smoke admin) is created here so the check does not depend on how the database was seeded.
+other_email="pub-other-$RANDOM-$RANDOM@example.com"
+echo "INSERT INTO users (id, email, username, password, display_name, token, is_active, last_login_medium, token_updated_at) SELECT gen_random_uuid(), :'email', gen_random_uuid()::text, password, 'Other', gen_random_uuid()::text, true, 'email', now() FROM users WHERE email = :'admin'" | psql "$DB" -X -q -v ON_ERROR_STOP=1 -v email="$other_email" -v admin="$EMAIL"
 other_jar=$(mktemp)
-curl -s -c "$other_jar" -d "email=other@saturn.dev&password=Saturn-rocks-2026" "$BASE/auth/sign-in/" >/dev/null
+curl -s -c "$other_jar" -d "email=$other_email&password=$PASSWORD" "$BASE/auth/sign-in/" >/dev/null
 code=$(curl -s -b "$other_jar" -o /dev/null -w '%{http_code}' -X PATCH "$BASE/api/public/assets/v2/anchor/$ANCHOR/$PUB_ASSET_ID/")
 [[ "$code" == 404 ]] || { echo "✖ other user PATCH public asset -> $code (expected 404)" >&2; exit 1; }
 code=$(curl -s -b "$other_jar" -o /dev/null -w '%{http_code}' -X DELETE "$BASE/api/public/assets/v2/anchor/$ANCHOR/$PUB_ASSET_ID/")
