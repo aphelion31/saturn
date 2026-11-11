@@ -17,6 +17,11 @@ call PATCH "$C/$CYCLE/user-properties/" '{"display_properties":{"state":false}}'
 call GET "$C/$CYCLE/analytics/"
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/issues/?updated_at__exact=1900-01-01"
 [[ "$(field "['total_count']")" == 0 ]]
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/issues/?per_page=0"
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/issues/?per_page=-1"
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/search-issues/?search=2147483648"
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/issues/?start_date=1900-01-01%3Bbefore"
+[[ "$(field "['total_count']")" == 0 ]]
 call POST "/api/workspaces/$SLUG/projects/$PROJECT/user-favorite-cycles/" '{"cycle":"'$CYCLE'"}'
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/user-favorite-cycles/"
 call DELETE "/api/workspaces/$SLUG/projects/$PROJECT/user-favorite-cycles/$CYCLE/"
