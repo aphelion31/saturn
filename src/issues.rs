@@ -67,7 +67,12 @@ pub fn routes() -> Router<AppState> {
         .route("/api/workspaces/{slug}/projects/{project_id}/issue-dates/", axum::routing::post(issue_dates))
         .route("/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-attachments/{attachment_id}/", axum::routing::delete(legacy_attachment_delete))
         .route("/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/meta/", get(issue_meta))
-        .route("/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-attachments/", get(legacy_attachments))
+        .route(
+            "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/issue-attachments/",
+            get(legacy_attachments)
+                .post(crate::assets::legacy_attachment_upload)
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
         .route("/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/versions/", get(issue_versions))
         .route("/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/versions/{version_id}/", get(issue_version))
         .route("/api/workspaces/{slug}/projects/{project_id}/work-items/{issue_id}/description-versions/", get(description_versions))
@@ -1432,7 +1437,7 @@ async fn comment_reaction_delete(
     reaction_delete(s, u, p, true).await
 }
 
-async fn visible_issue(
+pub(crate) async fn visible_issue(
     st: &AppState,
     user: &CurrentUser,
     slug: &str,

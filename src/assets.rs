@@ -421,6 +421,79 @@ async fn upload(State(st): State<AppState>, Path(asset_id): Path<Uuid>, mut form
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Plane `IssueAttachmentEndpoint.post` (legacy multipart upload): the `asset` file field is stored
+/// directly, `attributes` may carry name/type/size. Same visibility as reading the issue (restricted
+/// guests only on their own issues), size capped at FILE_SIZE_LIMIT, 201 with the row.
+pub(crate) async fn legacy_attachment_upload(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, issue)): Path<(String, Uuid, Uuid)>,
+    mut form: Multipart,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let p = crate::issues::visible_issue(&st, &user, &slug, project, issue).await?;
+    let mut attrs = json!({});
+    let mut file: Option<(String, Vec<u8>)> = None;
+    while let Some(mut field) = form
+        .next_field()
+        .await
+        .map_err(|_| ApiError::bad("Invalid multipart body"))?
+    {
+        match field.name() {
+            Some("attributes") => {
+                let raw = field.text().await.map_err(|_| ApiError::bad("Invalid attributes"))?;
+                attrs = serde_json::from_str(&raw)
+                    .ok()
+                    .filter(Value::is_object)
+                    .ok_or_else(|| ApiError::bad_body(json!({"attributes": ["Value must be valid JSON."]})))?;
+            }
+            Some("asset") => {
+                let name = sanitize_filename(field.file_name().unwrap_or(""));
+                let mut buf = Vec::new();
+                while let Some(chunk) = field.chunk().await.map_err(|_| ApiError::bad("Upload interrupted"))? {
+                    if buf.len() + chunk.len() > st.cfg.file_size_limit as usize {
+                        return Err(ApiError::bad_body(
+                            json!({"asset": ["File too large. Size should not exceed 5 MB."]}),
+                        ));
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+                file = Some((name, buf));
+            }
+            _ => {}
+        }
+    }
+    let (name, data) = file.ok_or_else(|| ApiError::bad_body(json!({"asset": ["No file was submitted."]})))?;
+    let name = if name.is_empty() { Uuid::new_v4().simple().to_string() } else { name };
+    let key = format!("{}/{}-{}", p.workspace_id(), Uuid::new_v4().simple(), name);
+    let path = disk_path(&st, &key)?;
+    if let Some(dir) = path.parent() {
+        tokio::fs::create_dir_all(dir).await.map_err(io_err)?;
+    }
+    tokio::fs::write(&path, &data).await.map_err(io_err)?;
+    // ponytail: Plane also queues an attachment.activity.created issue activity; add with the activity helper.
+    let row: Value = sqlx::query_scalar(
+        "INSERT INTO file_assets (id, attributes, asset, size, workspace_id, project_id, issue_id, created_by_id,
+           updated_by_id, entity_type, is_uploaded, is_deleted, is_archived, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, 'ISSUE_ATTACHMENT', true, false, false, now(), now())
+         RETURNING (to_jsonb(file_assets) - 'workspace_id' - 'project_id' - 'issue_id' - 'created_by_id' - 'updated_by_id')
+           || jsonb_build_object('workspace', workspace_id, 'project', project_id, 'issue', issue_id,
+                'created_by', created_by_id, 'updated_by', updated_by_id,
+                'asset_url', '/api/assets/v2/workspaces/' || $9 || '/projects/' || project_id || '/issues/' || issue_id || '/attachments/' || id || '/')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(&attrs)
+    .bind(&key)
+    .bind(data.len() as f64)
+    .bind(p.workspace_id())
+    .bind(project)
+    .bind(issue)
+    .bind(user.id)
+    .bind(&slug)
+    .fetch_one(&st.db)
+    .await?;
+    Ok((StatusCode::CREATED, Json(row)))
+}
+
 fn io_err(e: std::io::Error) -> ApiError {
     tracing::error!("storage error: {e}");
     ApiError(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "Storage error"}))
