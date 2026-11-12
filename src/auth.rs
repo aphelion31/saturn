@@ -1122,7 +1122,7 @@ async fn admin_sign_out(State(st): State<AppState>, u: MaybeUser) -> Result<Resp
     sign_out(&st, u, session::ADMIN_COOKIE, to).await
 }
 
-async fn is_instance_admin(st: &AppState, user_id: Uuid) -> Result<bool, ApiError> {
+pub(crate) async fn is_instance_admin(st: &AppState, user_id: Uuid) -> Result<bool, ApiError> {
     let v: (bool,) =
         sqlx::query_as("SELECT EXISTS (SELECT 1 FROM instance_admins WHERE user_id = $1 AND deleted_at IS NULL)")
             .bind(user_id)

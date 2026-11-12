@@ -25,7 +25,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/users/me/email/generate-code/", post(generate_email_code))
         .route("/api/users/me/email/", patch(update_email))
-        .route("/api/users/me/", get(me).patch(update_me))
+        .route("/api/users/me/", get(me).patch(update_me).delete(deactivate))
         .route("/api/users/me/settings/", get(settings))
         .route("/api/users/me/profile/", get(profile).patch(update_profile))
         .route("/api/users/me/instance-admin/", get(instance_admin))
@@ -43,6 +43,61 @@ async fn token_update(State(st): State<AppState>, user: CurrentUser, Path(pk): P
     }
     json_row(sqlx::query_scalar(&format!("UPDATE api_tokens AS t SET label=COALESCE($3,label), description=COALESCE($4,description), updated_at=now(), updated_by_id=$2 WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL RETURNING {TOKEN_READ_JSON} || jsonb_build_object('token', t.token)"))
         .bind(pk).bind(user.id).bind(s(&b,"label")).bind(s(&b,"description")), &st.db).await
+}
+
+/// Plane `UserEndpoint.deactivate`: refuse for instance admins and for the sole admin of a project or
+/// workspace that has other members; otherwise leave every membership, drop invites and sessions,
+/// reset onboarding, scramble the password and deactivate. One transaction so a refusal changes nothing.
+async fn deactivate(State(st): State<AppState>, user: CurrentUser) -> Result<Response, ApiError> {
+    if crate::auth::is_instance_admin(&st, user.id).await? {
+        return Err(ApiError::bad("You cannot deactivate your account since you are an instance admin"));
+    }
+    // A membership blocks deactivation when it has other members but no other active admin. Plane's
+    // annotate counts only the user's own row (total_members is always 1), so its guard never fires and
+    // a sole admin can orphan a workspace; Saturn enforces what the error message promises.
+    let sole = |table: &str, scope: &str| {
+        format!(
+            "SELECT EXISTS (SELECT 1 FROM {table} m WHERE m.member_id = $1 AND m.is_active AND m.deleted_at IS NULL
+               AND (SELECT count(*) FROM {table} o WHERE o.{scope} = m.{scope} AND o.deleted_at IS NULL) > 1
+               AND NOT EXISTS (SELECT 1 FROM {table} o WHERE o.{scope} = m.{scope} AND o.role = 20 AND o.is_active
+                 AND o.deleted_at IS NULL AND o.member_id <> $1))"
+        )
+    };
+    let mut tx = st.db.begin().await?;
+    sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR UPDATE").bind(user.id).execute(&mut *tx).await?;
+    for (table, scope, what) in [("project_members", "project_id", "projects"), ("workspace_members", "workspace_id", "workspaces")] {
+        let blocked: bool = sqlx::query_scalar(&sole(table, scope)).bind(user.id).fetch_one(&mut *tx).await?;
+        if blocked {
+            return Err(ApiError::bad(format!(
+                "You cannot deactivate account as you are the only admin in some {what}."
+            )));
+        }
+    }
+    sqlx::query("UPDATE project_members SET is_active = false WHERE member_id = $1 AND is_active").bind(user.id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE workspace_members SET is_active = false WHERE member_id = $1 AND is_active").bind(user.id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM workspace_member_invites WHERE email = $1").bind(&user.email).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM sessions WHERE user_id = $1").bind(user.id.to_string()).execute(&mut *tx).await?;
+    sqlx::query(
+        "UPDATE profiles SET last_workspace_id = NULL, is_tour_completed = false, is_onboarded = false,
+           onboarding_step = '{\"workspace_join\": false, \"profile_complete\": false, \"workspace_create\": false, \"workspace_invite\": false}'::jsonb
+         WHERE user_id = $1",
+    )
+    .bind(user.id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE users SET is_password_autoset = true, password = $2, is_active = false, last_logout_time = now(),
+           updated_at = now() WHERE id = $1",
+    )
+    .bind(user.id)
+    .bind(session::hash_password(&Uuid::new_v4().simple().to_string()))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    // ponytail: Plane also emails a deactivation notice; add when that template is ported.
+    let mut headers = HeaderMap::new();
+    headers.insert(header::SET_COOKIE, session::set_cookie(&st, session::COOKIE, None, 0).parse().unwrap());
+    Ok((StatusCode::NO_CONTENT, headers).into_response())
 }
 
 // --- API tokens (ApiTokenEndpoint). Token is returned once, on create. ---
