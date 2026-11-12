@@ -55,11 +55,11 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/intakes/{pk}/",
-            get(intake_retrieve).patch(intake_update).delete(intake_destroy),
+            get(intake_retrieve).delete(intake_destroy),
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/inboxes/{pk}/",
-            get(intake_retrieve).patch(intake_update).delete(intake_destroy),
+            get(intake_retrieve).delete(intake_destroy),
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/intake-issues/",
@@ -796,15 +796,8 @@ async fn intake_retrieve(
     .await
 }
 
-const INTAKE_FIELDS: &[(&str, &str)] = &[
-    ("name", "text"),
-    ("description", "text"),
-    ("is_default", "boolean"),
-    ("view_props", "jsonb"),
-    ("logo_props", "jsonb"),
-];
-
-/// Plane `IntakeViewSet.create`: create a new intake in the project.
+/// Plane `IntakeViewSet.perform_create` (admin or member). Plane has no partial_update/update on this
+/// viewset, so PATCH/PUT on `intakes/{pk}/` answer 405 there and are deliberately not routed here.
 async fn intake_create(
     State(st): State<AppState>,
     user: CurrentUser,
@@ -812,7 +805,7 @@ async fn intake_create(
     Json(b): Json<Value>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
-    p.require(&[ADMIN])?;
+    p.require(&[ADMIN, MEMBER])?;
     let name = b.get("name").and_then(Value::as_str).unwrap_or("Intake").trim();
     if name.is_empty() {
         return Err(ApiError::bad("Name is required"));
@@ -838,7 +831,14 @@ async fn intake_create(
     .bind(p.workspace_id())
     .bind(user.id)
     .execute(&st.db)
-    .await?;
+    .await
+    .map_err(|e| match &e {
+        // DRF's UniqueTogetherValidator on (name, project, deleted_at) answers 400 before the insert.
+        sqlx::Error::Database(d) if d.code().as_deref() == Some("23505") => ApiError::bad_body(
+            json!({"non_field_errors": ["The fields name, project, deleted_at must make a unique set."]}),
+        ),
+        _ => e.into(),
+    })?;
 
     let row = sqlx::query_scalar(&format!(
         "SELECT {INTAKE_JSON} FROM intakes n WHERE n.id = $1 AND n.project_id = $2 AND n.workspace_id = $3"
@@ -850,38 +850,6 @@ async fn intake_create(
     .await?;
 
     created(row)
-}
-
-/// Plane `IntakeViewSet.partial_update`: patch intake attributes.
-async fn intake_update(
-    State(st): State<AppState>,
-    user: CurrentUser,
-    Path((slug, project_id, pk)): Path<(String, Uuid, Uuid)>,
-    Json(b): Json<Value>,
-) -> ApiResult {
-    let p = require_project(&st.db, &user, &slug, project_id).await?;
-    p.require(&[ADMIN])?;
-    let mut sets = patch_sets(&b, INTAKE_FIELDS, 2);
-    if sets.is_empty() {
-        return intake_retrieve(State(st), user, Path((slug, project_id, pk))).await;
-    }
-    sets.push("updated_by_id = $1".into());
-    sets.push("updated_at = now()".into());
-    let res = sqlx::query(&format!(
-        "UPDATE intakes SET {} WHERE id = $3 AND project_id = $4 AND workspace_id = $5 AND deleted_at IS NULL",
-        sets.join(", ")
-    ))
-    .bind(user.id)
-    .bind(&b)
-    .bind(pk)
-    .bind(project_id)
-    .bind(p.workspace_id())
-    .execute(&st.db)
-    .await?;
-    if res.rows_affected() == 0 {
-        return Err(ApiError::not_found());
-    }
-    intake_retrieve(State(st), user, Path((slug, project_id, pk))).await
 }
 
 /// Plane `IntakeViewSet.destroy`: the default intake cannot be deleted.
