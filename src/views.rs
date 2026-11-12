@@ -29,7 +29,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/views/{pk}/",
-            get(project_retrieve).put(project_update).patch(project_update).delete(project_destroy),
+            get(project_retrieve).patch(project_update).delete(project_destroy),
         )
         .route("/api/workspaces/{slug}/views/", get(ws_list).post(ws_create))
         .route(
@@ -38,7 +38,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/api/workspaces/{slug}/views/{pk}/",
-            get(ws_retrieve).put(ws_update).patch(ws_update).delete(ws_destroy),
+            get(ws_retrieve).patch(ws_update).delete(ws_destroy),
         )
         .route(
             "/api/workspaces/{slug}/workspace-views/{pk}/",

@@ -19,8 +19,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/users/me/workspaces/", get(user_workspaces))
         .route("/api/workspaces/", get(user_workspaces).post(create))
         .route("/api/workspace-slug-check/", get(slug_check))
-        // ponytail: PUT shares PATCH validation; add DRF required-field checks when full replacement is needed.
-        .route("/api/workspaces/{slug}/", get(retrieve).put(update).patch(update).delete(destroy))
+        .route("/api/workspaces/{slug}/", get(retrieve).patch(update).delete(destroy))
         .route("/api/workspaces/{slug}/members/", get(members_list))
         .route("/api/workspaces/{slug}/members/leave/", post(leave))
         .route(

@@ -38,7 +38,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/cycles/{pk}/cycle-issues/{issue_id}/",
-            get(ci_retrieve).put(ci_update).patch(ci_update).delete(ci_destroy),
+            get(ci_retrieve).delete(ci_destroy),
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/cycles/{pk}/transfer-issues/",
@@ -883,23 +883,6 @@ async fn ci_retrieve(
         &st.db,
     )
     .await
-}
-
-// ponytail: PUT shares PATCH validation; add required-field validation for full DRF parity.
-async fn ci_update(State(st): State<AppState>, user: CurrentUser, Path((slug, project_id, cycle_id, issue_id)): Path<(String, Uuid, Uuid, Uuid)>, Json(b): Json<Value>) -> ApiResult {
-    let p = require_project(&st.db, &user, &slug, project_id).await?;
-    p.require(&[ADMIN, MEMBER])?;
-    if !b.is_object() { return Err(ApiError::bad("Invalid request")); }
-    let target = if b.get("issue").is_some() {
-        let id = uuid_of(&b, "issue").ok_or_else(|| ApiError::bad("Invalid issue"))?;
-        let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM issues WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL)").bind(id).bind(project_id).bind(p.workspace_id()).fetch_one(&st.db).await?;
-        if !valid { return Err(ApiError::bad("Invalid issue")); }
-        id
-    } else { issue_id };
-    let result = sqlx::query("UPDATE cycle_issues SET issue_id=$5,updated_at=now(),updated_by_id=$6 WHERE issue_id=$1 AND cycle_id=$2 AND project_id=$3 AND workspace_id=$4 AND deleted_at IS NULL")
-        .bind(issue_id).bind(cycle_id).bind(project_id).bind(p.workspace_id()).bind(target).bind(user.id).execute(&st.db).await?;
-    if result.rows_affected()==0 { return Err(ApiError::not_found()); }
-    ci_retrieve(State(st), user, Path((slug, project_id, cycle_id, target))).await
 }
 
 /// Remove one work item from a cycle (soft delete of the bridge row). Plane returns 204 even when absent.
