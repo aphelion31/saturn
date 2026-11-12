@@ -78,7 +78,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/issue-labels/{label_id}/",
-            get(label).put(update_label).patch(update_label).delete(delete_label),
+            get(label).patch(update_label).delete(delete_label),
         )
         .route("/api/workspaces/{slug}/project-identifiers/", get(project_identifiers).delete(delete_identifier))
         .route(
@@ -109,7 +109,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/workspaces/{slug}/projects/details/", get(list_projects))
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/",
-            get(retrieve).put(update).patch(update).delete(destroy),
+            get(retrieve).patch(update).delete(destroy),
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/archive/",

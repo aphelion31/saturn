@@ -2,8 +2,6 @@
 call GET "/api/users/me/workspaces/$SLUG/projects/invitations/"
 call PATCH /api/instances/ '{"instance_name":"Saturn smoke"}'
 [[ "$(field '.instance_name')" == 'Saturn smoke' ]]
-call PUT "/api/workspaces/$SLUG/" '{"name":"Acme"}'
-call PUT "/api/workspaces/$SLUG/projects/$PROJECT/" '{}'
 METHOD_MEMBER=$(psql "$DATABASE_URL" -Atc "SELECT id FROM project_members WHERE project_id='$PROJECT' AND is_active AND deleted_at IS NULL LIMIT 1")
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/members/$METHOD_MEMBER/"
 [[ "$(field '.id')" == "$METHOD_MEMBER" ]]

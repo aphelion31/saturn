@@ -81,7 +81,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/",
-            get(detail).put(update).patch(update).delete(destroy),
+            get(detail).patch(update).delete(destroy),
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/comments/",
