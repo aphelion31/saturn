@@ -47,11 +47,11 @@ pub fn routes() -> Router<AppState> {
         .route("/api/workspaces/{slug}/issues/", get(ws_issues))
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/intakes/",
-            get(intake_list),
+            get(intake_list).post(intake_create),
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/inboxes/",
-            get(intake_list),
+            get(intake_list).post(intake_create),
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/intakes/{pk}/",
@@ -794,6 +794,62 @@ async fn intake_retrieve(
         &st.db,
     )
     .await
+}
+
+/// Plane `IntakeViewSet.perform_create` (admin or member). Plane has no partial_update/update on this
+/// viewset, so PATCH/PUT on `intakes/{pk}/` answer 405 there and are deliberately not routed here.
+async fn intake_create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let name = b.get("name").and_then(Value::as_str).unwrap_or("Intake").trim();
+    if name.is_empty() {
+        return Err(ApiError::bad("Name is required"));
+    }
+    let description = b.get("description").and_then(Value::as_str).unwrap_or("");
+    let is_default = b.get("is_default").and_then(Value::as_bool).unwrap_or(false);
+    let view_props = b.get("view_props").cloned().unwrap_or_else(|| json!({}));
+    let logo_props = b.get("logo_props").cloned().unwrap_or_else(|| json!({}));
+
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO intakes (id, name, description, is_default, view_props, logo_props, project_id, workspace_id,
+             created_by_id, updated_by_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, now(), now())",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(description)
+    .bind(is_default)
+    .bind(view_props)
+    .bind(logo_props)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .bind(user.id)
+    .execute(&st.db)
+    .await
+    .map_err(|e| match &e {
+        // DRF's UniqueTogetherValidator on (name, project, deleted_at) answers 400 before the insert.
+        sqlx::Error::Database(d) if d.code().as_deref() == Some("23505") => ApiError::bad_body(
+            json!({"non_field_errors": ["The fields name, project, deleted_at must make a unique set."]}),
+        ),
+        _ => e.into(),
+    })?;
+
+    let row = sqlx::query_scalar(&format!(
+        "SELECT {INTAKE_JSON} FROM intakes n WHERE n.id = $1 AND n.project_id = $2 AND n.workspace_id = $3"
+    ))
+    .bind(id)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .fetch_one(&st.db)
+    .await?;
+
+    created(row)
 }
 
 /// Plane `IntakeViewSet.destroy`: the default intake cannot be deleted.
