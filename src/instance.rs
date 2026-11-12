@@ -16,13 +16,14 @@ use crate::common::*;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/api/instances/", axum::routing::patch(update_instance))
         .route(
             "/api/instances/configurations/",
             get(configurations).patch(update_configurations),
         )
         .route(
             "/api/instances/configurations/disable-email-feature/",
-            post(disable_email),
+            post(disable_email).delete(disable_email),
         )
         .route("/api/instances/email-credentials-check/", post(email_check))
         .route("/api/instances/admins/", get(admins).post(add_admin))
@@ -30,6 +31,33 @@ pub fn routes() -> Router<AppState> {
         .route("/api/instances/workspaces/", get(workspaces).post(create_workspace))
         .route("/api/instances/workspace-slug-check/", get(slug_check))
         .route("/api/instances/changelog/", get(|| async { Json(json!([])) }))
+}
+
+async fn update_instance(State(st): State<AppState>, user: CurrentUser, Json(b): Json<Value>) -> ApiResult {
+    require_instance_admin(&st, &user).await?;
+    let obj = b.as_object().ok_or_else(|| ApiError::bad("Invalid request"))?;
+    let fields = [
+        ("instance_name", "text"), ("whitelist_emails", "text"), ("instance_id", "text"),
+        ("current_version", "text"), ("latest_version", "text"), ("edition", "text"),
+        ("domain", "text"), ("namespace", "text"), ("is_telemetry_enabled", "boolean"),
+        ("is_support_required", "boolean"), ("is_signup_screen_visited", "boolean"),
+        ("is_verified", "boolean"), ("is_test", "boolean"), ("is_current_version_deprecated", "boolean"),
+    ];
+    for (key, ty) in fields {
+        if let Some(v) = obj.get(key) {
+            let nullable = matches!(key, "whitelist_emails" | "latest_version" | "namespace");
+            if !(v.is_null() && nullable || if ty == "boolean" { v.is_boolean() } else { v.is_string() }) {
+                return Err(ApiError::bad_body(json!({key: ["Invalid value."]})));
+            }
+            if ty == "text" && !matches!(key, "whitelist_emails" | "domain") && v.as_str().is_some_and(|s| s.chars().count() > 255) {
+                return Err(ApiError::bad_body(json!({key: ["Ensure this field has no more than 255 characters."]})));
+            }
+        }
+    }
+    let mut sets = crate::users::patch_sets(&b, &fields, 2);
+    sets.push("updated_at=now()".into());
+    sets.push("updated_by_id=$1".into());
+    json_row(sqlx::query_scalar(&format!("UPDATE instances SET {} WHERE $2::jsonb IS NOT NULL AND id=(SELECT id FROM instances WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 1) RETURNING to_jsonb(instances)", sets.join(", "))).bind(user.id).bind(b), &st.db).await
 }
 
 /// Keys and defaults of Plane's `instance_config_variables` that Saturn uses or shows in god-mode.

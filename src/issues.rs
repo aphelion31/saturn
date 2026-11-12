@@ -81,7 +81,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/",
-            get(detail).patch(update).delete(destroy),
+            get(detail).put(update).patch(update).delete(destroy),
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/issues/{issue_id}/comments/",
@@ -1593,7 +1593,7 @@ async fn history(
     .await
 }
 
-async fn update(
+pub(crate) async fn update(
     State(st): State<AppState>,
     user: CurrentUser,
     Path((slug, project_id, issue_id)): Path<(String, Uuid, Uuid)>,

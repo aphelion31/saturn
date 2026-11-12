@@ -37,7 +37,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/modules/{module_id}/issues/{issue_id}/",
-            get(get_issue).delete(remove_issue),
+            get(get_issue).put(update_module_issue).patch(update_module_issue).delete(remove_issue),
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/modules/{module_id}/module-links/",
@@ -635,6 +635,16 @@ async fn get_issue(
         &st.db,
     )
     .await
+}
+
+// ponytail: PUT shares PATCH validation; add required-field validation for full DRF parity.
+async fn update_module_issue(State(st): State<AppState>, user: CurrentUser, Path((slug, project_id, module_id, issue_id)): Path<(String, Uuid, Uuid, Uuid)>, Json(b): Json<Value>) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN, MEMBER])?;
+    let linked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM module_issues WHERE module_id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND deleted_at IS NULL)")
+        .bind(module_id).bind(issue_id).bind(project_id).bind(p.workspace_id()).fetch_one(&st.db).await?;
+    if !linked { return Err(ApiError::not_found()); }
+    crate::issues::update(State(st), user, Path((slug, project_id, issue_id)), Json(b)).await
 }
 
 /// Plane `ModuleIssueViewSet.destroy`: unlink one issue from one module (soft).
