@@ -47,19 +47,19 @@ pub fn routes() -> Router<AppState> {
         .route("/api/workspaces/{slug}/issues/", get(ws_issues))
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/intakes/",
-            get(intake_list),
+            get(intake_list).post(intake_create),
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/inboxes/",
-            get(intake_list),
+            get(intake_list).post(intake_create),
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/intakes/{pk}/",
-            get(intake_retrieve).delete(intake_destroy),
+            get(intake_retrieve).patch(intake_update).delete(intake_destroy),
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/inboxes/{pk}/",
-            get(intake_retrieve).delete(intake_destroy),
+            get(intake_retrieve).patch(intake_update).delete(intake_destroy),
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/intake-issues/",
@@ -794,6 +794,94 @@ async fn intake_retrieve(
         &st.db,
     )
     .await
+}
+
+const INTAKE_FIELDS: &[(&str, &str)] = &[
+    ("name", "text"),
+    ("description", "text"),
+    ("is_default", "boolean"),
+    ("view_props", "jsonb"),
+    ("logo_props", "jsonb"),
+];
+
+/// Plane `IntakeViewSet.create`: create a new intake in the project.
+async fn intake_create(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id)): Path<(String, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN])?;
+    let name = b.get("name").and_then(Value::as_str).unwrap_or("Intake").trim();
+    if name.is_empty() {
+        return Err(ApiError::bad("Name is required"));
+    }
+    let description = b.get("description").and_then(Value::as_str).unwrap_or("");
+    let is_default = b.get("is_default").and_then(Value::as_bool).unwrap_or(false);
+    let view_props = b.get("view_props").cloned().unwrap_or_else(|| json!({}));
+    let logo_props = b.get("logo_props").cloned().unwrap_or_else(|| json!({}));
+
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO intakes (id, name, description, is_default, view_props, logo_props, project_id, workspace_id,
+             created_by_id, updated_by_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, now(), now())",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(description)
+    .bind(is_default)
+    .bind(view_props)
+    .bind(logo_props)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .bind(user.id)
+    .execute(&st.db)
+    .await?;
+
+    let row = sqlx::query_scalar(&format!(
+        "SELECT {INTAKE_JSON} FROM intakes n WHERE n.id = $1 AND n.project_id = $2 AND n.workspace_id = $3"
+    ))
+    .bind(id)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .fetch_one(&st.db)
+    .await?;
+
+    created(row)
+}
+
+/// Plane `IntakeViewSet.partial_update`: patch intake attributes.
+async fn intake_update(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project_id, pk)): Path<(String, Uuid, Uuid)>,
+    Json(b): Json<Value>,
+) -> ApiResult {
+    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    p.require(&[ADMIN])?;
+    let mut sets = patch_sets(&b, INTAKE_FIELDS, 2);
+    if sets.is_empty() {
+        return intake_retrieve(State(st), user, Path((slug, project_id, pk))).await;
+    }
+    sets.push("updated_by_id = $1".into());
+    sets.push("updated_at = now()".into());
+    let res = sqlx::query(&format!(
+        "UPDATE intakes SET {} WHERE id = $3 AND project_id = $4 AND workspace_id = $5 AND deleted_at IS NULL",
+        sets.join(", ")
+    ))
+    .bind(user.id)
+    .bind(&b)
+    .bind(pk)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .execute(&st.db)
+    .await?;
+    if res.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    intake_retrieve(State(st), user, Path((slug, project_id, pk))).await
 }
 
 /// Plane `IntakeViewSet.destroy`: the default intake cannot be deleted.
