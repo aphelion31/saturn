@@ -2431,6 +2431,45 @@ async fn create_issue(
         ),
     )
     .await?;
+    for (field, ids) in [
+        ("assignees", uuid_list(body, "assignee_ids")?),
+        ("labels", uuid_list(body, "label_ids")?),
+    ] {
+        for relation_id in ids {
+            let name: Option<String> = if field == "assignees" {
+                sqlx::query_scalar("SELECT u.display_name FROM users u JOIN project_members m ON m.member_id=u.id WHERE u.id=$1 AND m.project_id=$2 AND m.workspace_id=$3 AND m.is_active AND m.role>=15 AND m.deleted_at IS NULL")
+                    .bind(relation_id).bind(project_id).bind(p.workspace_id()).fetch_optional(&mut *tx).await?
+            } else {
+                sqlx::query_scalar(
+                    "SELECT name FROM labels WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+                )
+                .bind(relation_id)
+                .bind(project_id)
+                .bind(p.workspace_id())
+                .fetch_optional(&mut *tx)
+                .await?
+            };
+            if let Some(name) = name.as_deref() {
+                let mut event = crate::activity::ActivityEvent::new(
+                    id,
+                    project_id,
+                    p.workspace_id(),
+                    user.id,
+                    "updated",
+                    if field == "assignees" {
+                        "added assignee "
+                    } else {
+                        "added label "
+                    },
+                );
+                event.field = Some(field);
+                event.old_value = Some("");
+                event.new_value = Some(name);
+                event.new_identifier = Some(relation_id);
+                crate::activity::record(&mut *tx, event).await?;
+            }
+        }
+    }
     let result: Value = sqlx::query_scalar(&format!(
         "SELECT {} || jsonb_build_object('description_html',i.description_html,'is_subscribed',false,'is_intake',false) FROM issues i WHERE i.id=$1 AND i.project_id=$2 AND i.workspace_id=$3",
         workitems::ITEM_JSON
