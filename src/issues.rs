@@ -1528,6 +1528,7 @@ async fn comment_create(
     let id: Uuid = sqlx::query_scalar("INSERT INTO issue_comments (workspace_id,project_id,issue_id,actor_id,created_by_id,updated_by_id,comment_html,comment_stripped,comment_json,access,attachments,description_id) VALUES ($1,$2,$3,$4,$4,$4,$5,$6,$7,$8,ARRAY[]::varchar[],$9) RETURNING id")
         .bind(p.workspace_id()).bind(project).bind(issue).bind(user.id).bind(&html).bind(strip_tags(&html)).bind(json).bind(access.unwrap_or("INTERNAL")).bind(description).fetch_one(&mut *tx).await?;
     tx.commit().await?;
+    crate::webhook_out::emit(&st, p.workspace_id(), "issue_comment", "created", serde_json::json!({"id": id}));
     let Json(value) = comment_detail(State(st), user, Path((slug, project, issue, id))).await?;
     created(value)
 }
@@ -1549,6 +1550,7 @@ async fn comment_update(
     sqlx::query("UPDATE descriptions d SET description_html=c.comment_html,description_stripped=c.comment_stripped,description_json=c.comment_json,updated_at=now(),updated_by_id=$5 FROM issue_comments c WHERE c.id=$1 AND c.issue_id=$2 AND c.project_id=$3 AND c.workspace_id=$4 AND d.id=c.description_id AND d.project_id=$3 AND d.workspace_id=$4 AND d.deleted_at IS NULL")
         .bind(comment).bind(issue).bind(project).bind(p.workspace_id()).bind(user.id).execute(&mut *tx).await?;
     tx.commit().await?;
+    crate::webhook_out::emit(&st, p.workspace_id(), "issue_comment", "updated", serde_json::json!({"id": comment}));
     comment_detail(State(st), user, Path((slug, project, issue, comment))).await
 }
 
@@ -1563,6 +1565,7 @@ async fn comment_delete(
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
+    crate::webhook_out::emit(&st, p.workspace_id(), "issue_comment", "deleted", serde_json::json!({"id": comment}));
     no_content()
 }
 
@@ -1741,6 +1744,7 @@ pub(crate) async fn update(
         }
     }
     tx.commit().await?;
+    crate::webhook_out::emit(&st, p.workspace_id(), "issue", "updated", body.clone());
     detail(State(st), user, Path((slug, project_id, issue_id))).await
 }
 
@@ -1756,6 +1760,7 @@ async fn destroy(
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
+    crate::webhook_out::emit(&st, p.workspace_id(), "issue", "deleted", serde_json::json!({"id": issue_id}));
     no_content()
 }
 
@@ -1770,6 +1775,7 @@ async fn create(
     let mut tx = st.db.begin().await?;
     let result = create_issue(&mut tx, &user, &p, &body).await?;
     tx.commit().await?;
+    crate::webhook_out::emit(&st, p.workspace_id(), "issue", "created", result.clone());
     created(result)
 }
 

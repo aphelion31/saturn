@@ -94,7 +94,8 @@ async fn deactivate(State(st): State<AppState>, user: CurrentUser) -> Result<Res
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    // ponytail: Plane also emails a deactivation notice; add when that template is ported.
+    let text = format!("Your account has been deactivated on Plane. {}/login", st.cfg.web_url.trim_end_matches('/'));
+    crate::outbound::send_mail_bg(&st, user.email.clone(), format!("{} has been deactivated on Plane", user.email), ammonia::clean(&text), text);
     let mut headers = HeaderMap::new();
     headers.insert(header::SET_COOKIE, session::set_cookie(&st, session::COOKIE, None, 0).parse().unwrap());
     Ok((StatusCode::NO_CONTENT, headers).into_response())
@@ -591,7 +592,7 @@ async fn generate_email_code(State(st): State<AppState>, user: CurrentUser, Json
     crate::outbound::send_mail_bg(
         &st,
         email.clone(),
-        format!("Your Plane email verification code is {token}"),
+        "Verify your new email address".into(),
         format!("<p>Your Plane email verification code is <strong>{token}</strong>. It expires in 10 minutes.</p>"),
         format!("Your Plane email verification code is {token}. It expires in 10 minutes."),
     );
@@ -672,7 +673,7 @@ async fn update_email(
         crate::outbound::send_mail_bg(
             &st,
             to,
-            "Your Plane account email was changed".into(),
+            "Plane email address successfully updated".into(),
             "<p>The email address on your Plane account was changed. If this was not you, contact your administrator.</p>"
                 .into(),
             "The email address on your Plane account was changed. If this was not you, contact your administrator."

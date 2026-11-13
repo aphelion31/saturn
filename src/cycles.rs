@@ -303,6 +303,7 @@ async fn create(
     .bind(end)
     .fetch_one(&st.db)
     .await?;
+    crate::webhook_out::emit(&st, p.workspace_id(), "cycle", "created", json!({"id": id}));
     Ok((StatusCode::CREATED, fetch_cycle(&st.db, &p, &user, id).await?))
 }
 
@@ -389,6 +390,7 @@ async fn update(
     .fetch_optional(&st.db)
     .await?;
     v.ok_or_else(cycle_not_found)?;
+    crate::webhook_out::emit(&st, p.workspace_id(), "cycle", "updated", json!({"id": pk}));
     fetch_cycle(&st.db, &p, &user, pk).await
 }
 
@@ -432,6 +434,7 @@ async fn destroy(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    crate::webhook_out::emit(&st, p.workspace_id(), "cycle", "deleted", json!({"id": pk}));
     no_content()
 }
 
