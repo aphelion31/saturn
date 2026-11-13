@@ -1024,11 +1024,11 @@ async fn transfer(
     .bind(c.5)
     .execute(&mut *tx)
     .await?;
-    sqlx::query(&format!(
+    let moved: Vec<Uuid> = sqlx::query_scalar(&format!(
         "UPDATE cycle_issues ci SET cycle_id = $1, updated_by_id = $2, updated_at = now()
          WHERE ci.cycle_id = $3 AND ci.project_id = $4 AND ci.workspace_id = $5 AND ci.deleted_at IS NULL
            AND ci.issue_id IN (SELECT i.id FROM issues i JOIN states s ON s.id = i.state_id
-               WHERE s.group = ANY($6) AND {ACTIVE})"
+               WHERE s.group = ANY($6) AND {ACTIVE}) RETURNING ci.issue_id"
     ))
     .bind(new_id)
     .bind(user.id)
@@ -1036,8 +1036,37 @@ async fn transfer(
     .bind(project_id)
     .bind(p.workspace_id())
     .bind(vec!["backlog", "unstarted", "started"])
-    .execute(&mut *tx)
+    .fetch_all(&mut *tx)
     .await?;
+    let names: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id,name FROM cycles WHERE id=ANY($1) AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+    )
+    .bind(vec![cycle_id, new_id])
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .fetch_all(&mut *tx)
+    .await?;
+    let old_name = names
+        .iter()
+        .find(|(id, _)| *id == cycle_id)
+        .map(|(_, name)| name.as_str())
+        .unwrap_or("");
+    let new_name = names
+        .iter()
+        .find(|(id, _)| *id == new_id)
+        .map(|(_, name)| name.as_str())
+        .unwrap_or("");
+    for issue in moved {
+        let comment = format!("updated cycle from {old_name}\n                to {new_name}");
+        let mut event =
+            crate::activity::ActivityEvent::new(issue, project_id, p.workspace_id(), user.id, "updated", &comment);
+        event.field = Some("cycles");
+        event.old_value = Some(old_name);
+        event.new_value = Some(new_name);
+        event.old_identifier = Some(cycle_id);
+        event.new_identifier = Some(new_id);
+        crate::activity::record(&mut *tx, event).await?;
+    }
     tx.commit().await?;
     Ok(Json(json!({"message": "Success"})))
 }

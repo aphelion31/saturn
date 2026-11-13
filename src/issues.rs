@@ -941,6 +941,19 @@ async fn bulk_archive(
     let date: chrono::NaiveDate = sqlx::query_scalar("SELECT CURRENT_DATE").fetch_one(&mut *tx).await?;
     sqlx::query("UPDATE issues SET archived_at=$4,updated_at=now(),updated_by_id=$5 WHERE id=ANY($1) AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL")
         .bind(&ids).bind(pid).bind(p.workspace_id()).bind(date).bind(user.id).execute(&mut *tx).await?;
+    for id in &ids {
+        let mut event = crate::activity::ActivityEvent::new(
+            *id,
+            pid,
+            p.workspace_id(),
+            user.id,
+            "updated",
+            "Actor has archived the issue",
+        );
+        event.field = Some("archived_at");
+        event.new_value = Some("manual_archive");
+        crate::activity::record(&mut *tx, event).await?;
+    }
     tx.commit().await?;
     Ok(Json(serde_json::json!({"archived_at":date})))
 }
@@ -980,9 +993,80 @@ async fn bulk_operation(
             return Err(ApiError::bad("Invalid state"));
         }
     }
+    let before: Vec<Value> = sqlx::query_scalar("SELECT to_jsonb(i) FROM issues i WHERE i.id=ANY($1) AND i.project_id=$2 AND i.workspace_id=$3 AND i.deleted_at IS NULL FOR UPDATE")
+        .bind(&ids).bind(pid).bind(p.workspace_id()).fetch_all(&mut *tx).await?;
     let count=sqlx::query(&format!("UPDATE issues i SET state_id=COALESCE($4,state_id),priority=COALESCE($5,priority),start_date=CASE WHEN $6 THEN $7 ELSE start_date END,target_date=CASE WHEN $8 THEN $9 ELSE target_date END,completed_at=CASE WHEN $4::uuid IS NULL THEN completed_at WHEN (SELECT s.group FROM states s WHERE s.id=$4 AND s.project_id=$2 AND s.workspace_id=$3) IN ('completed','cancelled') THEN now() ELSE NULL END,updated_at=now(),updated_by_id=$10 WHERE i.id=ANY($1) AND i.project_id=$2 AND i.workspace_id=$3 AND {ACTIVE} AND (CASE WHEN $6 THEN $7 ELSE start_date END IS NULL OR CASE WHEN $8 THEN $9 ELSE target_date END IS NULL OR CASE WHEN $6 THEN $7 ELSE start_date END <= CASE WHEN $8 THEN $9 ELSE target_date END)")).bind(&ids).bind(pid).bind(p.workspace_id()).bind(state).bind(priority).bind(props.contains_key("start_date")).bind(start).bind(props.contains_key("target_date")).bind(end).bind(user.id).execute(&mut *tx).await?.rows_affected();
     if count as usize != ids.len() {
         return Err(ApiError::bad("Invalid issues or date range"));
+    }
+    for old in before {
+        let Some(id) = old
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|v| Uuid::parse_str(v).ok())
+        else {
+            continue;
+        };
+        let after: Value = sqlx::query_scalar(
+            "SELECT to_jsonb(i) FROM issues i WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+        )
+        .bind(id)
+        .bind(pid)
+        .bind(p.workspace_id())
+        .fetch_one(&mut *tx)
+        .await?;
+        for (field, comment) in [
+            ("priority", "updated the priority to"),
+            ("start_date", "updated the start date to "),
+            ("target_date", "updated the target date to"),
+        ] {
+            if old.get(field) != after.get(field) {
+                let mut event =
+                    crate::activity::ActivityEvent::new(id, pid, p.workspace_id(), user.id, "updated", comment);
+                event.field = Some(field);
+                event.old_value =
+                    old.get(field)
+                        .and_then(Value::as_str)
+                        .or(if field.ends_with("_date") { Some("") } else { None });
+                event.new_value = after
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .or(if field.ends_with("_date") { Some("") } else { None });
+                crate::activity::record(&mut *tx, event).await?;
+            }
+        }
+        if old.get("state_id") != after.get("state_id") {
+            let old_id = old
+                .get("state_id")
+                .and_then(Value::as_str)
+                .and_then(|v| Uuid::parse_str(v).ok());
+            let new_id = after
+                .get("state_id")
+                .and_then(Value::as_str)
+                .and_then(|v| Uuid::parse_str(v).ok());
+            let names: Vec<(Uuid, String)> = sqlx::query_as("SELECT id,name FROM states WHERE id=ANY($1) AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL")
+                .bind([old_id, new_id].into_iter().flatten().collect::<Vec<_>>()).bind(pid).bind(p.workspace_id()).fetch_all(&mut *tx).await?;
+            let mut event = crate::activity::ActivityEvent::new(
+                id,
+                pid,
+                p.workspace_id(),
+                user.id,
+                "updated",
+                "updated the state to",
+            );
+            event.field = Some("state");
+            event.old_identifier = old_id;
+            event.new_identifier = new_id;
+            event.old_value = names
+                .iter()
+                .find(|(id, _)| Some(*id) == old_id)
+                .map(|(_, name)| name.as_str());
+            event.new_value = names
+                .iter()
+                .find(|(id, _)| Some(*id) == new_id)
+                .map(|(_, name)| name.as_str());
+            crate::activity::record(&mut *tx, event).await?;
+        }
     }
     tx.commit().await?;
     Ok(Json(serde_json::json!({"updated":count})))
