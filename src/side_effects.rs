@@ -511,16 +511,19 @@ pub fn spawn_copy_page_assets(
                 orig.attributes.get("name").and_then(Value::as_str).unwrap_or("unnamed"),
             );
             let new_key = format!("{}/{}-{}", workspace_id, new_id.simple(), name);
-            if let (Ok(src), Ok(dst)) = (
+            let (Ok(src), Ok(dst)) = (
                 crate::assets::disk_path(&st, &orig.asset),
                 crate::assets::disk_path(&st, &new_key),
-            ) {
-                if let Some(parent) = dst.parent() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
-                }
-                if let Err(e) = tokio::fs::copy(&src, &dst).await {
-                    tracing::warn!(old_asset = %orig.id, error = %e, "asset file copy failed; continuing with DB row");
-                }
+            ) else {
+                continue;
+            };
+            if let Some(parent) = dst.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            // Plane copies the object first and only then records the asset; never point a row at a missing file.
+            if let Err(e) = tokio::fs::copy(&src, &dst).await {
+                tracing::warn!(old_asset = %orig.id, error = %e, "asset file copy failed; keeping original reference");
+                continue;
             }
             let et = orig.entity_type.as_deref().unwrap_or("PAGE_DESCRIPTION");
             let page_col = if et == "PAGE_DESCRIPTION" { Some(page_id) } else { None };
