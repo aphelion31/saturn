@@ -862,6 +862,7 @@ async fn issue_reaction_create(
         return Err(ApiError::not_found());
     }
 
+    let mut tx = st.db.begin().await?;
     let id = Uuid::new_v4();
     let row: (Value,) = sqlx::query_as(
         "WITH ins AS (
@@ -898,8 +899,22 @@ async fn issue_reaction_create(
     .bind(issue_id)
     .bind(b.project_id)
     .bind(b.workspace_id)
-    .fetch_one(&st.db)
+    .fetch_one(&mut *tx)
     .await?;
+
+    let mut event = crate::activity::ActivityEvent::new(
+        issue_id,
+        b.project_id,
+        b.workspace_id,
+        user.id,
+        "created",
+        "added the reaction",
+    );
+    event.field = Some("reaction");
+    event.new_value = Some(&body.reaction);
+    event.new_identifier = Some(id);
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
 
     Ok((StatusCode::CREATED, Json(row.0)))
 }
@@ -915,23 +930,34 @@ async fn issue_reaction_destroy(
         return Err(ApiError::bad("Reactions are not enabled for this project board"));
     }
 
-    let res = sqlx::query(
+    let mut tx = st.db.begin().await?;
+    let id: Option<Uuid> = sqlx::query_scalar(
         "UPDATE issue_reactions
          SET deleted_at = now()
          WHERE issue_id = $1 AND reaction = $2 AND actor_id = $3
-           AND project_id = $4 AND workspace_id = $5 AND deleted_at IS NULL",
+           AND project_id = $4 AND workspace_id = $5 AND deleted_at IS NULL RETURNING id",
     )
     .bind(issue_id)
     .bind(&reaction_code)
     .bind(user.id)
     .bind(b.project_id)
     .bind(b.workspace_id)
-    .execute(&st.db)
+    .fetch_optional(&mut *tx)
     .await?;
-
-    if res.rows_affected() == 0 {
-        return Err(ApiError::not_found());
-    }
+    let id = id.ok_or_else(ApiError::not_found)?;
+    let mut event = crate::activity::ActivityEvent::new(
+        issue_id,
+        b.project_id,
+        b.workspace_id,
+        user.id,
+        "deleted",
+        "removed the reaction",
+    );
+    event.field = Some("reaction");
+    event.old_value = Some(&reaction_code);
+    event.old_identifier = Some(id);
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1003,6 +1029,9 @@ async fn comment_reaction_create(
         return Err(ApiError::not_found());
     }
 
+    let mut tx = st.db.begin().await?;
+    let issue: Uuid = sqlx::query_scalar("SELECT issue_id FROM issue_comments WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND access='EXTERNAL' AND deleted_at IS NULL")
+        .bind(comment_id).bind(b.project_id).bind(b.workspace_id).fetch_one(&mut *tx).await?;
     let id = Uuid::new_v4();
     let row: (Value,) = sqlx::query_as(
         "WITH ins AS (
@@ -1033,8 +1062,22 @@ async fn comment_reaction_create(
     .bind(comment_id)
     .bind(b.project_id)
     .bind(b.workspace_id)
-    .fetch_one(&st.db)
+    .fetch_one(&mut *tx)
     .await?;
+
+    let mut event = crate::activity::ActivityEvent::new(
+        issue,
+        b.project_id,
+        b.workspace_id,
+        user.id,
+        "created",
+        "added the reaction",
+    );
+    event.field = Some("reaction");
+    event.new_value = Some(&body.reaction);
+    event.new_identifier = Some(id);
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
 
     Ok((StatusCode::CREATED, Json(row.0)))
 }
@@ -1050,25 +1093,36 @@ async fn comment_reaction_destroy(
         return Err(ApiError::bad("Reactions are not enabled for this board"));
     }
 
-    let res = sqlx::query(
+    let mut tx = st.db.begin().await?;
+    let row: Option<(Uuid, Uuid)> = sqlx::query_as(
         "UPDATE comment_reactions cr
          SET deleted_at = now()
          FROM issue_comments c
          WHERE cr.comment_id = c.id AND cr.comment_id = $1 AND cr.reaction = $2 AND cr.actor_id = $3
            AND cr.project_id = $4 AND cr.workspace_id = $5 AND c.access = 'EXTERNAL'
-           AND cr.deleted_at IS NULL",
+           AND c.project_id=$4 AND c.workspace_id=$5 AND c.deleted_at IS NULL AND cr.deleted_at IS NULL RETURNING cr.id,c.issue_id",
     )
     .bind(comment_id)
     .bind(&reaction_code)
     .bind(user.id)
     .bind(b.project_id)
     .bind(b.workspace_id)
-    .execute(&st.db)
+    .fetch_optional(&mut *tx)
     .await?;
-
-    if res.rows_affected() == 0 {
-        return Err(ApiError::not_found());
-    }
+    let (id, issue) = row.ok_or_else(ApiError::not_found)?;
+    let mut event = crate::activity::ActivityEvent::new(
+        issue,
+        b.project_id,
+        b.workspace_id,
+        user.id,
+        "deleted",
+        "removed the reaction",
+    );
+    event.field = Some("reaction");
+    event.old_value = Some(&reaction_code);
+    event.old_identifier = Some(id);
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1132,6 +1186,7 @@ async fn issue_vote_create(
         return Err(ApiError::not_found());
     }
 
+    let mut tx = st.db.begin().await?;
     let vote_val = body.vote.unwrap_or(1);
     let id = Uuid::new_v4();
 
@@ -1169,8 +1224,22 @@ async fn issue_vote_create(
     .bind(issue_id)
     .bind(b.project_id)
     .bind(b.workspace_id)
-    .fetch_one(&st.db)
+    .fetch_one(&mut *tx)
     .await?;
+
+    let vote = vote_val.to_string();
+    let mut event = crate::activity::ActivityEvent::new(
+        issue_id,
+        b.project_id,
+        b.workspace_id,
+        user.id,
+        "updated",
+        "added the vote",
+    );
+    event.field = Some("vote");
+    event.new_value = Some(&vote);
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
 
     Ok((StatusCode::CREATED, Json(row.0)))
 }
@@ -1186,22 +1255,34 @@ async fn issue_vote_destroy(
         return Err(ApiError::bad("Votes are not enabled for this project board"));
     }
 
-    let res = sqlx::query(
+    let mut tx = st.db.begin().await?;
+    let row: Option<(Uuid, i32)> = sqlx::query_as(
         "UPDATE issue_votes
          SET deleted_at = now()
          WHERE issue_id = $1 AND actor_id = $2
-           AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
+           AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL RETURNING id,vote",
     )
     .bind(issue_id)
     .bind(user.id)
     .bind(b.project_id)
     .bind(b.workspace_id)
-    .execute(&st.db)
+    .fetch_optional(&mut *tx)
     .await?;
-
-    if res.rows_affected() == 0 {
-        return Err(ApiError::not_found());
-    }
+    let (id, value) = row.ok_or_else(ApiError::not_found)?;
+    let value = value.to_string();
+    let mut event = crate::activity::ActivityEvent::new(
+        issue_id,
+        b.project_id,
+        b.workspace_id,
+        user.id,
+        "deleted",
+        "removed the vote",
+    );
+    event.field = Some("vote");
+    event.old_value = Some(&value);
+    event.old_identifier = Some(id);
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

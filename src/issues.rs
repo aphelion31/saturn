@@ -1403,14 +1403,28 @@ async fn reaction_create(
     } else {
         "INSERT INTO issue_reactions (workspace_id,project_id,issue_id,actor_id,reaction,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$5,$4,$4) RETURNING id"
     };
+    let mut tx = st.db.begin().await?;
+    let issue = if comment {
+        sqlx::query_scalar("SELECT issue_id FROM issue_comments WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL")
+            .bind(id).bind(pid).bind(p.workspace_id()).fetch_one(&mut *tx).await?
+    } else {
+        id
+    };
     let rid: Uuid = sqlx::query_scalar(sql)
         .bind(p.workspace_id())
         .bind(pid)
         .bind(id)
         .bind(user.id)
         .bind(code)
-        .fetch_one(&st.db)
+        .fetch_one(&mut *tx)
         .await?;
+    let mut event =
+        crate::activity::ActivityEvent::new(issue, pid, p.workspace_id(), user.id, "created", "added the reaction");
+    event.field = Some("reaction");
+    event.new_value = Some(code);
+    event.new_identifier = Some(rid);
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     let Json(Value::Array(rows)) = reactions(st, user, (slug, pid, id), comment).await? else {
         return Err(ApiError::not_found());
     };
@@ -1429,21 +1443,33 @@ async fn reaction_delete(
     let (slug, pid, id, code) = path;
     let p = reaction_context(&st, &user, &slug, pid, id, comment).await?;
     let sql = if comment {
-        "UPDATE comment_reactions SET deleted_at=now(),updated_at=now() WHERE comment_id=$1 AND project_id=$2 AND workspace_id=$3 AND actor_id=$4 AND reaction=$5 AND deleted_at IS NULL"
+        "UPDATE comment_reactions SET deleted_at=now(),updated_at=now() WHERE comment_id=$1 AND project_id=$2 AND workspace_id=$3 AND actor_id=$4 AND reaction=$5 AND deleted_at IS NULL RETURNING id"
     } else {
-        "UPDATE issue_reactions SET deleted_at=now(),updated_at=now() WHERE issue_id=$1 AND project_id=$2 AND workspace_id=$3 AND actor_id=$4 AND reaction=$5 AND deleted_at IS NULL"
+        "UPDATE issue_reactions SET deleted_at=now(),updated_at=now() WHERE issue_id=$1 AND project_id=$2 AND workspace_id=$3 AND actor_id=$4 AND reaction=$5 AND deleted_at IS NULL RETURNING id"
     };
-    let r = sqlx::query(sql)
+    let mut tx = st.db.begin().await?;
+    let issue = if comment {
+        sqlx::query_scalar("SELECT issue_id FROM issue_comments WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL")
+            .bind(id).bind(pid).bind(p.workspace_id()).fetch_one(&mut *tx).await?
+    } else {
+        id
+    };
+    let rid: Option<Uuid> = sqlx::query_scalar(sql)
         .bind(id)
         .bind(pid)
         .bind(p.workspace_id())
         .bind(user.id)
-        .bind(code)
-        .execute(&st.db)
+        .bind(&code)
+        .fetch_optional(&mut *tx)
         .await?;
-    if r.rows_affected() == 0 {
-        return Err(ApiError::not_found());
-    }
+    let rid = rid.ok_or_else(ApiError::not_found)?;
+    let mut event =
+        crate::activity::ActivityEvent::new(issue, pid, p.workspace_id(), user.id, "deleted", "removed the reaction");
+    event.field = Some("reaction");
+    event.old_value = Some(&code);
+    event.old_identifier = Some(rid);
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     no_content()
 }
 async fn issue_reactions(State(s): State<AppState>, u: CurrentUser, Path(p): Path<IssuePath>) -> ApiResult {
