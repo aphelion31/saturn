@@ -37,6 +37,18 @@ async fn client(raw: &str) -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
+async fn model_data(db: &sqlx::PgPool, event: &str, id: Uuid, workspace_id: Uuid) -> Result<Value, sqlx::Error> {
+    let sql = match event {
+        "issue" => format!("SELECT to_jsonb(i) || {} || jsonb_build_object('labels', COALESCE((SELECT jsonb_agg(to_jsonb(l)) FROM issue_labels il JOIN labels l ON l.id=il.label_id AND l.workspace_id=i.workspace_id AND l.deleted_at IS NULL WHERE il.issue_id=i.id AND il.workspace_id=i.workspace_id AND il.deleted_at IS NULL), '[]'::jsonb), 'assignees', COALESCE((SELECT jsonb_agg({}) FROM issue_assignees ia JOIN users u ON u.id=ia.assignee_id WHERE ia.issue_id=i.id AND ia.workspace_id=i.workspace_id AND ia.deleted_at IS NULL), '[]'::jsonb)) FROM issues i WHERE i.id=$1 AND i.workspace_id=$2 AND i.deleted_at IS NULL", crate::workitems::ITEM_JSON, crate::users::USER_LITE_JSON),
+        "issue_comment" => format!("SELECT {} FROM issue_comments c WHERE c.id=$1 AND c.workspace_id=$2 AND c.deleted_at IS NULL", crate::issues::COMMENT_JSON),
+        "project" => "SELECT (to_jsonb(p) - 'workspace_id' - 'created_by_id' - 'updated_by_id') || jsonb_build_object('workspace',p.workspace_id,'created_by',p.created_by_id,'updated_by',p.updated_by_id) FROM projects p WHERE p.id=$1 AND p.workspace_id=$2 AND p.deleted_at IS NULL".into(),
+        "module" => format!("{} WHERE m.id=$1 AND m.workspace_id=$2 AND m.deleted_at IS NULL", crate::modules::module_select("NULL::uuid")),
+        "cycle" => format!("{} AND c.id=$1", crate::cycles::cycle_select("TRUE").replace("c.project_id = $1 AND ", "").replace("$3", "NULL::uuid")),
+        _ => return Err(sqlx::Error::RowNotFound),
+    };
+    sqlx::query_scalar(&sql).bind(id).bind(workspace_id).fetch_one(db).await
+}
+
 pub fn emit(st: &AppState, workspace_id: Uuid, event: &str, action: &str, payload: Value) {
     let (st, event, action) = (st.clone(), event.to_owned(), action.to_owned());
     tokio::spawn(async move {
@@ -50,8 +62,12 @@ pub fn emit(st: &AppState, workspace_id: Uuid, event: &str, action: &str, payloa
                 return;
             }
         };
+        let data = if action == "deleted" { payload.clone() } else {
+            let Some(id) = payload.get("id").and_then(Value::as_str).and_then(|v| Uuid::parse_str(v).ok()) else { tracing::warn!(%event, "webhook event missing id"); return; };
+            match model_data(&st.db, &event, id, workspace_id).await { Ok(data) => data, Err(e) => { tracing::warn!(%event, error=%e, "webhook serialization failed"); return; } }
+        };
         for (id, url, secret, slug) in rows {
-            let body = json!({"event":event,"action":action,"webhook_id":id,"workspace_id":workspace_id,"workspace_slug":slug,"data":payload,"activity":null}).to_string();
+            let body = json!({"event":event,"action":action,"webhook_id":id,"workspace_id":workspace_id,"workspace_slug":slug,"data":data,"activity":null}).to_string();
             for retry in 0..=5i16 {
                 let delivery = Uuid::new_v4().to_string();
                 let sig = signature(&secret, body.as_bytes());
@@ -87,7 +103,10 @@ pub fn emit(st: &AppState, workspace_id: Uuid, event: &str, action: &str, payloa
                     break;
                 }
                 if retry == 5 {
-                    if let Err(e) = sqlx::query("UPDATE webhooks SET is_active = false WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL").bind(id).bind(workspace_id).execute(&st.db).await { tracing::warn!(error=%e, "webhook deactivation failed"); }
+                    match sqlx::query_scalar::<_, Option<String>>("UPDATE webhooks h SET is_active=false WHERE h.id=$1 AND h.workspace_id=$2 AND h.deleted_at IS NULL RETURNING (SELECT email FROM users WHERE id=h.created_by_id)").bind(id).bind(workspace_id).fetch_optional(&st.db).await {
+                        Ok(Some(Some(email))) => { let text = format!("Webhook {url} has been deactivated due to failed requests. {}/{slug}/settings/webhooks/{id}", st.cfg.web_url.trim_end_matches('/')); crate::outbound::send_mail_bg(&st, email, "Webhook Deactivated".into(), ammonia::clean(&text), text); }
+                        Ok(_) => (), Err(e) => tracing::warn!(error=%e, "webhook deactivation failed"),
+                    }
                     break;
                 }
                 let cap = 600u64 * (1 << retry);

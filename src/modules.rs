@@ -134,7 +134,7 @@ fn fav(user_param: &str) -> String {
     )
 }
 
-fn module_select(user_param: &str) -> String {
+pub(crate) fn module_select(user_param: &str) -> String {
     format!("SELECT {} FROM modules m {COUNTS}", module_json(&fav(user_param)))
 }
 

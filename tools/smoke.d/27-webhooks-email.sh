@@ -14,5 +14,6 @@ done
 kill "$WH_PID" 2>/dev/null || true
 wait "$WH_PID" 2>/dev/null || true
 [[ "$WH_COUNT" -gt 0 ]] && rg -qi '^x-plane-event: issue' "$WH_CAPTURE"
+psql "$DATABASE_URL" -Atc "SELECT request_body FROM webhook_logs WHERE webhook='$WH_ID' AND event_type='issue' LIMIT 1" | jq -e '.data.name == "Webhook smoke" and (.data.labels | type == "array") and (.data.assignees | type == "array")' >/dev/null
 rm -f "$WH_CAPTURE"
 call DELETE "/api/workspaces/$SLUG/webhooks/$WH_ID/"

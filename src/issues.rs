@@ -1462,7 +1462,7 @@ pub(crate) async fn visible_issue(
 }
 
 // Serializer aliases use DRF's relation names rather than database column names.
-const COMMENT_JSON: &str = "(to_jsonb(c) - 'actor_id' - 'issue_id' - 'project_id' - 'workspace_id' - 'created_by_id' - 'updated_by_id' - 'description_id' - 'parent_id') || jsonb_build_object(
+pub(crate) const COMMENT_JSON: &str = "(to_jsonb(c) - 'actor_id' - 'issue_id' - 'project_id' - 'workspace_id' - 'created_by_id' - 'updated_by_id' - 'description_id' - 'parent_id') || jsonb_build_object(
  'actor',c.actor_id,'issue',c.issue_id,'project',c.project_id,'workspace',c.workspace_id,'created_by',c.created_by_id,'updated_by',c.updated_by_id,'description',c.description_id,'parent',c.parent_id,
  'actor_detail',(SELECT jsonb_build_object('id',u.id,'first_name',u.first_name,'last_name',u.last_name,'avatar',u.avatar,'avatar_url',CASE WHEN u.avatar_asset_id IS NOT NULL THEN '/api/assets/v2/static/' || u.avatar_asset_id || '/' ELSE NULLIF(u.avatar,'') END,'is_bot',u.is_bot,'display_name',u.display_name) FROM users u WHERE u.id=c.actor_id),
  'issue_detail',(SELECT jsonb_build_object('id',i.id,'name',i.name,'description_json',i.description_json,'description_html',i.description_html,'priority',i.priority,'start_date',i.start_date,'target_date',i.target_date,'sequence_id',i.sequence_id,'sort_order',i.sort_order,'is_draft',i.is_draft) FROM issues i WHERE i.id=c.issue_id AND i.project_id=c.project_id AND i.workspace_id=c.workspace_id),
@@ -1744,7 +1744,7 @@ pub(crate) async fn update(
         }
     }
     tx.commit().await?;
-    crate::webhook_out::emit(&st, p.workspace_id(), "issue", "updated", body.clone());
+    crate::webhook_out::emit(&st, p.workspace_id(), "issue", "updated", serde_json::json!({"id": issue_id}));
     detail(State(st), user, Path((slug, project_id, issue_id))).await
 }
 

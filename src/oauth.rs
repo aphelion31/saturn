@@ -435,12 +435,14 @@ async fn complete(
             .map_err(|_| fail())?;
         id
     };
+    let was_inactive: bool = sqlx::query_scalar("SELECT NOT is_active FROM users WHERE id=$1").bind(id).fetch_one(&st.db).await.map_err(|_| fail())?;
     sqlx::query("UPDATE users SET is_active=true,last_login_medium=$2 WHERE id=$1")
         .bind(id)
         .bind(&p.name)
         .execute(&st.db)
         .await
         .map_err(|_| fail())?;
+    if was_inactive { crate::outbound::activation_mail(&st, id).await; }
     // Plane's account tokens are encrypted at rest; do not retain provider secrets in logs.
     let a = outbound::encrypt(&st.cfg.secret_key, access);
     let r = token["refresh_token"]

@@ -127,7 +127,7 @@ const CYCLE_FROM: &str = "FROM cycles c
 
 /// CycleSerializer fields plus list extras, and `status` (CURRENT / UPCOMING / COMPLETED / DRAFT).
 /// ponytail: timestamps come back as stored (UTC); Plane converts them to the project timezone.
-fn cycle_select(where_sql: &str) -> String {
+pub(crate) fn cycle_select(where_sql: &str) -> String {
     format!(
         "SELECT jsonb_build_object(
             'id', c.id, 'workspace_id', c.workspace_id, 'project_id', c.project_id, 'name', c.name,
