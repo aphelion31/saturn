@@ -1,4 +1,6 @@
-import * as s from process.env.PLANE_EDITOR_SERVER ?? "../../../plane/packages/editor/dist/server.js";
+// Regenerate (dev only, not used at runtime or in CI):
+//   PLANE_EDITOR_SERVER=/abs/plane/packages/editor/dist/server.js node tests/fixtures/plane_live_doc.gen.mjs tests/fixtures/plane_live_doc.json
+const s = await import(process.env.PLANE_EDITOR_SERVER);
 import fs from "fs";
 import extra from "./extra.mjs";
 const cases = {
