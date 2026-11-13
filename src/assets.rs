@@ -325,7 +325,11 @@ async fn create_project_asset(
     .await
 }
 
-pub(crate) async fn create_user_asset(State(st): State<AppState>, user: CurrentUser, Json(b): Json<Value>) -> ApiResult {
+pub(crate) async fn create_user_asset(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Json(b): Json<Value>,
+) -> ApiResult {
     let entity_type = s(&b, "entity_type").unwrap_or("");
     if !matches!(entity_type, "USER_AVATAR" | "USER_COVER") {
         return Err(ApiError::bad_body(
@@ -463,14 +467,19 @@ pub(crate) async fn legacy_attachment_upload(
         }
     }
     let (name, data) = file.ok_or_else(|| ApiError::bad_body(json!({"asset": ["No file was submitted."]})))?;
-    let name = if name.is_empty() { Uuid::new_v4().simple().to_string() } else { name };
+    let name = if name.is_empty() {
+        Uuid::new_v4().simple().to_string()
+    } else {
+        name
+    };
     let key = format!("{}/{}-{}", p.workspace_id(), Uuid::new_v4().simple(), name);
     let path = disk_path(&st, &key)?;
     if let Some(dir) = path.parent() {
         tokio::fs::create_dir_all(dir).await.map_err(io_err)?;
     }
     tokio::fs::write(&path, &data).await.map_err(io_err)?;
-    // ponytail: Plane also queues an attachment.activity.created issue activity; add with the activity helper.
+    let mut tx = st.db.begin().await?;
+    let asset_id = Uuid::new_v4();
     let row: Value = sqlx::query_scalar(
         "INSERT INTO file_assets (id, attributes, asset, size, workspace_id, project_id, issue_id, created_by_id,
            updated_by_id, entity_type, is_uploaded, is_deleted, is_archived, created_at, updated_at)
@@ -480,7 +489,7 @@ pub(crate) async fn legacy_attachment_upload(
                 'created_by', created_by_id, 'updated_by', updated_by_id,
                 'asset_url', '/api/assets/v2/workspaces/' || $9 || '/projects/' || project_id || '/issues/' || issue_id || '/attachments/' || id || '/')",
     )
-    .bind(Uuid::new_v4())
+    .bind(asset_id)
     .bind(&attrs)
     .bind(&key)
     .bind(data.len() as f64)
@@ -489,8 +498,21 @@ pub(crate) async fn legacy_attachment_upload(
     .bind(issue)
     .bind(user.id)
     .bind(&slug)
-    .fetch_one(&st.db)
+    .fetch_one(&mut *tx)
     .await?;
+    let mut event = crate::activity::ActivityEvent::new(
+        issue,
+        project,
+        p.workspace_id(),
+        user.id,
+        "created",
+        "created an attachment",
+    );
+    event.field = Some("attachment");
+    event.new_value = Some(&key);
+    event.new_identifier = Some(asset_id);
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     Ok((StatusCode::CREATED, Json(row)))
 }
 
@@ -1083,8 +1105,25 @@ async fn mark_attachment_uploaded(
     body: Option<Json<Value>>,
 ) -> ApiResult<StatusCode> {
     let p = issue_ctx(&st, &user, &slug, project_id, issue_id).await?;
-    let (_, entity_type, id) = owned_asset(&st, &p.ws, asset_id, Some(project_id)).await?;
-    set_uploaded(&st, id, &entity_type, &body.map(|b| b.0).unwrap_or_default()).await?;
+    owned_asset(&st, &p.ws, asset_id, Some(project_id)).await?;
+    let mut tx = st.db.begin().await?;
+    let body = body.map(|b| b.0).unwrap_or_default();
+    let row: Option<(String, bool)> = sqlx::query_as("UPDATE file_assets SET is_uploaded=true,attributes=COALESCE($5,attributes),updated_at=now() WHERE id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND entity_type='ISSUE_ATTACHMENT' AND deleted_at IS NULL RETURNING asset,is_uploaded")
+        .bind(asset_id).bind(issue_id).bind(project_id).bind(p.workspace_id()).bind(body.get("attributes")).fetch_optional(&mut *tx).await?;
+    let (asset, _) = row.ok_or_else(ApiError::not_found)?;
+    let mut event = crate::activity::ActivityEvent::new(
+        issue_id,
+        project_id,
+        p.workspace_id(),
+        user.id,
+        "created",
+        "created an attachment",
+    );
+    event.field = Some("attachment");
+    event.new_value = Some(&asset);
+    event.new_identifier = Some(asset_id);
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     no_content()
 }
 
@@ -1094,8 +1133,24 @@ async fn delete_attachment(
     Path((slug, project_id, issue_id, asset_id)): Path<(String, Uuid, Uuid, Uuid)>,
 ) -> ApiResult<StatusCode> {
     let p = issue_ctx(&st, &user, &slug, project_id, issue_id).await?;
-    let (_, entity_type, id) = owned_asset(&st, &p.ws, asset_id, Some(project_id)).await?;
-    soft_delete(&st, id, &entity_type).await?;
+    owned_asset(&st, &p.ws, asset_id, Some(project_id)).await?;
+    let mut tx = st.db.begin().await?;
+    let result = sqlx::query("UPDATE file_assets SET is_deleted=true,deleted_at=now() WHERE id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND entity_type='ISSUE_ATTACHMENT' AND deleted_at IS NULL")
+        .bind(asset_id).bind(issue_id).bind(project_id).bind(p.workspace_id()).execute(&mut *tx).await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    let mut event = crate::activity::ActivityEvent::new(
+        issue_id,
+        project_id,
+        p.workspace_id(),
+        user.id,
+        "deleted",
+        "deleted the attachment",
+    );
+    event.field = Some("attachment");
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     no_content()
 }
 
