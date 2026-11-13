@@ -1310,6 +1310,56 @@ async fn update(
     .bind(p.workspace_id())
     .fetch_one(&mut *tx)
     .await?;
+    if old_state_id != target_state_id {
+        let ids: Vec<Uuid> = [old_state_id, target_state_id].into_iter().flatten().collect();
+        let states: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT id,name FROM states WHERE id=ANY($1) AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+        )
+        .bind(ids)
+        .bind(project_id)
+        .bind(p.workspace_id())
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut event = crate::activity::ActivityEvent::new(
+            pk,
+            project_id,
+            p.workspace_id(),
+            user.id,
+            "updated",
+            "updated the state to",
+        );
+        event.field = Some("state");
+        event.old_identifier = old_state_id;
+        event.new_identifier = target_state_id;
+        event.old_value = states
+            .iter()
+            .find(|(id, _)| Some(*id) == old_state_id)
+            .map(|(_, name)| name.as_str());
+        event.new_value = states
+            .iter()
+            .find(|(id, _)| Some(*id) == target_state_id)
+            .map(|(_, name)| name.as_str());
+        crate::activity::record(&mut *tx, event).await?;
+    }
+    if before.get("archived_at") != after.get("archived_at") {
+        let archived = after.get("archived_at").is_some_and(|v| !v.is_null());
+        let mut event = crate::activity::ActivityEvent::new(
+            pk,
+            project_id,
+            p.workspace_id(),
+            user.id,
+            "updated",
+            if archived {
+                "Actor has archived the issue"
+            } else {
+                "has restored the issue"
+            },
+        );
+        event.field = Some("archived_at");
+        event.old_value = if archived { None } else { Some("archive") };
+        event.new_value = Some(if archived { "manual_archive" } else { "restore" });
+        crate::activity::record(&mut *tx, event).await?;
+    }
     for (key, field, comment) in [
         ("name", "name", "updated the name to"),
         ("priority", "priority", "updated the priority to"),
@@ -1355,6 +1405,7 @@ async fn destroy(
 ) -> ApiResult<StatusCode> {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER, GUEST])?;
+    let mut tx = st.db.begin().await?;
     let r = sqlx::query(
         "UPDATE issues SET deleted_at = now(), updated_at = now(), updated_by_id = $4
          WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL AND ($5 OR created_by_id = $4)",
@@ -1364,11 +1415,22 @@ async fn destroy(
     .bind(p.workspace_id())
     .bind(user.id)
     .bind(p.is_admin() || p.ws.is_admin())
-    .execute(&st.db)
+    .execute(&mut *tx)
     .await?;
     if r.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
+    let mut event = crate::activity::ActivityEvent::new(
+        pk,
+        project_id,
+        p.workspace_id(),
+        user.id,
+        "deleted",
+        "deleted the issue",
+    );
+    event.field = Some("issue");
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     crate::webhook_out::emit(&st, p.workspace_id(), "issue", "deleted", serde_json::json!({"id": pk}));
     no_content()
 }

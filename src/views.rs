@@ -1196,6 +1196,29 @@ async fn intake_issue_patch(
         .await?;
     }
     if let Some(code) = status {
+        let old_status: i32 = sqlx::query_scalar("SELECT status FROM intake_issues WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL FOR UPDATE")
+            .bind(ii_id).bind(project_id).bind(p.workspace_id()).fetch_one(&mut *tx).await?;
+        let name = |status| match status {
+            -2 => Some("Pending"),
+            -1 => Some("Rejected"),
+            0 => Some("Snoozed"),
+            1 => Some("Accepted"),
+            2 => Some("Duplicate"),
+            _ => None,
+        };
+        let verb = code.to_string();
+        let mut event = crate::activity::ActivityEvent::new(
+            pk,
+            project_id,
+            p.workspace_id(),
+            user.id,
+            &verb,
+            "updated the intake status",
+        );
+        event.field = Some("intake");
+        event.old_value = name(i64::from(old_status));
+        event.new_value = name(code);
+        crate::activity::record(&mut *tx, event).await?;
         // Accepting a triage item moves it to the project's default state, as Plane does.
         if code == 1 && issue_group.as_deref() == Some("triage") {
             let default: Option<Uuid> = sqlx::query_scalar(

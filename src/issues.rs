@@ -1845,6 +1845,7 @@ pub(crate) async fn update(
             "start_date",
             "target_date",
             "parent_id",
+            "estimate_point",
         ]
         .contains(&k.as_str())
     }) {
@@ -1866,6 +1867,49 @@ pub(crate) async fn update(
     let old: Option<Value> = sqlx::query_scalar("SELECT to_jsonb(i) FROM issues i WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL FOR UPDATE")
         .bind(issue_id).bind(project_id).bind(p.workspace_id()).fetch_optional(&mut *tx).await?;
     let old = old.ok_or_else(ApiError::not_found)?;
+    if body.get("estimate_point").is_some() {
+        let estimate = optional_uuid(&body, "estimate_point")?;
+        let previous = old
+            .get("estimate_point_id")
+            .and_then(Value::as_str)
+            .and_then(|v| Uuid::parse_str(v).ok());
+        if previous != estimate {
+            let ids: Vec<Uuid> = [previous, estimate].into_iter().flatten().collect();
+            let points: Vec<(Uuid, String, String)> = sqlx::query_as("SELECT ep.id,ep.value,e.type FROM estimate_points ep JOIN estimates e ON e.id=ep.estimate_id AND e.project_id=ep.project_id AND e.workspace_id=ep.workspace_id WHERE ep.id=ANY($1) AND ep.project_id=$2 AND ep.workspace_id=$3 AND ep.deleted_at IS NULL AND e.deleted_at IS NULL")
+                .bind(ids).bind(project_id).bind(p.workspace_id()).fetch_all(&mut *tx).await?;
+            if estimate.is_some() && !points.iter().any(|(id, _, _)| Some(*id) == estimate) {
+                return Err(ApiError::bad("Invalid estimate point"));
+            }
+            sqlx::query("UPDATE issues SET estimate_point_id=$4 WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL")
+                .bind(issue_id).bind(project_id).bind(p.workspace_id()).bind(estimate).execute(&mut *tx).await?;
+            let kind = points
+                .iter()
+                .find(|(id, _, _)| Some(*id) == estimate.or(previous))
+                .map(|(_, _, kind)| kind.as_str())
+                .unwrap_or("points");
+            let field = format!("estimate_{kind}");
+            let mut event = crate::activity::ActivityEvent::new(
+                issue_id,
+                project_id,
+                p.workspace_id(),
+                user.id,
+                if estimate.is_none() { "removed" } else { "updated" },
+                "updated the estimate point to ",
+            );
+            event.field = Some(&field);
+            event.old_identifier = previous;
+            event.new_identifier = estimate;
+            event.old_value = points
+                .iter()
+                .find(|(id, _, _)| Some(*id) == previous)
+                .map(|(_, value, _)| value.as_str());
+            event.new_value = points
+                .iter()
+                .find(|(id, _, _)| Some(*id) == estimate)
+                .map(|(_, value, _)| value.as_str());
+            crate::activity::record(&mut *tx, event).await?;
+        }
+    }
     if body.get("parent_id").is_some() {
         let parent = optional_uuid(&body, "parent_id")?;
         if let Some(parent) = parent {
