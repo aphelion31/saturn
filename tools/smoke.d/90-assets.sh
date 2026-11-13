@@ -75,9 +75,11 @@ call GET "/api/users/file-assets/"
 jq -e --arg id "$U_ASSET" 'any(.[]; .id == $id)' <<<"$body" >/dev/null
 echo "✔ GET /api/users/file-assets/ lists created asset"
 
-# User file-assets: retrieve by pk
+# User file-assets: retrieve (Plane shape: 200 {data:[...], status})
 call GET "/api/users/file-assets/$U_ASSET/"
-[[ "$(field '.id')" == "$U_ASSET" ]] || { echo "✖ GET /api/users/file-assets/{pk}/ failed" >&2; exit 1; }
+[[ "$(field '.data[0].id')" == "$U_ASSET" && "$(field '.status')" == "true" ]] || { echo "✖ GET /api/users/file-assets/{pk}/ failed" >&2; exit 1; }
+call GET "/api/users/file-assets/no-such-key/"
+[[ "$(field '.status')" == "false" ]] || { echo "✖ GET unknown user asset should be status=false" >&2; exit 1; }
 echo "✔ GET /api/users/file-assets/{pk}/ -> 200"
 
 # Workspace file-assets: POST upload
