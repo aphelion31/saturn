@@ -27,6 +27,7 @@ mod issues;
 mod modules;
 mod notifications;
 mod pages;
+mod live_doc;
 mod projects;
 mod public;
 mod recent_visits;

@@ -398,10 +398,13 @@ type Rooms = std::collections::HashMap<Uuid, std::sync::Arc<tokio::sync::Mutex<R
 struct Room {
     state: Vec<u8>,
     events: tokio::sync::broadcast::Sender<Vec<u8>>,
+    dirty_since: Option<tokio::time::Instant>,
+    last_change: tokio::time::Instant,
+    editor: Uuid,
 }
 static ROOMS: std::sync::OnceLock<tokio::sync::Mutex<Rooms>> = std::sync::OnceLock::new();
 
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LiveQuery {
     workspace_slug: String,
@@ -479,6 +482,66 @@ fn frame(name: &str, typ: usize, subtype: Option<usize>, payload: &[u8]) -> Vec<
     out
 }
 
+async fn persist_live(
+    st: &AppState,
+    q: &LiveQuery,
+    workspace: Uuid,
+    restricted: bool,
+    id: Uuid,
+    room: &mut Room,
+) -> anyhow::Result<()> {
+    let converted = match crate::live_doc::formats(&room.state) {
+        Ok((html, json, title)) => match sanitize_html(&html) {
+            Ok(html) => Some((html, json, title)),
+            Err(_) => {
+                tracing::warn!(page = %id, "invalid live document HTML; preserving binary");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, page = %id, "unsupported live document; preserving binary");
+            None
+        }
+    };
+    let mut tx = st.db.begin().await?;
+    let previous: Option<String> = sqlx::query_scalar(&format!("SELECT p.description_html FROM pages p WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL FOR UPDATE"))
+        .bind(workspace).bind(q.project_id).bind(room.editor).bind(restricted).bind(id).fetch_optional(&mut *tx).await?;
+    let previous = previous.ok_or_else(|| anyhow::anyhow!("page no longer writable"))?;
+    let Some((html, json, title)) = converted else {
+        sqlx::query(&format!("UPDATE pages p SET description_binary=$6,updated_by_id=$3,updated_at=now() WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL"))
+            .bind(workspace).bind(q.project_id).bind(room.editor).bind(restricted).bind(id).bind(&room.state).execute(&mut *tx).await?;
+        tx.commit().await?;
+        room.dirty_since = None;
+        return Ok(());
+    };
+    let stripped = strip_tags(&html);
+    let title = title.filter(|s| !s.trim().is_empty());
+    sqlx::query(&format!("UPDATE pages p SET description_binary=$6,description_html=$7,description_json=$8,description_stripped=$9,name=COALESCE($10,p.name),updated_by_id=$3,updated_at=now() WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL"))
+        .bind(workspace).bind(q.project_id).bind(room.editor).bind(restricted).bind(id)
+        .bind(&room.state).bind(&html).bind(&json).bind(&stripped).bind(&title).execute(&mut *tx).await?;
+    if previous != html {
+        let latest: Option<(Uuid, Uuid, bool)> = sqlx::query_as("SELECT id,owned_by_id,last_saved_at >= now() - interval '10 minutes' FROM page_versions WHERE workspace_id=$1 AND page_id=$2 AND deleted_at IS NULL ORDER BY last_saved_at DESC LIMIT 1")
+            .bind(workspace).bind(id).fetch_optional(&mut *tx).await?;
+        if let Some((version, owner, true)) = latest.filter(|(_, owner, _)| *owner == room.editor) {
+            let _ = owner;
+            sqlx::query("UPDATE page_versions SET description_binary=$3,description_html=$4,description_json=$5,description_stripped=$6,sub_pages_data='{}'::jsonb,updated_at=now() WHERE workspace_id=$1 AND page_id=$2 AND id=$7 AND deleted_at IS NULL")
+                .bind(workspace).bind(id).bind(&room.state).bind(&html).bind(&json).bind(&stripped).bind(version).execute(&mut *tx).await?;
+        } else {
+            sqlx::query("INSERT INTO page_versions (workspace_id,page_id,owned_by_id,last_saved_at,description_binary,description_html,description_json,description_stripped) VALUES ($1,$2,$3,now(),$4,$5,$6,$7)")
+                .bind(workspace).bind(id).bind(room.editor).bind(&room.state).bind(&html).bind(&json).bind(&stripped).execute(&mut *tx).await?;
+        }
+        sqlx::query("UPDATE page_versions SET deleted_at=now() WHERE workspace_id=$1 AND page_id=$2 AND deleted_at IS NULL AND id IN (SELECT id FROM page_versions WHERE workspace_id=$1 AND page_id=$2 AND deleted_at IS NULL ORDER BY last_saved_at DESC,id DESC OFFSET 20)")
+            .bind(workspace).bind(id).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    if previous != html {
+        // Plane: the live server PATCHes the page, which queues page_transaction (page_logs).
+        crate::side_effects::spawn_page_transaction(st.clone(), workspace, id, Some(html), Some(previous));
+    }
+    room.dirty_since = None;
+    Ok(())
+}
+
 async fn live_socket(
     mut socket: axum::extract::ws::WebSocket,
     st: AppState,
@@ -504,21 +567,40 @@ async fn live_socket(
     {
         return;
     }
-    let existing: Option<Option<Vec<u8>>> = match sqlx::query_scalar(&format!("SELECT p.description_binary FROM pages p WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL"))
+    let existing: Option<(Option<Vec<u8>>, String, String)> = match sqlx::query_as(&format!("SELECT p.description_binary,p.description_html,p.name FROM pages p WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL"))
         .bind(workspace).bind(q.project_id).bind(user.id).bind(restricted).bind(id).fetch_optional(&st.db).await { Ok(v)=>v, Err(_)=>return };
-    let Some(existing) = existing else { return };
+    let Some((binary, html, title)) = existing else { return };
     let rooms = ROOMS.get_or_init(|| tokio::sync::Mutex::new(Rooms::new()));
     let room = {
         let mut map = rooms.lock().await;
-        map.entry(id)
-            .or_insert_with(|| {
-                let (events, _) = tokio::sync::broadcast::channel(256);
-                std::sync::Arc::new(tokio::sync::Mutex::new(Room {
-                    state: existing.unwrap_or_default(),
-                    events,
-                }))
-            })
-            .clone()
+        if let Some(room) = map.get(&id) {
+            room.clone()
+        } else {
+            let state = match binary.filter(|b| !b.is_empty()) {
+                Some(binary) => binary,
+                None => {
+                    let Ok(state) = crate::live_doc::initialize(&html, &title) else {
+                        return;
+                    };
+                    let result = sqlx::query(&format!("UPDATE pages p SET description_binary=$6 WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL AND (p.description_binary IS NULL OR octet_length(p.description_binary)=0)"))
+                        .bind(workspace).bind(q.project_id).bind(user.id).bind(restricted).bind(id).bind(&state).execute(&st.db).await;
+                    if !matches!(result, Ok(ref r) if r.rows_affected()==1) {
+                        return;
+                    }
+                    state
+                }
+            };
+            let (events, _) = tokio::sync::broadcast::channel(256);
+            let room = std::sync::Arc::new(tokio::sync::Mutex::new(Room {
+                state,
+                events,
+                dirty_since: None,
+                last_change: tokio::time::Instant::now(),
+                editor: user.id,
+            }));
+            map.insert(id, room.clone());
+            room
+        }
     };
     let mut rx = room.lock().await.events.subscribe();
     if socket
@@ -528,8 +610,17 @@ async fn live_socket(
     {
         return;
     }
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
     loop {
         tokio::select! {
+            _ = tick.tick() => {
+                let mut r = room.lock().await;
+                if r.dirty_since.is_some_and(|since| since.elapsed() >= std::time::Duration::from_secs(10) || r.last_change.elapsed() >= std::time::Duration::from_secs(2)) {
+                    if let Err(e) = persist_live(&st, &q, workspace, restricted, id, &mut r).await {
+                        tracing::error!(error = %e, page = %id, "failed to persist live page");
+                    }
+                }
+            }
             incoming=socket.recv()=> {
                 let Some(Ok(Message::Binary(data)))=incoming else { break };
                 let allowed: bool = sqlx::query_scalar(&format!("SELECT EXISTS(SELECT 1 FROM pages p WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL AND EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id=$2 AND pm.workspace_id=$1 AND pm.member_id=$3 AND pm.is_active AND pm.deleted_at IS NULL))"))
@@ -553,11 +644,12 @@ async fn live_socket(
                     let Ok(update)=Update::decode_v1(payload) else { break };
                     if doc.transact_mut().apply_update(update).is_err() { break; }
                     let state=doc.transact().encode_state_as_update_v1(&StateVector::default());
-                    // Persist before broadcast: never acknowledge edits that failed to save.
-                    let result=sqlx::query(&format!("UPDATE pages p SET description_binary=$6,updated_by_id=$3,updated_at=now() WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL"))
-                        .bind(workspace).bind(q.project_id).bind(user.id).bind(restricted).bind(id).bind(&state).execute(&st.db).await;
-                    if !matches!(result,Ok(ref r) if r.rows_affected()==1) { break; }
-                    room.state=state; let _=room.events.send(data.to_vec());
+                    room.state=state;
+                    let now = tokio::time::Instant::now();
+                    room.dirty_since.get_or_insert(now);
+                    room.last_change=now;
+                    room.editor=user.id;
+                    let _=room.events.send(data.to_vec());
                 }
             },
             event=rx.recv()=> {
@@ -571,6 +663,32 @@ async fn live_socket(
     drop(rx);
     let mut map = rooms.lock().await;
     if std::sync::Arc::strong_count(&room) == 2 {
-        map.remove(&id);
+        let mut r = room.lock().await;
+        if r.dirty_since.is_none() || persist_live(&st, &q, workspace, restricted, id, &mut r).await.is_ok() {
+            map.remove(&id);
+        } else {
+            tracing::error!(page = %id, "failed to flush live page on disconnect; retaining room state");
+            let retry_room = room.clone();
+            let retry_query = q.clone();
+            let retry_state = st.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let mut map = rooms.lock().await;
+                    let mut room = retry_room.lock().await;
+                    if room.dirty_since.is_none()
+                        || persist_live(&retry_state, &retry_query, workspace, restricted, id, &mut room)
+                            .await
+                            .is_ok()
+                    {
+                        if std::sync::Arc::strong_count(&retry_room) == 2 {
+                            map.remove(&id);
+                        }
+                        break;
+                    }
+                    tracing::warn!(page = %id, "retrying live page flush");
+                }
+            });
+        }
     }
 }
