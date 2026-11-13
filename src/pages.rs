@@ -404,7 +404,7 @@ struct Room {
 }
 static ROOMS: std::sync::OnceLock<tokio::sync::Mutex<Rooms>> = std::sync::OnceLock::new();
 
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LiveQuery {
     workspace_slug: String,
@@ -490,13 +490,32 @@ async fn persist_live(
     id: Uuid,
     room: &mut Room,
 ) -> anyhow::Result<()> {
-    let (html, json, title) = crate::live_doc::formats(&room.state).map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    let html = sanitize_html(&html).map_err(|_| anyhow::anyhow!("invalid live document HTML"))?;
-    let stripped = strip_tags(&html);
+    let converted = match crate::live_doc::formats(&room.state) {
+        Ok((html, json, title)) => match sanitize_html(&html) {
+            Ok(html) => Some((html, json, title)),
+            Err(_) => {
+                tracing::warn!(page = %id, "invalid live document HTML; preserving binary");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, page = %id, "unsupported live document; preserving binary");
+            None
+        }
+    };
     let mut tx = st.db.begin().await?;
     let previous: Option<String> = sqlx::query_scalar(&format!("SELECT p.description_html FROM pages p WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL FOR UPDATE"))
         .bind(workspace).bind(q.project_id).bind(room.editor).bind(restricted).bind(id).fetch_optional(&mut *tx).await?;
     let previous = previous.ok_or_else(|| anyhow::anyhow!("page no longer writable"))?;
+    let Some((html, json, title)) = converted else {
+        sqlx::query(&format!("UPDATE pages p SET description_binary=$6,updated_by_id=$3,updated_at=now() WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL"))
+            .bind(workspace).bind(q.project_id).bind(room.editor).bind(restricted).bind(id).bind(&room.state).execute(&mut *tx).await?;
+        tx.commit().await?;
+        room.dirty_since = None;
+        return Ok(());
+    };
+    let stripped = strip_tags(&html);
+    let title = title.filter(|s| !s.trim().is_empty());
     sqlx::query(&format!("UPDATE pages p SET description_binary=$6,description_html=$7,description_json=$8,description_stripped=$9,name=COALESCE($10,p.name),updated_by_id=$3,updated_at=now() WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL"))
         .bind(workspace).bind(q.project_id).bind(room.editor).bind(restricted).bind(id)
         .bind(&room.state).bind(&html).bind(&json).bind(&stripped).bind(&title).execute(&mut *tx).await?;
@@ -621,10 +640,6 @@ async fn live_socket(
                     let Ok(update)=Update::decode_v1(payload) else { break };
                     if doc.transact_mut().apply_update(update).is_err() { break; }
                     let state=doc.transact().encode_state_as_update_v1(&StateVector::default());
-                    if let Err(e) = crate::live_doc::formats(&state) {
-                        tracing::error!(error = %e, page = %id, "rejecting unsupported live document update");
-                        break;
-                    }
                     room.state=state;
                     let now = tokio::time::Instant::now();
                     room.dirty_since.get_or_insert(now);
@@ -649,6 +664,27 @@ async fn live_socket(
             map.remove(&id);
         } else {
             tracing::error!(page = %id, "failed to flush live page on disconnect; retaining room state");
+            let retry_room = room.clone();
+            let retry_query = q.clone();
+            let retry_state = st.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let mut map = rooms.lock().await;
+                    let mut room = retry_room.lock().await;
+                    if room.dirty_since.is_none()
+                        || persist_live(&retry_state, &retry_query, workspace, restricted, id, &mut room)
+                            .await
+                            .is_ok()
+                    {
+                        if std::sync::Arc::strong_count(&retry_room) == 2 {
+                            map.remove(&id);
+                        }
+                        break;
+                    }
+                    tracing::warn!(page = %id, "retrying live page flush");
+                }
+            });
         }
     }
 }

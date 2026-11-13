@@ -26,6 +26,37 @@ fn nodes<T: ReadTxn>(children: impl Iterator<Item = XmlOut>, txn: &T) -> anyhow:
                         attrs.entry("textAlign").or_insert(Value::Null);
                         attrs.entry("level").or_insert(json!(1));
                     }
+                    "orderedList" => {
+                        attrs.entry("start").or_insert(json!(1));
+                        attrs.entry("type").or_insert(Value::Null);
+                    }
+                    "taskItem" => {
+                        attrs.entry("checked").or_insert(json!(false));
+                    }
+                    "codeBlock" => {
+                        attrs.entry("language").or_insert(Value::Null);
+                    }
+                    "calloutComponent" => {
+                        attrs.entry("id").or_insert(Value::Null);
+                    }
+                    "issue-embed-component" => {
+                        attrs.retain(|_, v| !v.is_null());
+                    }
+                    "tableRow" => {
+                        attrs.entry("background").or_insert(Value::Null);
+                        attrs.entry("textColor").or_insert(Value::Null);
+                    }
+                    "tableCell" | "tableHeader" => {
+                        attrs.entry("colspan").or_insert(json!(1));
+                        attrs.entry("rowspan").or_insert(json!(1));
+                        attrs.entry("colwidth").or_insert(json!([150]));
+                        if kind == "tableCell" {
+                            attrs.entry("background").or_insert(Value::Null);
+                            attrs.entry("textColor").or_insert(Value::Null);
+                        } else {
+                            attrs.entry("background").or_insert(json!("none"));
+                        }
+                    }
                     "mention" => {
                         for k in ["id", "entity_identifier", "entity_name"] {
                             attrs.entry(k).or_insert(Value::Null);
@@ -46,9 +77,8 @@ fn nodes<T: ReadTxn>(children: impl Iterator<Item = XmlOut>, txn: &T) -> anyhow:
                             attrs.entry(k).or_insert(v);
                         }
                     }
-                    "bulletList" | "orderedList" | "listItem" | "taskList" | "taskItem" | "blockquote"
-                    | "codeBlock" | "horizontalRule" | "hardBreak" | "image" | "callout" | "table" | "tableRow"
-                    | "tableCell" | "tableHeader" => {}
+                    "bulletList" | "listItem" | "taskList" | "blockquote" | "horizontalRule" | "hardBreak"
+                    | "image" | "callout" | "table" => {}
                     _ => bail!("unsupported editor node: {kind}"),
                 }
                 let content = nodes(el.children(txn), txn)?;
@@ -113,6 +143,12 @@ fn escape(s: &str) -> String {
 fn attr(v: &Value, k: &str) -> String {
     v.get(k).and_then(Value::as_str).unwrap_or("").to_string()
 }
+fn alignment(a: &Value) -> String {
+    a["textAlign"]
+        .as_str()
+        .map(|v| format!(" style=\"text-align: {};\"", escape(v)))
+        .unwrap_or_default()
+}
 fn render(node: &Value) -> anyhow::Result<String> {
     let kind = node["type"].as_str().context("missing node type")?;
     let a = &node["attrs"];
@@ -123,7 +159,7 @@ fn render(node: &Value) -> anyhow::Result<String> {
         }
     }
     if kind == "text" {
-        body = escape(node["text"].as_str().unwrap_or(""));
+        body = escape(node["text"].as_str().unwrap_or("")).replace("&quot;", "\"");
         if let Some(marks) = node["marks"].as_array() {
             for mark in marks.iter().rev() {
                 let m = mark["type"].as_str().unwrap_or("");
@@ -133,9 +169,14 @@ fn render(node: &Value) -> anyhow::Result<String> {
                     "italic" => format!("<em>{body}</em>"),
                     "strike" => format!("<s>{body}</s>"),
                     "underline" => format!("<u>{body}</u>"),
-                    "code" => format!("<code>{body}</code>"),
-                    "link" => format!("<a href=\"{}\">{body}</a>", escape(&attr(ma, "href"))),
-                    "textStyle" => format!("<span style=\"color: {}\">{body}</span>", escape(&attr(ma, "color"))),
+                    "code" => format!(
+                        "<code class=\"rounded-sm bg-layer-3 px-[6px] py-[1.5px] font-code font-medium text-(--extended-color-orange-600) border-[0.5px] border-subtle\" spellcheck=\"false\">{body}</code>"
+                    ),
+                    "link" => format!(
+                        "<a target=\"_blank\" rel=\"noopener noreferrer nofollow\" class=\"text-accent-secondary underline underline-offset-[3px] hover:text-accent-primary transition-colors cursor-pointer\" href=\"{}\">{body}</a>",
+                        escape(&attr(ma, "href"))
+                    ),
+                    "textStyle" | "customColor" => format!("<span>{body}</span>"),
                     _ => bail!("unsupported editor mark: {m}"),
                 };
             }
@@ -144,17 +185,30 @@ fn render(node: &Value) -> anyhow::Result<String> {
     }
     Ok(match kind {
         "doc" => body,
-        "paragraph" => format!("<p class=\"editor-paragraph-block\">{body}</p>"),
+        "paragraph" => format!("<p class=\"editor-paragraph-block\"{}>{body}</p>", alignment(a)),
         "heading" => {
             let n = a["level"].as_u64().unwrap_or(1).clamp(1, 6);
-            format!("<h{n} class=\"editor-heading-block\">{body}</h{n}>")
+            format!("<h{n} class=\"editor-heading-block\"{}>{body}</h{n}>", alignment(a))
         }
         "bulletList" => format!("<ul class=\"list-disc pl-7 space-y-(--list-spacing-y)\">{body}</ul>"),
-        "orderedList" => format!("<ol class=\"list-decimal pl-7 space-y-(--list-spacing-y)\">{body}</ol>"),
+        "orderedList" => format!(
+            "<ol class=\"list-decimal pl-7 space-y-(--list-spacing-y)\"{}>{body}</ol>",
+            if a["start"].as_i64().unwrap_or(1) != 1 {
+                format!(" start=\"{}\"", a["start"])
+            } else {
+                String::new()
+            }
+        ),
         "listItem" => format!("<li class=\"not-prose space-y-2\">{body}</li>"),
         "blockquote" => format!("<blockquote>{body}</blockquote>"),
-        "codeBlock" => format!("<pre><code>{body}</code></pre>"),
-        "horizontalRule" => "<hr>".into(),
+        "codeBlock" => format!(
+            "<pre><code{}>{body}</code></pre>",
+            a["language"]
+                .as_str()
+                .map(|s| format!(" class=\"language-{}\"", escape(s)))
+                .unwrap_or_default()
+        ),
+        "horizontalRule" => "<div class=\"py-4 border-strong-1\" data-type=\"horizontalRule\"><div></div></div>".into(),
         "hardBreak" => "<br>".into(),
         "mention" | "imageComponent" | "image" => {
             let tag = match kind {
@@ -179,8 +233,10 @@ fn render(node: &Value) -> anyhow::Result<String> {
             };
             let mut s = format!("<{tag}");
             for k in keys {
-                if let Some(v) = a.get(*k).and_then(Value::as_str) {
-                    s.push_str(&format!(" {k}=\"{}\"", escape(v)));
+                if let Some(v) = a.get(*k).filter(|v| !v.is_null()) {
+                    let value = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+                    let key = if *k == "aspectRatio" { "aspectratio" } else { k };
+                    s.push_str(&format!(" {key}=\"{}\"", escape(&value)));
                 }
             }
             s.push('>');
@@ -190,12 +246,71 @@ fn render(node: &Value) -> anyhow::Result<String> {
             s
         }
         "table" => format!("<table><tbody>{body}</tbody></table>"),
-        "tableRow" => format!("<tr>{body}</tr>"),
-        "tableCell" => format!("<td>{body}</td>"),
-        "tableHeader" => format!("<th>{body}</th>"),
-        "taskList" => format!("<ul data-type=\"taskList\">{body}</ul>"),
-        "taskItem" => format!("<li data-type=\"taskItem\">{body}</li>"),
+        "tableRow" => format!("<tr style=\"\">{body}</tr>"),
+        "tableCell" | "tableHeader" => {
+            let tag = if kind == "tableCell" { "td" } else { "th" };
+            let width = a["colwidth"]
+                .as_array()
+                .map(|a| a.iter().map(Value::to_string).collect::<Vec<_>>().join(","))
+                .unwrap_or_default();
+            let bg = a["background"].as_str();
+            format!(
+                "<{tag} colspan=\"{}\" rowspan=\"{}\" colwidth=\"{}\"{} style=\"{}\">{body}</{tag}>",
+                a["colspan"],
+                a["rowspan"],
+                width,
+                bg.map(|v| format!(" background=\"{}\"", escape(v))).unwrap_or_default(),
+                bg.map(|v| format!("background-color: {};", escape(v)))
+                    .unwrap_or_default()
+            )
+        }
+        "taskList" => format!("<ul class=\"not-prose pl-2 space-y-2\" data-type=\"taskList\">{body}</ul>"),
+        "taskItem" => {
+            let checked = a["checked"].as_bool().unwrap_or(false);
+            format!(
+                "<li class=\"flex\" data-checked=\"{checked}\" data-type=\"taskItem\"><label><input type=\"checkbox\"{}><span></span></label><div>{body}</div></li>",
+                if checked { " checked=\"checked\"" } else { "" }
+            )
+        }
         "callout" => format!("<div data-type=\"callout\">{body}</div>"),
+        "calloutComponent" | "issue-embed-component" => {
+            let (tag, keys): (&str, &[&str]) = if kind == "calloutComponent" {
+                (
+                    "div",
+                    &[
+                        "id",
+                        "data-icon-color",
+                        "data-icon-name",
+                        "data-emoji-unicode",
+                        "data-emoji-url",
+                        "data-logo-in-use",
+                        "data-background",
+                        "data-block-type",
+                    ],
+                )
+            } else {
+                (
+                    "issue-embed-component",
+                    &[
+                        "entity_identifier",
+                        "project_identifier",
+                        "workspace_identifier",
+                        "id",
+                        "entity_name",
+                    ],
+                )
+            };
+            let mut out = format!("<{tag}");
+            for key in keys {
+                if let Some(v) = a.get(*key).filter(|v| !v.is_null()) {
+                    out.push_str(&format!(
+                        " {key}=\"{}\"",
+                        escape(&v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))
+                    ));
+                }
+            }
+            format!("{out}>{body}</{tag}>")
+        }
         _ => bail!("unsupported editor node: {kind}"),
     })
 }
@@ -277,10 +392,14 @@ impl html5ever::tokenizer::TokenSink for HtmlSink {
             }
             CharacterTokens(s) => {
                 if let Some(p) = stack.last_mut() {
-                    p.children.push(HtmlNode {
-                        text: s.to_string(),
-                        ..Default::default()
-                    });
+                    if let Some(last) = p.children.last_mut().filter(|n| n.tag.is_empty()) {
+                        last.text.push_str(&s);
+                    } else {
+                        p.children.push(HtmlNode {
+                            text: s.to_string(),
+                            ..Default::default()
+                        });
+                    }
                 }
             }
             _ => {}
@@ -349,6 +468,15 @@ fn insert_nodes<P: XmlFragment>(
             "mention-component" => "mention",
             "image-component" => "imageComponent",
             "img" => "image",
+            "div"
+                if child
+                    .attrs
+                    .get("data-block-type")
+                    .is_some_and(|v| v == "callout-component") =>
+            {
+                "calloutComponent"
+            }
+            "issue-embed-component" => "issue-embed-component",
             "table" => "table",
             "tr" => "tableRow",
             "td" => "tableCell",
@@ -361,22 +489,21 @@ fn insert_nodes<P: XmlFragment>(
                     "s" | "del" => "strike",
                     "code" => "code",
                     "a" => "link",
+                    _ if child.attrs.get("data-type").is_some_and(|v| v == "emoji") => "customColor",
                     _ => "textStyle",
                 };
                 let mut m = marks.clone();
                 let mut attrs = serde_json::Map::new();
+                if mark == "customColor" {
+                    attrs.insert("color".into(), Value::Null);
+                    attrs.insert("backgroundColor".into(), Value::Null);
+                }
                 if mark == "link" {
+                    attrs.insert("target".into(), json!("_blank"));
+                    attrs.insert("rel".into(), json!("noopener noreferrer nofollow"));
+                    attrs.insert("class".into(), json!("text-accent-secondary underline underline-offset-[3px] hover:text-accent-primary transition-colors cursor-pointer"));
                     if let Some(v) = child.attrs.get("href") {
                         attrs.insert("href".into(), json!(v));
-                    }
-                }
-                if mark == "textStyle" {
-                    if let Some(style) = child.attrs.get("style") {
-                        for s in style.split(';') {
-                            if let Some(("color", v)) = s.trim().split_once(':') {
-                                attrs.insert("color".into(), json!(v.trim()));
-                            }
-                        }
                     }
                 }
                 m.insert(mark.into(), yrs::Any::from_json(&Value::Object(attrs).to_string())?);
@@ -393,6 +520,53 @@ fn insert_nodes<P: XmlFragment>(
         if kind == "heading" {
             let level = child.tag[1..].parse::<i64>()?;
             el.insert_attribute(txn, "level", level);
+        }
+        if matches!(kind, "paragraph" | "heading") {
+            if let Some(style) = child.attrs.get("style") {
+                for declaration in style.split(';') {
+                    if let Some(("text-align", value)) = declaration.trim().split_once(':') {
+                        el.insert_attribute(txn, "textAlign", value.trim().to_string());
+                    }
+                }
+            }
+        }
+        if kind == "orderedList" {
+            if let Some(start) = child.attrs.get("start").and_then(|v| v.parse::<i64>().ok()) {
+                el.insert_attribute(txn, "start", start);
+            }
+        }
+        if kind == "taskItem" {
+            el.insert_attribute(
+                txn,
+                "checked",
+                child.attrs.get("data-checked").is_some_and(|v| v == "true"),
+            );
+        }
+        if kind == "codeBlock" {
+            if let Some(language) = child
+                .children
+                .first()
+                .and_then(|c| c.attrs.get("class"))
+                .and_then(|s| s.split_whitespace().find_map(|s| s.strip_prefix("language-")))
+            {
+                el.insert_attribute(txn, "language", language.to_string());
+            }
+        }
+        if kind == "imageComponent" {
+            if let Some(v) = child.attrs.get("aspectratio").and_then(|v| v.parse::<f64>().ok()) {
+                el.insert_attribute(txn, "aspectRatio", v);
+            }
+        }
+        if matches!(kind, "calloutComponent" | "issue-embed-component") {
+            for (k, v) in &child.attrs {
+                if k == "data-emoji-unicode" {
+                    if let Ok(n) = v.parse::<i64>() {
+                        el.insert_attribute(txn, k.clone(), n);
+                    }
+                } else {
+                    el.insert_attribute(txn, k.clone(), v.clone());
+                }
+            }
         }
         if matches!(kind, "mention" | "imageComponent" | "image") {
             for (k, v) in &child.attrs {
@@ -428,6 +602,9 @@ pub fn initialize(html: &str, title: &str) -> anyhow::Result<Vec<u8>> {
     {
         let mut txn = doc.transact_mut();
         insert_nodes(&root, &mut txn, &tree.children, &Default::default())?;
+        if root.len(&txn) == 0 {
+            root.insert(&mut txn, 0, XmlElementPrelim::empty("paragraph"));
+        }
         let h = title_root.insert(&mut txn, 0, XmlElementPrelim::empty("heading"));
         h.insert_attribute(&mut txn, "level", 1i64);
         if !title.is_empty() {
@@ -495,7 +672,10 @@ mod plane_parity {
             match super::formats(&bin) {
                 Ok((html, json, title)) => {
                     if html != case["html"].as_str().unwrap() {
-                        failures.push(format!("{name}: html\n  got  {html}\n  want {}", case["html"].as_str().unwrap()));
+                        failures.push(format!(
+                            "{name}: html\n  got  {html}\n  want {}",
+                            case["html"].as_str().unwrap()
+                        ));
                     }
                     if json != case["json"] {
                         failures.push(format!("{name}: json\n  got  {json}\n  want {}", case["json"]));
@@ -519,7 +699,10 @@ mod plane_parity {
             match result {
                 Ok((html, json, _)) => {
                     if html != case["html"].as_str().unwrap() {
-                        failures.push(format!("{name}: html\n  got  {html}\n  want {}", case["html"].as_str().unwrap()));
+                        failures.push(format!(
+                            "{name}: html\n  got  {html}\n  want {}",
+                            case["html"].as_str().unwrap()
+                        ));
                     }
                     if json != case["json"] {
                         failures.push(format!("{name}: json\n  got  {json}\n  want {}", case["json"]));
