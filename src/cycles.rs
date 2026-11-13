@@ -127,7 +127,7 @@ const CYCLE_FROM: &str = "FROM cycles c
 
 /// CycleSerializer fields plus list extras, and `status` (CURRENT / UPCOMING / COMPLETED / DRAFT).
 /// ponytail: timestamps come back as stored (UTC); Plane converts them to the project timezone.
-fn cycle_select(where_sql: &str) -> String {
+pub(crate) fn cycle_select(where_sql: &str) -> String {
     format!(
         "SELECT jsonb_build_object(
             'id', c.id, 'workspace_id', c.workspace_id, 'project_id', c.project_id, 'name', c.name,
@@ -303,6 +303,7 @@ async fn create(
     .bind(end)
     .fetch_one(&st.db)
     .await?;
+    crate::webhook_out::emit(&st, p.workspace_id(), "cycle", "created", json!({"id": id}));
     Ok((StatusCode::CREATED, fetch_cycle(&st.db, &p, &user, id).await?))
 }
 
@@ -389,6 +390,7 @@ async fn update(
     .fetch_optional(&st.db)
     .await?;
     v.ok_or_else(cycle_not_found)?;
+    crate::webhook_out::emit(&st, p.workspace_id(), "cycle", "updated", json!({"id": pk}));
     fetch_cycle(&st.db, &p, &user, pk).await
 }
 
@@ -432,6 +434,7 @@ async fn destroy(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    crate::webhook_out::emit(&st, p.workspace_id(), "cycle", "deleted", json!({"id": pk}));
     no_content()
 }
 

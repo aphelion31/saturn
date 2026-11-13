@@ -134,7 +134,7 @@ fn fav(user_param: &str) -> String {
     )
 }
 
-fn module_select(user_param: &str) -> String {
+pub(crate) fn module_select(user_param: &str) -> String {
     format!("SELECT {} FROM modules m {COUNTS}", module_json(&fav(user_param)))
 }
 
@@ -302,6 +302,7 @@ async fn create(
         .bind(id)
         .fetch_one(&st.db)
         .await?;
+    crate::webhook_out::emit(&st, p.workspace_id(), "module", "created", v.clone());
     created(v)
 }
 
@@ -425,6 +426,7 @@ async fn update(
         insert_members(&mut tx, pk, project_id, p.workspace_id(), &m, user.id).await?;
     }
     tx.commit().await?;
+    crate::webhook_out::emit(&st, p.workspace_id(), "module", "updated", json!({"id": pk}));
     json_row(
         sqlx::query_scalar(&format!("{} WHERE m.id = $2", module_select("$1")))
             .bind(user.id)
@@ -475,6 +477,7 @@ async fn destroy(
         sqlx::query(q).bind(pk).execute(&mut *tx).await?;
     }
     tx.commit().await?;
+    crate::webhook_out::emit(&st, p.workspace_id(), "module", "deleted", json!({"id": pk}));
     no_content()
 }
 

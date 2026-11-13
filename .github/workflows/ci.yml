@@ -28,7 +28,7 @@ jobs:
       - name: API smoke test
         run: |
           ./target/debug/saturn seed admin@saturn.dev 'Saturn-rocks-2026' Acme
-          BIND=127.0.0.1:3000 WEB_URL=http://127.0.0.1:3000 ./target/debug/saturn &
+          SATURN_WEBHOOK_ALLOW_PRIVATE=1 BIND=127.0.0.1:3000 WEB_URL=http://127.0.0.1:3000 ./target/debug/saturn &
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:3000/health && break; sleep 1; done
           BASE=http://127.0.0.1:3000 tools/smoke.sh
 

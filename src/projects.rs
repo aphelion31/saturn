@@ -340,6 +340,14 @@ async fn add_members(
         sqlx::query("INSERT INTO project_user_properties (workspace_id,project_id,user_id,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$4) ON CONFLICT DO NOTHING").bind(p.workspace_id()).bind(project).bind(id).bind(user.id).execute(&mut *tx).await?;
     }
     tx.commit().await?;
+    for member in requested {
+        if let Some(id) = uuid_of(member, "member_id") {
+            if let Ok(email) = sqlx::query_scalar::<_, String>("SELECT u.email FROM users u JOIN workspace_members m ON m.member_id=u.id WHERE u.id=$1 AND m.workspace_id=$2 AND m.deleted_at IS NULL").bind(id).bind(p.workspace_id()).fetch_one(&st.db).await {
+                let text = format!("You have been invited to a Plane project. {}/{}/projects/{}/issues", st.cfg.web_url.trim_end_matches('/'), slug, project);
+                crate::outbound::send_mail_bg(&st, email, "You have been invited to a Plane project".into(), ammonia::clean(&text), text);
+            }
+        }
+    }
     let Json(rows) = members(State(st), user, Path((slug, project))).await?;
     Ok((StatusCode::CREATED, Json(rows)))
 }
@@ -873,6 +881,7 @@ async fn update(
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
+    crate::webhook_out::emit(&st, ws.workspace_id, "project", "updated", json!({"id": id}));
     retrieve(State(st), user, Path((slug, id))).await
 }
 
@@ -941,6 +950,7 @@ async fn create(
     let mut tx = st.db.begin().await?;
     let id = create_project(&mut tx, ws.workspace_id, user.id, name, identifier, &b).await?;
     tx.commit().await?;
+    crate::webhook_out::emit(&st, ws.workspace_id, "project", "created", json!({"id": id}));
     let Json(project) = retrieve(State(st), user, Path((slug, id))).await?;
     Ok((StatusCode::CREATED, Json(project)))
 }
@@ -982,6 +992,7 @@ async fn destroy(
     if r.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
+    crate::webhook_out::emit(&st, ws.workspace_id, "project", "deleted", json!({"id": project_id}));
     no_content()
 }
 
@@ -1215,11 +1226,12 @@ async fn invitations_create(
         rows.push((addr, role));
     }
     let mut tx = st.db.begin().await?;
+    let mut sent_invites = Vec::new();
     for (addr, role) in &rows {
         let token = invite_token();
-        sqlx::query(
+        let id: Uuid = sqlx::query_scalar(
             "INSERT INTO project_member_invites (id, email, token, role, accepted, project_id, workspace_id, created_by_id, updated_by_id)
-             VALUES (gen_random_uuid(), $1, $2, $3, false, $4, $5, $6, $6)",
+             VALUES (gen_random_uuid(), $1, $2, $3, false, $4, $5, $6, $6) RETURNING id",
         )
         .bind(addr)
         .bind(token)
@@ -1227,11 +1239,21 @@ async fn invitations_create(
         .bind(project_id)
         .bind(p.workspace_id())
         .bind(user.id)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
+        sent_invites.push((addr.clone(), id));
     }
     tx.commit().await?;
-    // ponytail: email sending skipped; invite row stored in DB
+    let names: Result<(String, String), _> = sqlx::query_as("SELECT p.name, COALESCE(NULLIF(u.first_name,''), NULLIF(u.display_name,''), u.email) FROM projects p JOIN users u ON u.id=$3 WHERE p.id=$1 AND p.workspace_id=$2 AND p.deleted_at IS NULL").bind(project_id).bind(p.workspace_id()).bind(user.id).fetch_one(&st.db).await;
+    if let Ok((project_name, inviter)) = names {
+        for (email, id) in sent_invites {
+            if let Ok(mut link) = url::Url::parse(&format!("{}/project-invitations/", st.cfg.web_url.trim_end_matches('/'))) {
+                link.query_pairs_mut().append_pair("invitation_id", &id.to_string()).append_pair("email", &email).append_pair("slug", &slug).append_pair("project_id", &project_id.to_string());
+                let text = format!("{inviter} invited you to join {project_name} on Plane. Visit {link}");
+                crate::outbound::send_mail_bg(&st, email, format!("{inviter} invited you to join {project_name} on Plane"), ammonia::clean(&text), text);
+            }
+        }
+    }
     Ok(Json(json!({"message": "Email sent successfully"})))
 }
 

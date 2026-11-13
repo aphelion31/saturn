@@ -981,6 +981,7 @@ async fn sign_in(st: AppState, headers: HeaderMap, f: AuthForm, app: App) -> Res
         .bind(id)
         .execute(&st.db)
         .await?;
+    if !active { crate::outbound::activation_mail(&st, id).await; }
     join_accepted_invites(&st, id, &email).await?;
     let uagent = headers
         .get(header::USER_AGENT)

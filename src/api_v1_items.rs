@@ -608,6 +608,7 @@ async fn comment_create(
     .bind(access)
     .fetch_one(&st.db)
     .await?;
+    crate::webhook_out::emit(&st, p.workspace_id(), "issue_comment", "created", json!({"id": id}));
     let Json(v) = comment_retrieve(State(st), user, Path((slug, project_id, issue_id, id))).await?;
     created(v)
 }
@@ -652,6 +653,7 @@ async fn comment_update(
     if r.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
+    crate::webhook_out::emit(&st, p.workspace_id(), "issue_comment", "updated", json!({"id": pk}));
     comment_retrieve(State(st), user, Path((slug, project_id, issue_id, pk))).await
 }
 
@@ -677,6 +679,7 @@ async fn comment_delete(
     if r.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
+    crate::webhook_out::emit(&st, p.workspace_id(), "issue_comment", "deleted", json!({"id": pk}));
     no_content()
 }
 
@@ -1130,6 +1133,7 @@ async fn create(
     }
     tx.commit().await?;
     let v = read_item(&st, &p, id).await?;
+    crate::webhook_out::emit(&st, p.workspace_id(), "issue", "created", v.clone());
     created(v)
 }
 
@@ -1287,6 +1291,7 @@ async fn update(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    crate::webhook_out::emit(&st, p.workspace_id(), "issue", "updated", serde_json::json!({"id": pk}));
     Ok(Json(read_item(&st, &p, pk).await?))
 }
 
@@ -1312,6 +1317,7 @@ async fn destroy(
     if r.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
+    crate::webhook_out::emit(&st, p.workspace_id(), "issue", "deleted", serde_json::json!({"id": pk}));
     no_content()
 }
 

@@ -156,6 +156,17 @@ pub fn send_mail_bg(st: &AppState, to: String, subject: String, html: String, te
     });
 }
 
+pub async fn activation_mail(st: &AppState, user_id: uuid::Uuid) {
+    match sqlx::query_as::<_, (String, String)>("SELECT email, COALESCE(NULLIF(first_name,''), NULLIF(display_name,''), email) FROM users WHERE id=$1")
+        .bind(user_id).fetch_optional(&st.db).await {
+        Ok(Some((email, name))) => {
+            let text = format!("Your account has been activated on Plane. {}/profile", st.cfg.web_url.trim_end_matches('/'));
+            send_mail_bg(st, email, format!("{name} has been activated on Plane"), ammonia::clean(&text), text);
+        }
+        Ok(None) => (), Err(e) => tracing::warn!(error=%e, "activation email lookup failed"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -212,7 +212,6 @@ async fn invite_create(
             json!({"non_field_errors": ["Email already invited"]}),
         ));
     }
-    // ponytail: no invite email is sent (Saturn has no SMTP), the token is the random uuid hex.
     let row: Value = sqlx::query_scalar(&format!(
         "WITH i AS (
             INSERT INTO workspace_member_invites
@@ -228,6 +227,7 @@ async fn invite_create(
     .bind(user.id)
     .fetch_one(&st.db)
     .await?;
+    crate::workspaces::send_workspace_invitation(&st, ws.workspace_id, user.id, &email).await;
     created(row)
 }
 

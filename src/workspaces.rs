@@ -42,7 +42,10 @@ pub fn routes() -> Router<AppState> {
             "/api/workspaces/{slug}/invitations/{pk}/",
             get(invite_public).patch(invite_update).delete(invite_delete),
         )
-        .route("/api/workspaces/{slug}/invitations/{pk}/join/", get(invite_public).post(invite_join))
+        .route(
+            "/api/workspaces/{slug}/invitations/{pk}/join/",
+            get(invite_public).post(invite_join),
+        )
         .route(
             "/api/users/me/workspaces/invitations/",
             get(my_invites_list).post(my_invites_accept),
@@ -685,8 +688,6 @@ async fn invites_list(State(st): State<AppState>, user: CurrentUser, Path(slug):
 }
 
 /// Plane: create invites (admin). Invited role is capped at the caller's role.
-// ponytail: no SMTP in Saturn, so invite emails are not sent. The invite row is stored and the
-// recipient accepts it from the invitations list.
 async fn invites_create(
     State(st): State<AppState>,
     user: CurrentUser,
@@ -740,7 +741,24 @@ async fn invites_create(
         .await?;
     }
     tx.commit().await?;
+    for (addr, _) in &rows {
+        send_workspace_invitation(&st, ws.workspace_id, user.id, addr).await;
+    }
     Ok(Json(json!({"message": "Emails sent successfully"})))
+}
+
+pub(crate) async fn send_workspace_invitation(st: &AppState, workspace: Uuid, inviter: Uuid, email: &str) {
+    let row: Result<(Uuid, String, String, String, String), _> = sqlx::query_as("SELECT i.id, i.token, w.slug, w.name, COALESCE(NULLIF(u.first_name,''), NULLIF(u.display_name,''), u.email) FROM workspace_member_invites i JOIN workspaces w ON w.id=i.workspace_id JOIN users u ON u.id=$3 WHERE i.workspace_id=$1 AND i.email=$2 AND i.deleted_at IS NULL ORDER BY i.created_at DESC LIMIT 1")
+        .bind(workspace).bind(email).bind(inviter).fetch_one(&st.db).await;
+    match row {
+        Ok((id, token, slug, workspace_name, name)) => {
+            let Ok(mut link) = url::Url::parse(&format!("{}/workspace-invitations/", st.cfg.web_url.trim_end_matches('/'))) else { tracing::warn!("invalid WEB_URL"); return; };
+            link.query_pairs_mut().append_pair("invitation_id", &id.to_string()).append_pair("slug", &slug).append_pair("token", &token);
+            let text = format!("{name} has invited you to join them in {workspace_name} on Plane. Visit {link}");
+            crate::outbound::send_mail_bg(st, email.to_owned(), format!("{name} has invited you to join them in {workspace_name} on Plane"), ammonia::clean(&text), text);
+        }
+        Err(e) => tracing::warn!(error=%e, "workspace invitation email lookup failed"),
+    }
 }
 
 /// 32 random base62 chars, same alphabet as session keys.
@@ -1527,13 +1545,15 @@ async fn check_webhook_url(raw: &str) -> Result<(), ApiError> {
             .map(|a| a.ip())
             .collect(),
     };
-    if ips.is_empty() || ips.iter().any(|ip| blocked_ip(*ip)) {
+    if ips.is_empty()
+        || (std::env::var("SATURN_WEBHOOK_ALLOW_PRIVATE").as_deref() != Ok("1") && ips.iter().any(|ip| blocked_ip(*ip)))
+    {
         return Err(bad());
     }
     Ok(())
 }
 
-fn blocked_ip(ip: std::net::IpAddr) -> bool {
+pub(crate) fn blocked_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
             v4.is_loopback()
