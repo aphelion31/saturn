@@ -593,6 +593,7 @@ async fn comment_create(
         Some(_) => return Err(ApiError::bad_body(json!({"access": ["Invalid access"]}))),
     };
     // ponytail: Plane also writes a `descriptions` row and `comment_json`; skipped, UI reads comment_html.
+    let mut tx = st.db.begin().await?;
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO issue_comments (workspace_id, project_id, issue_id, actor_id, created_by_id, updated_by_id,
             comment_html, comment_stripped, comment_json, access, attachments)
@@ -606,8 +607,22 @@ async fn comment_create(
     .bind(&html)
     .bind(strip_tags(&html))
     .bind(access)
-    .fetch_one(&st.db)
+    .fetch_one(&mut *tx)
     .await?;
+    let mut event = crate::activity::ActivityEvent::new(
+        issue_id,
+        project_id,
+        p.workspace_id(),
+        user.id,
+        "created",
+        "created a comment",
+    );
+    event.field = Some("comment");
+    event.new_value = Some(&html);
+    event.new_identifier = Some(id);
+    event.issue_comment_id = Some(id);
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     crate::webhook_out::emit(&st, p.workspace_id(), "issue_comment", "created", json!({"id": id}));
     let Json(v) = comment_retrieve(State(st), user, Path((slug, project_id, issue_id, id))).await?;
     created(v)
@@ -632,6 +647,9 @@ async fn comment_update(
         Some(v) if v == "INTERNAL" || v == "EXTERNAL" => Some(v),
         Some(_) => return Err(ApiError::bad_body(json!({"access": ["Invalid access"]}))),
     };
+    let mut tx = st.db.begin().await?;
+    let old: Option<String> = sqlx::query_scalar("SELECT comment_html FROM issue_comments WHERE id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND created_by_id=$5 AND deleted_at IS NULL FOR UPDATE")
+        .bind(pk).bind(issue_id).bind(project_id).bind(p.workspace_id()).bind(user.id).fetch_optional(&mut *tx).await?;
     let r = sqlx::query(
         "UPDATE issue_comments SET comment_html = COALESCE($5, comment_html),
             comment_stripped = CASE WHEN $5::text IS NULL THEN comment_stripped ELSE $6 END,
@@ -648,11 +666,29 @@ async fn comment_update(
     .bind(html.as_deref().map(strip_tags))
     .bind(access)
     .bind(p.workspace_id())
-    .execute(&st.db)
+    .execute(&mut *tx)
     .await?;
     if r.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
+    if html.is_some() && old != html {
+        let mut event = crate::activity::ActivityEvent::new(
+            issue_id,
+            project_id,
+            p.workspace_id(),
+            user.id,
+            "updated",
+            "updated a comment",
+        );
+        event.field = Some("comment");
+        event.old_value = old.as_deref();
+        event.new_value = html.as_deref();
+        event.old_identifier = Some(pk);
+        event.new_identifier = Some(pk);
+        event.issue_comment_id = Some(pk);
+        crate::activity::record(&mut *tx, event).await?;
+    }
+    tx.commit().await?;
     crate::webhook_out::emit(&st, p.workspace_id(), "issue_comment", "updated", json!({"id": pk}));
     comment_retrieve(State(st), user, Path((slug, project_id, issue_id, pk))).await
 }
@@ -665,6 +701,7 @@ async fn comment_delete(
 ) -> ApiResult<StatusCode> {
     let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
     p.require(&[ADMIN, MEMBER, GUEST])?;
+    let mut tx = st.db.begin().await?;
     let r = sqlx::query(
         "UPDATE issue_comments SET deleted_at = now(), updated_at = now(), updated_by_id = $4
          WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $5 AND deleted_at IS NULL AND created_by_id = $4",
@@ -674,11 +711,23 @@ async fn comment_delete(
     .bind(project_id)
     .bind(user.id)
     .bind(p.workspace_id())
-    .execute(&st.db)
+    .execute(&mut *tx)
     .await?;
     if r.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
+    let mut event = crate::activity::ActivityEvent::new(
+        issue_id,
+        project_id,
+        p.workspace_id(),
+        user.id,
+        "deleted",
+        "deleted the comment",
+    );
+    event.field = Some("comment");
+    event.issue_comment_id = Some(pk);
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     crate::webhook_out::emit(&st, p.workspace_id(), "issue_comment", "deleted", json!({"id": pk}));
     no_content()
 }

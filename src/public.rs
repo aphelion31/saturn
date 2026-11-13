@@ -557,6 +557,7 @@ async fn comment_create(
     let comment_json = body.comment_json.unwrap_or_else(|| json!({}));
     let comment_stripped = strip_tags(&comment_html);
 
+    let mut tx = st.db.begin().await?;
     let row: (Value,) = sqlx::query_as(
         "WITH ins AS (
             INSERT INTO issue_comments (
@@ -602,8 +603,22 @@ async fn comment_create(
     .bind(b.workspace_id)
     .bind(&comment_html)
     .bind(&comment_json)
-    .fetch_one(&st.db)
+    .fetch_one(&mut *tx)
     .await?;
+    let mut event = crate::activity::ActivityEvent::new(
+        issue_id,
+        b.project_id,
+        b.workspace_id,
+        user.id,
+        "created",
+        "created a comment",
+    );
+    event.field = Some("comment");
+    event.new_value = Some(&comment_html);
+    event.new_identifier = Some(id);
+    event.issue_comment_id = Some(id);
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
 
     Ok((StatusCode::CREATED, Json(row.0)))
 }
@@ -697,21 +712,25 @@ async fn comment_update(
         return Err(ApiError::not_found());
     }
 
+    let mut tx = st.db.begin().await?;
     let existing: Option<(Option<String>, Option<Value>)> = sqlx::query_as(
         "SELECT comment_html, comment_json FROM issue_comments
          WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $4
-           AND access = 'EXTERNAL' AND actor_id = $5 AND deleted_at IS NULL",
+           AND access = 'EXTERNAL' AND actor_id = $5 AND deleted_at IS NULL FOR UPDATE",
     )
     .bind(pk)
     .bind(issue_id)
     .bind(b.project_id)
     .bind(b.workspace_id)
     .bind(user.id)
-    .fetch_optional(&st.db)
+    .fetch_optional(&mut *tx)
     .await?;
 
     let (old_html, old_json) = existing.ok_or_else(ApiError::not_found)?;
-    let raw_html = body.comment_html.or(old_html).unwrap_or_else(|| "<p></p>".to_string());
+    let raw_html = body
+        .comment_html
+        .or_else(|| old_html.clone())
+        .unwrap_or_else(|| "<p></p>".to_string());
     let new_html = sanitize_html(&raw_html)?;
     let new_json = body.comment_json.or(old_json).unwrap_or_else(|| json!({}));
     let new_stripped = strip_tags(&new_html);
@@ -759,8 +778,26 @@ async fn comment_update(
     .bind(issue_id)
     .bind(b.project_id)
     .bind(b.workspace_id)
-    .fetch_one(&st.db)
+    .fetch_one(&mut *tx)
     .await?;
+    if old_html.as_deref() != Some(new_html.as_str()) {
+        let mut event = crate::activity::ActivityEvent::new(
+            issue_id,
+            b.project_id,
+            b.workspace_id,
+            user.id,
+            "updated",
+            "updated a comment",
+        );
+        event.field = Some("comment");
+        event.old_value = old_html.as_deref();
+        event.new_value = Some(&new_html);
+        event.old_identifier = Some(pk);
+        event.new_identifier = Some(pk);
+        event.issue_comment_id = Some(pk);
+        crate::activity::record(&mut *tx, event).await?;
+    }
+    tx.commit().await?;
 
     Ok(Json(row.0))
 }
@@ -779,6 +816,7 @@ async fn comment_destroy(
         return Err(ApiError::not_found());
     }
 
+    let mut tx = st.db.begin().await?;
     let res = sqlx::query(
         "UPDATE issue_comments
          SET deleted_at = now()
@@ -790,12 +828,24 @@ async fn comment_destroy(
     .bind(b.project_id)
     .bind(b.workspace_id)
     .bind(user.id)
-    .execute(&st.db)
+    .execute(&mut *tx)
     .await?;
 
     if res.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
+    let mut event = crate::activity::ActivityEvent::new(
+        issue_id,
+        b.project_id,
+        b.workspace_id,
+        user.id,
+        "deleted",
+        "deleted the comment",
+    );
+    event.field = Some("comment");
+    event.issue_comment_id = Some(pk);
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
