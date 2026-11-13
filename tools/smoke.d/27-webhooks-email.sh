@@ -17,18 +17,27 @@ for _ in {1..50}; do curl -s -o /dev/null "http://127.0.0.1:$WH_PORT/" && break;
 call POST "/api/workspaces/$SLUG/webhooks/" '{"url":"http://127.0.0.1:'"$WH_PORT"'/","issue":true,"is_active":true}'
 WH_ID=$(field '.id')
 call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/" '{"name":"Webhook smoke"}'
+WH_ISSUE=$(field '.id')
 for _ in {1..150}; do
   WH_COUNT=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "SELECT count(*) FROM webhook_logs WHERE webhook='$WH_ID' AND event_type='issue' AND response_status='200'")
   [[ "$WH_COUNT" -gt 0 ]] && break
   sleep 0.1
 done
+call PATCH "/api/workspaces/$SLUG/projects/$PROJECT/issues/$WH_ISSUE/" '{"priority":"high"}'
+for _ in {1..150}; do
+  WH_UPDATED=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "SELECT count(*) FROM webhook_logs WHERE webhook='$WH_ID' AND request_method='updated' AND response_status='200'")
+  [[ "$WH_UPDATED" -gt 0 ]] && break
+  sleep 0.1
+done
+[[ "$WH_UPDATED" -gt 0 ]] || { echo "✖ no updated webhook delivery" >&2; exit 1; }
 kill "$WH_PID" 2>/dev/null || true
 wait "$WH_PID" 2>/dev/null || true
 [[ "$WH_COUNT" -gt 0 ]] || { echo "✖ no 200 webhook_logs row; logs: $(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "SELECT response_status||' '||left(response_body,120) FROM webhook_logs WHERE webhook='$WH_ID'")" >&2; exit 1; }
 grep -qi '^x-plane-event: issue' "$WH_CAPTURE" || { echo "✖ sink did not receive X-Plane-Event" >&2; exit 1; }
 grep -qi '^x-plane-signature: [0-9a-f]\{64\}' "$WH_CAPTURE" || { echo "✖ missing HMAC signature header" >&2; exit 1; }
 echo "✔ webhook delivered with X-Plane-Event and signature"
-psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "SELECT request_body FROM webhook_logs WHERE webhook='$WH_ID' AND event_type='issue' LIMIT 1" | jq -e '.data.name == "Webhook smoke" and (.data.labels | type == "array") and (.data.assignees | type == "array")' >/dev/null
+psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "SELECT request_body FROM webhook_logs WHERE webhook='$WH_ID' AND request_method='created' LIMIT 1" | jq -e '.data.name == "Webhook smoke" and (.data.labels | type == "array") and (.data.assignees | type == "array") and (.activity.actor.id | type == "string") and .activity.field == null and (.data.state.group | type == "string") and (.data.project | type == "string") and (.data | has("project_id") | not)' >/dev/null
+psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "SELECT request_body FROM webhook_logs WHERE webhook='$WH_ID' AND request_method='updated' LIMIT 1" | jq -e '.activity.field == "priority" and .activity.old_value == "none" and .activity.new_value == "high"' >/dev/null
 rm -f "$WH_CAPTURE"
 call DELETE "/api/workspaces/$SLUG/webhooks/$WH_ID/"
 fi

@@ -257,7 +257,16 @@ async fn retrieve(
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER])?;
-    crate::recent_visits::record(&st.db, crate::recent_visits::Visit { workspace_id: p.workspace_id(), user_id: user.id, entity_name: "cycle", entity_identifier: pk, project_id: Some(project_id) });
+    crate::recent_visits::record(
+        &st.db,
+        crate::recent_visits::Visit {
+            workspace_id: p.workspace_id(),
+            user_id: user.id,
+            entity_name: "cycle",
+            entity_identifier: pk,
+            project_id: Some(project_id),
+        },
+    );
     fetch_cycle(&st.db, &p, &user, pk).await
 }
 
@@ -304,7 +313,7 @@ async fn create(
     .bind(end)
     .fetch_one(&st.db)
     .await?;
-    crate::webhook_out::emit(&st, p.workspace_id(), "cycle", "created", json!({"id": id}));
+    crate::webhook_out::emit(&st, p.workspace_id(), "cycle", "created", json!({"id": id}), user.id);
     Ok((StatusCode::CREATED, fetch_cycle(&st.db, &p, &user, id).await?))
 }
 
@@ -316,6 +325,7 @@ async fn update(
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER])?;
+    let webhook_before = crate::webhook_out::model_data(&st.db, "cycle", pk, p.workspace_id()).await?;
     let cur: (
         Option<chrono::DateTime<chrono::Utc>>,
         Option<chrono::DateTime<chrono::Utc>>,
@@ -391,7 +401,15 @@ async fn update(
     .fetch_optional(&st.db)
     .await?;
     v.ok_or_else(cycle_not_found)?;
-    crate::webhook_out::emit(&st, p.workspace_id(), "cycle", "updated", json!({"id": pk}));
+    crate::webhook_out::emit_with_changes(
+        &st,
+        p.workspace_id(),
+        "cycle",
+        "updated",
+        json!({"id": pk}),
+        user.id,
+        crate::webhook_out::changes(&webhook_before, &b),
+    );
     fetch_cycle(&st.db, &p, &user, pk).await
 }
 
@@ -435,7 +453,7 @@ async fn destroy(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    crate::webhook_out::emit(&st, p.workspace_id(), "cycle", "deleted", json!({"id": pk}));
+    crate::webhook_out::emit(&st, p.workspace_id(), "cycle", "deleted", json!({"id": pk}), user.id);
     no_content()
 }
 

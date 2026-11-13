@@ -679,7 +679,14 @@ async fn comment_create(
     let activities = crate::notify::snapshots(&mut tx, issue_id, project_id, p.workspace_id()).await?;
     tx.commit().await?;
     crate::notify::after_activity(&st, issue_id, project_id, p.workspace_id(), user.id, activities);
-    crate::webhook_out::emit(&st, p.workspace_id(), "issue_comment", "created", json!({"id": id}));
+    crate::webhook_out::emit(
+        &st,
+        p.workspace_id(),
+        "issue_comment",
+        "created",
+        json!({"id": id}),
+        user.id,
+    );
     let Json(v) = comment_retrieve(State(st), user, Path((slug, project_id, issue_id, id))).await?;
     created(v)
 }
@@ -693,6 +700,7 @@ async fn comment_update(
 ) -> ApiResult {
     let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
     p.require(&[ADMIN, MEMBER, GUEST])?;
+    let webhook_before = crate::webhook_out::model_data(&st.db, "issue_comment", pk, p.workspace_id()).await?;
     let html = match b.get("comment_html") {
         None => None,
         Some(Value::String(v)) => Some(sanitize_html(v)?),
@@ -747,7 +755,15 @@ async fn comment_update(
     let activities = crate::notify::snapshots(&mut tx, issue_id, project_id, p.workspace_id()).await?;
     tx.commit().await?;
     crate::notify::after_activity(&st, issue_id, project_id, p.workspace_id(), user.id, activities);
-    crate::webhook_out::emit(&st, p.workspace_id(), "issue_comment", "updated", json!({"id": pk}));
+    crate::webhook_out::emit_with_changes(
+        &st,
+        p.workspace_id(),
+        "issue_comment",
+        "updated",
+        json!({"id": pk}),
+        user.id,
+        crate::webhook_out::changes(&webhook_before, &b),
+    );
     comment_retrieve(State(st), user, Path((slug, project_id, issue_id, pk))).await
 }
 
@@ -786,7 +802,14 @@ async fn comment_delete(
     event.issue_comment_id = Some(pk);
     crate::activity::record(&mut *tx, event).await?;
     tx.commit().await?;
-    crate::webhook_out::emit(&st, p.workspace_id(), "issue_comment", "deleted", json!({"id": pk}));
+    crate::webhook_out::emit(
+        &st,
+        p.workspace_id(),
+        "issue_comment",
+        "deleted",
+        json!({"id": pk}),
+        user.id,
+    );
     no_content()
 }
 
@@ -1296,7 +1319,7 @@ async fn create(
     tx.commit().await?;
     crate::notify::after_activity(&st, id, project_id, p.workspace_id(), user.id, activities);
     let v = read_item(&st, &p, id).await?;
-    crate::webhook_out::emit(&st, p.workspace_id(), "issue", "created", v.clone());
+    crate::webhook_out::emit(&st, p.workspace_id(), "issue", "created", v.clone(), user.id);
     created(v)
 }
 
@@ -1345,6 +1368,7 @@ async fn update(
         Some(_) => return Err(ApiError::bad_body(json!({"description_html": ["Invalid HTML."]}))),
     };
     let mut tx = st.db.begin().await?;
+    let webhook_before = crate::webhook_out::model_data(&st.db, "issue", pk, p.workspace_id()).await?;
     let old: Option<(Option<chrono::NaiveDate>, Option<chrono::NaiveDate>, Option<Uuid>)> = sqlx::query_as(
         "SELECT i.start_date, i.target_date, i.state_id FROM issues i WHERE i.id = $1 AND i.project_id = $2 AND i.workspace_id = $3 AND i.deleted_at IS NULL AND NOT i.is_draft AND (NOT $4 OR i.created_by_id = $5) FOR UPDATE"
     )
@@ -1556,11 +1580,19 @@ async fn update(
         (["labels", "label_ids"], "issue_labels", "label_id"),
         (["assignees", "assignee_ids"], "issue_assignees", "assignee_id"),
     ] {
-        let Some(key) = keys.into_iter().find(|k| b.get(*k).is_some()) else { continue };
+        let Some(key) = keys.into_iter().find(|k| b.get(*k).is_some()) else {
+            continue;
+        };
         let wanted = uuid_list(&b, key)?;
         let valid: Vec<Uuid> = if table == "issue_labels" {
-            sqlx::query_scalar("SELECT id FROM labels WHERE id=ANY($1) AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL")
-                .bind(&wanted).bind(project_id).bind(p.workspace_id()).fetch_all(&mut *tx).await?
+            sqlx::query_scalar(
+                "SELECT id FROM labels WHERE id=ANY($1) AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+            )
+            .bind(&wanted)
+            .bind(project_id)
+            .bind(p.workspace_id())
+            .fetch_all(&mut *tx)
+            .await?
         } else {
             sqlx::query_scalar("SELECT member_id FROM project_members WHERE member_id=ANY($1) AND project_id=$2 AND workspace_id=$3 AND is_active AND role>=15 AND deleted_at IS NULL")
                 .bind(&wanted).bind(project_id).bind(p.workspace_id()).fetch_all(&mut *tx).await?
@@ -1576,7 +1608,11 @@ async fn update(
         let before_ids: Vec<Uuid> = sqlx::query_scalar(&format!(
             "SELECT {col} FROM {table} WHERE issue_id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL"
         ))
-        .bind(pk).bind(project_id).bind(p.workspace_id()).fetch_all(&mut *tx).await?;
+        .bind(pk)
+        .bind(project_id)
+        .bind(p.workspace_id())
+        .fetch_all(&mut *tx)
+        .await?;
         sqlx::query(&format!(
             "UPDATE {table} SET deleted_at=now(), updated_at=now(), updated_by_id=$5 WHERE issue_id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL AND NOT ({col}=ANY($4))"
         ))
@@ -1589,12 +1625,23 @@ async fn update(
             ))
             .bind(pk).bind(project_id).bind(p.workspace_id()).bind(id).bind(user.id).execute(&mut *tx).await?;
         }
-        for (id, is_added) in added.iter().map(|i| (*i, true)).chain(removed.iter().map(|i| (*i, false))) {
+        for (id, is_added) in added
+            .iter()
+            .map(|i| (*i, true))
+            .chain(removed.iter().map(|i| (*i, false)))
+        {
             let name: Option<String> = if table == "issue_labels" {
                 sqlx::query_scalar("SELECT name FROM labels WHERE id=$1 AND project_id=$2 AND workspace_id=$3")
-                    .bind(id).bind(project_id).bind(p.workspace_id()).fetch_optional(&mut *tx).await?
+                    .bind(id)
+                    .bind(project_id)
+                    .bind(p.workspace_id())
+                    .fetch_optional(&mut *tx)
+                    .await?
             } else {
-                sqlx::query_scalar("SELECT display_name FROM users WHERE id=$1").bind(id).fetch_optional(&mut *tx).await?
+                sqlx::query_scalar("SELECT display_name FROM users WHERE id=$1")
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?
             };
             let Some(name) = name else { continue };
             let (field, comment) = match (table, is_added) {
@@ -1603,7 +1650,8 @@ async fn update(
                 (_, true) => ("assignees", "added assignee "),
                 (_, false) => ("assignees", "removed assignee "),
             };
-            let mut event = crate::activity::ActivityEvent::new(pk, project_id, p.workspace_id(), user.id, "updated", comment);
+            let mut event =
+                crate::activity::ActivityEvent::new(pk, project_id, p.workspace_id(), user.id, "updated", comment);
             event.field = Some(field);
             event.old_value = Some(if is_added { "" } else { name.as_str() });
             event.new_value = Some(if is_added { name.as_str() } else { "" });
@@ -1618,7 +1666,15 @@ async fn update(
     let activities = crate::notify::snapshots(&mut tx, pk, project_id, p.workspace_id()).await?;
     tx.commit().await?;
     crate::notify::after_activity(&st, pk, project_id, p.workspace_id(), user.id, activities);
-    crate::webhook_out::emit(&st, p.workspace_id(), "issue", "updated", serde_json::json!({"id": pk}));
+    crate::webhook_out::emit_with_changes(
+        &st,
+        p.workspace_id(),
+        "issue",
+        "updated",
+        serde_json::json!({"id": pk}),
+        user.id,
+        crate::webhook_out::changes(&webhook_before, &b),
+    );
     Ok(Json(read_item(&st, &p, pk).await?))
 }
 
@@ -1656,7 +1712,14 @@ async fn destroy(
     event.field = Some("issue");
     crate::activity::record(&mut *tx, event).await?;
     tx.commit().await?;
-    crate::webhook_out::emit(&st, p.workspace_id(), "issue", "deleted", serde_json::json!({"id": pk}));
+    crate::webhook_out::emit(
+        &st,
+        p.workspace_id(),
+        "issue",
+        "deleted",
+        serde_json::json!({"id": pk}),
+        user.id,
+    );
     no_content()
 }
 
