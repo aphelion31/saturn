@@ -618,7 +618,9 @@ async fn comment_create(
     event.new_identifier = Some(id);
     event.issue_comment_id = Some(id);
     crate::activity::record(&mut *tx, event).await?;
+    let activities = crate::notify::snapshots(&mut tx, issue_id, b.project_id, b.workspace_id).await?;
     tx.commit().await?;
+    crate::notify::after_activity(&st, issue_id, b.project_id, b.workspace_id, user.id, activities);
 
     Ok((StatusCode::CREATED, Json(row.0)))
 }
@@ -797,7 +799,9 @@ async fn comment_update(
         event.issue_comment_id = Some(pk);
         crate::activity::record(&mut *tx, event).await?;
     }
+    let activities = crate::notify::snapshots(&mut tx, issue_id, b.project_id, b.workspace_id).await?;
     tx.commit().await?;
+    crate::notify::after_activity(&st, issue_id, b.project_id, b.workspace_id, user.id, activities);
 
     Ok(Json(row.0))
 }
@@ -1513,7 +1517,9 @@ async fn intake_issue_create(
     .await?;
 
     crate::activity::record(&mut *tx, crate::activity::ActivityEvent::new(issue_id, b.project_id, b.workspace_id, user.id, "created", "created the issue")).await?;
+    let activities = crate::notify::snapshots(&mut tx, issue_id, b.project_id, b.workspace_id).await?;
     tx.commit().await?;
+    crate::notify::after_activity(&st, issue_id, b.project_id, b.workspace_id, user.id, activities);
 
     let out: (Value,) = sqlx::query_as(
         "SELECT jsonb_build_object(

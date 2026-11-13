@@ -23,6 +23,7 @@ use crate::common::AppState;
 use crate::jobs_fk::{OnDelete, PLANE_FKS};
 
 pub const JOB_NAMES: &[&str] = &[
+    "stack_email_notification",
     "archive_and_close_old_issues",
     "unsnooze_expired_intake_issues",
     "hard_delete",
@@ -69,7 +70,7 @@ pub fn duration_until_next_daily(now: DateTime<Utc>, target_hour: u32, target_mi
 /// Computes sleep duration until the next run of a named scheduled task.
 pub fn duration_until_next_run(job_name: &str, now: DateTime<Utc>) -> Option<Duration> {
     match job_name {
-        "unsnooze_expired_intake_issues" => Some(duration_until_next_5min(now)),
+        "unsnooze_expired_intake_issues" | "stack_email_notification" => Some(duration_until_next_5min(now)),
         "hard_delete" => Some(duration_until_next_daily(now, 0, 0)),
         "archive_and_close_old_issues" => Some(duration_until_next_daily(now, 1, 0)),
         "delete_old_s3_link" => {
@@ -115,6 +116,7 @@ pub async fn run_job_locked(st: &AppState, job_name: &str) -> anyhow::Result<boo
     }
 
     match job_name {
+        "stack_email_notification" => crate::notify::stack_email_notification(st, &mut tx).await?,
         "archive_and_close_old_issues" => run_archive_and_close(&mut tx).await?,
         "unsnooze_expired_intake_issues" => run_unsnooze_intake(&mut tx).await?,
         "hard_delete" => run_hard_delete(&mut tx).await?,
