@@ -903,6 +903,12 @@ async fn bulk_delete(
             .execute(&mut *tx)
             .await?;
     }
+    for id in &ids {
+        let mut event =
+            crate::activity::ActivityEvent::new(*id, pid, p.workspace_id(), user.id, "deleted", "deleted the issue");
+        event.field = Some("issue");
+        crate::activity::record(&mut *tx, event).await?;
+    }
     tx.commit().await?;
     Ok(Json(
         serde_json::json!({"message":format!("{} issues were deleted",ids.len())}),
@@ -1170,6 +1176,7 @@ async fn relation_create(
         let (a, b) = if reverse { (id, iid) } else { (iid, id) };
         let row:Option<Value>=sqlx::query_scalar("INSERT INTO issue_relations (workspace_id,project_id,issue_id,related_issue_id,relation_type,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$5,$6,$6) ON CONFLICT DO NOTHING RETURNING (to_jsonb(issue_relations)-'workspace_id'-'project_id'-'issue_id'-'related_issue_id'-'created_by_id'-'updated_by_id') || jsonb_build_object('workspace',workspace_id,'project',project_id,'issue',issue_id,'related_issue',related_issue_id,'created_by',created_by_id,'updated_by',updated_by_id)").bind(p.workspace_id()).bind(pid).bind(a).bind(b).bind(stored).bind(user.id).fetch_optional(&mut *tx).await?;
         if let Some(v) = row {
+            relation_activity(&mut tx, iid, id, pid, p.workspace_id(), user.id, kind, true).await?;
             rows.push(v);
         }
     }
@@ -1185,11 +1192,66 @@ async fn relation_remove(
     let p = visible_issue(&st, &user, &slug, pid, iid).await?;
     p.require(&[ADMIN, MEMBER])?;
     let other = uuid_of(&body, "related_issue").ok_or_else(|| ApiError::bad("Invalid related issue"))?;
-    let r=sqlx::query("UPDATE issue_relations SET deleted_at=now(),updated_at=now(),updated_by_id=$4 WHERE id=(SELECT id FROM issue_relations WHERE workspace_id=$1 AND ((issue_id=$2 AND related_issue_id=$3) OR (issue_id=$3 AND related_issue_id=$2)) AND deleted_at IS NULL LIMIT 1)").bind(p.workspace_id()).bind(iid).bind(other).bind(user.id).execute(&st.db).await?;
-    if r.rows_affected() == 0 {
-        return Err(ApiError::not_found());
-    }
+    let mut tx = st.db.begin().await?;
+    let relation: Option<(String, Uuid)> = sqlx::query_as("UPDATE issue_relations SET deleted_at=now(),updated_at=now(),updated_by_id=$4 WHERE id=(SELECT id FROM issue_relations WHERE workspace_id=$1 AND ((issue_id=$2 AND related_issue_id=$3) OR (issue_id=$3 AND related_issue_id=$2)) AND deleted_at IS NULL LIMIT 1) RETURNING relation_type,issue_id").bind(p.workspace_id()).bind(iid).bind(other).bind(user.id).fetch_optional(&mut *tx).await?;
+    let (stored, source) = relation.ok_or_else(ApiError::not_found)?;
+    let kind = s(&body, "relation_type").unwrap_or(if source == iid {
+        &stored
+    } else {
+        inverse_relation(&stored)
+    });
+    relation_activity(&mut tx, iid, other, pid, p.workspace_id(), user.id, kind, false).await?;
+    tx.commit().await?;
     no_content()
+}
+
+fn inverse_relation(kind: &str) -> &str {
+    match kind {
+        "blocking" => "blocked_by",
+        "blocked_by" => "blocking",
+        "start_after" => "start_before",
+        "start_before" => "start_after",
+        "finish_after" => "finish_before",
+        "finish_before" => "finish_after",
+        _ => kind,
+    }
+}
+
+async fn relation_activity(
+    tx: &mut sqlx::PgConnection,
+    issue: Uuid,
+    other: Uuid,
+    project: Uuid,
+    workspace: Uuid,
+    actor: Uuid,
+    kind: &str,
+    added: bool,
+) -> Result<(), sqlx::Error> {
+    let rows: Vec<(Uuid, String)> = sqlx::query_as("SELECT i.id,p.identifier || '-' || i.sequence_id::text FROM issues i JOIN projects p ON p.id=i.project_id AND p.workspace_id=i.workspace_id WHERE i.id=ANY($1) AND i.workspace_id=$2 AND i.deleted_at IS NULL")
+        .bind([issue, other].to_vec()).bind(workspace).fetch_all(&mut *tx).await?;
+    for (target, related, relation) in [(issue, other, kind), (other, issue, inverse_relation(kind))] {
+        if let Some((_, name)) = rows.iter().find(|(id, _)| *id == related) {
+            let comment = format!(
+                "{} {} relation",
+                if added { "added" } else { "deleted" },
+                if added { relation } else { kind }
+            );
+            let mut event = crate::activity::ActivityEvent::new(
+                target,
+                project,
+                workspace,
+                actor,
+                if added { "updated" } else { "deleted" },
+                &comment,
+            );
+            event.field = Some(relation);
+            event.old_value = Some(if added { "" } else { name });
+            event.new_value = Some(if added { name } else { "" });
+            event.old_identifier = Some(if added || target == issue { related } else { other });
+            crate::activity::record(&mut *tx, event).await?;
+        }
+    }
+    Ok(())
 }
 async fn sub_issues(
     State(st): State<AppState>,
@@ -1239,12 +1301,57 @@ async fn sub_issue_assign(
     if cycle {
         return Err(ApiError::bad("Parent cycle"));
     }
+    let before: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as("SELECT id,parent_id FROM issues WHERE id=ANY($1) AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL FOR UPDATE")
+        .bind(&ids).bind(pid).bind(p.workspace_id()).fetch_all(&mut *tx).await?;
     let r=sqlx::query("UPDATE issues SET parent_id=$1,updated_at=now(),updated_by_id=$5 WHERE id=ANY($4) AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL AND archived_at IS NULL AND NOT is_draft").bind(iid).bind(pid).bind(p.workspace_id()).bind(&ids).bind(user.id).execute(&mut *tx).await?;
     if r.rows_affected() as usize != ids.len() {
         return Err(ApiError::bad("Invalid sub issue IDs"));
     }
+    for (child, old_parent) in before {
+        if old_parent != Some(iid) {
+            parent_activity(&mut tx, child, pid, p.workspace_id(), user.id, old_parent, Some(iid)).await?;
+        }
+    }
     tx.commit().await?;
     sub_issues(State(st), user, Path((slug, pid, iid))).await
+}
+
+async fn parent_activity(
+    tx: &mut sqlx::PgConnection,
+    issue: Uuid,
+    project: Uuid,
+    workspace: Uuid,
+    actor: Uuid,
+    old: Option<Uuid>,
+    new: Option<Uuid>,
+) -> Result<(), sqlx::Error> {
+    let ids: Vec<Uuid> = [old, new].into_iter().flatten().collect();
+    let rows: Vec<(Uuid, String)> = sqlx::query_as("SELECT i.id,p.identifier || '-' || i.sequence_id::text FROM issues i JOIN projects p ON p.id=i.project_id AND p.workspace_id=i.workspace_id WHERE i.id=ANY($1) AND i.project_id=$2 AND i.workspace_id=$3 AND i.deleted_at IS NULL")
+        .bind(ids).bind(project).bind(workspace).fetch_all(&mut *tx).await?;
+    let mut event = crate::activity::ActivityEvent::new(
+        issue,
+        project,
+        workspace,
+        actor,
+        "updated",
+        "updated the parent issue to",
+    );
+    event.field = Some("parent");
+    event.old_value = Some(
+        rows.iter()
+            .find(|(id, _)| Some(*id) == old)
+            .map(|(_, name)| name.as_str())
+            .unwrap_or(""),
+    );
+    event.new_value = Some(
+        rows.iter()
+            .find(|(id, _)| Some(*id) == new)
+            .map(|(_, name)| name.as_str())
+            .unwrap_or(""),
+    );
+    event.old_identifier = old;
+    event.new_identifier = new;
+    crate::activity::record(tx, event).await
 }
 
 const LINK_JSON: &str = "(to_jsonb(l)-'issue_id'-'project_id'-'workspace_id'-'created_by_id'-'updated_by_id') || jsonb_build_object('issue',l.issue_id,'project',l.project_id,'workspace',l.workspace_id,'created_by',l.created_by_id,'updated_by',l.updated_by_id,'created_by_detail',(SELECT jsonb_build_object('id',u.id,'first_name',u.first_name,'last_name',u.last_name,'display_name',u.display_name,'avatar',u.avatar,'is_bot',u.is_bot) FROM users u WHERE u.id=l.created_by_id))";
@@ -1737,6 +1844,7 @@ pub(crate) async fn update(
             "label_ids",
             "start_date",
             "target_date",
+            "parent_id",
         ]
         .contains(&k.as_str())
     }) {
@@ -1758,6 +1866,34 @@ pub(crate) async fn update(
     let old: Option<Value> = sqlx::query_scalar("SELECT to_jsonb(i) FROM issues i WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL FOR UPDATE")
         .bind(issue_id).bind(project_id).bind(p.workspace_id()).fetch_optional(&mut *tx).await?;
     let old = old.ok_or_else(ApiError::not_found)?;
+    if body.get("parent_id").is_some() {
+        let parent = optional_uuid(&body, "parent_id")?;
+        if let Some(parent) = parent {
+            let valid: bool = sqlx::query_scalar("WITH RECURSIVE ancestors AS (SELECT id,parent_id FROM issues WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL UNION SELECT i.id,i.parent_id FROM issues i JOIN ancestors a ON i.id=a.parent_id WHERE i.project_id=$2 AND i.workspace_id=$3 AND i.deleted_at IS NULL) SELECT EXISTS(SELECT 1 FROM ancestors) AND NOT EXISTS(SELECT 1 FROM ancestors WHERE id=$4)")
+                .bind(parent).bind(project_id).bind(p.workspace_id()).bind(issue_id).fetch_one(&mut *tx).await?;
+            if !valid {
+                return Err(ApiError::bad("Invalid parent"));
+            }
+        }
+        let previous = old
+            .get("parent_id")
+            .and_then(Value::as_str)
+            .and_then(|v| Uuid::parse_str(v).ok());
+        if previous != parent {
+            sqlx::query("UPDATE issues SET parent_id=$4 WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL")
+                .bind(issue_id).bind(project_id).bind(p.workspace_id()).bind(parent).execute(&mut *tx).await?;
+            parent_activity(
+                &mut tx,
+                issue_id,
+                project_id,
+                p.workspace_id(),
+                user.id,
+                previous,
+                parent,
+            )
+            .await?;
+        }
+    }
     let start = optional_date(&body, "start_date")?;
     let target = optional_date(&body, "target_date")?;
     let old_start = old
