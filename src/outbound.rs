@@ -188,3 +188,24 @@ mod tests {
         assert_eq!(decrypt("plane-secret", t), "plane-value");
     }
 }
+
+const PROJECT_ADDITION_HTML: &str = include_str!("../assets/email/project_addition.html");
+
+fn esc(v: &str) -> String {
+    v.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#x27;")
+}
+
+/// Plane `project_add_user_email` body: `emails/notifications/project_addition.html` plus a plain-text part.
+/// Returns (html, text). Values are HTML-escaped before substitution.
+pub fn project_addition_mail(project: &str, workspace: &str, email: &str, inviter: &str, url: &str) -> (String, String) {
+    let html = PROJECT_ADDITION_HTML
+        .replace("{{project_name}}", &esc(project))
+        .replace("{{workspace_name}}", &esc(workspace))
+        .replace("{{email}}", &esc(email))
+        .replace("{{inviter_first_name}}", &esc(inviter))
+        .replace("{{project_url}}", &esc(url));
+    let text = format!(
+        "{inviter} invited you to {project} in {workspace} on Plane. Open the project: {url}",
+    );
+    (html, text)
+}

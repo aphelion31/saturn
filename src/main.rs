@@ -1,4 +1,5 @@
 mod activity;
+mod api_log;
 mod api_v1;
 mod api_v1_assets;
 mod api_v1_extra;
@@ -26,10 +27,12 @@ mod notifications;
 mod pages;
 mod projects;
 mod public;
+mod recent_visits;
 mod states;
 mod user_dash;
 mod users;
 mod views;
+mod workspace_seed;
 mod workspaces;
 
 use axum::{
@@ -46,10 +49,15 @@ const MIGRATIONS: &[(&str, &str)] = &[
 ];
 
 pub fn app(state: AppState) -> Router {
-    let api = Router::new()
+    // Public v1 API: X-Api-Key requests are logged to api_activity_logs (Plane APITokenLogMiddleware).
+    let v1 = Router::new()
         .merge(api_v1::routes())
         .merge(api_v1_assets::routes())
         .merge(api_v1_extra::routes())
+        .merge(api_v1_items::routes())
+        .layer(middleware::from_fn_with_state(state.clone(), api_log::log_api_requests));
+    let api = Router::new()
+        .merge(v1)
         .merge(auth::routes())
         .merge(oauth::routes())
         .merge(instance::routes())
@@ -66,7 +74,6 @@ pub fn app(state: AppState) -> Router {
         .merge(assets::routes())
         .merge(public::routes())
         .merge(analytics::routes())
-        .merge(api_v1_items::routes())
         .merge(user_dash::routes())
         .merge(external::routes())
         .route("/api/{*rest}", any(web::not_implemented))
