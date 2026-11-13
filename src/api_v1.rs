@@ -560,7 +560,7 @@ async fn label(
         .bind(label_id).bind(project_id).bind(p.workspace_id()), &st.db).await
 }
 
-fn paginate(rows: Vec<Value>, q: &HashMap<String, String>) -> ApiResult {
+pub(crate) fn paginate(rows: Vec<Value>, q: &HashMap<String, String>) -> ApiResult {
     let limit = match q.get("per_page") {
         Some(v) => v
             .parse::<usize>()

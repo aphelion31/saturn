@@ -1,5 +1,6 @@
 mod api_v1;
 mod api_v1_assets;
+mod api_v1_extra;
 mod auth;
 mod oauth;
 mod common;
@@ -44,6 +45,7 @@ pub fn app(state: AppState) -> Router {
     let api = Router::new()
         .merge(api_v1::routes())
         .merge(api_v1_assets::routes())
+        .merge(api_v1_extra::routes())
         .merge(auth::routes())
         .merge(oauth::routes())
         .merge(instance::routes())
