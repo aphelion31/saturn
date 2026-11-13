@@ -1,7 +1,7 @@
 # Live document persistence over a real websocket.
 call POST "/api/workspaces/$SLUG/projects/$PROJECT/pages/" '{"name":"Live smoke initial"}'
 LIVE_PAGE=$(field '.id')
-LIVE_COOKIE=$(awk '$6 == "sessionid" { print $6 "=" $7; exit }' "$jar")
+LIVE_COOKIE=$(awk '$6 == "session-id" { print $6 "=" $7; exit }' "$jar")
 [[ -n "$LIVE_COOKIE" ]] || { echo 'missing session cookie' >&2; exit 1; }
 ./target/debug/examples/live_ws_probe "$BASE" "$SLUG" "$PROJECT" "$LIVE_PAGE" "$LIVE_COOKIE"
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/pages/$LIVE_PAGE/"

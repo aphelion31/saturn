@@ -88,7 +88,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let port = url.port_or_known_default().ok_or("missing port")?;
     let mut s = tokio::net::TcpStream::connect((host, port)).await?;
     let req = format!(
-        "GET /live/collaboration?workspaceSlug={}&projectId={}&documentType=page HTTP/1.1\r\nHost: {}:{}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nCookie: {}\r\n\r\n",
+        "GET /live/collaboration?workspaceSlug={}&projectId={}&documentType=project_page HTTP/1.1\r\nHost: {}:{}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nCookie: {}\r\n\r\n",
         args[2], args[3], host, port, args[5]
     );
     s.write_all(req.as_bytes()).await?;
