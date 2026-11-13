@@ -7,16 +7,13 @@ if [[ "$code" == 400 ]]; then
 else
 psql "${DATABASE_URL:-postgres://localhost/saturn}" -qc "DELETE FROM webhooks WHERE url='http://127.0.0.1:$WH_PORT/'"
 WH_CAPTURE=$(mktemp)
-# Minimal one-shot HTTP sink on IPv4 loopback. OpenBSD netcat (Ubuntu CI) takes `-l HOST PORT`;
-# macOS netcat takes `-l PORT` (binds all); try the explicit form first.
-WH_RESP='HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK'
-(printf "$WH_RESP" | nc -4 -l 127.0.0.1 "$WH_PORT" > "$WH_CAPTURE" 2>/dev/null \
-  || printf "$WH_RESP" | nc -l "$WH_PORT" > "$WH_CAPTURE") &
+# Test HTTP sink (examples/http_sink.rs): portable, accepts every retry, records raw requests.
+WH_SINK=${WH_SINK:-./target/debug/examples/http_sink}
+[[ -x "$WH_SINK" ]] || cargo build -q --example http_sink
+"$WH_SINK" "127.0.0.1:$WH_PORT" "$WH_CAPTURE" 2>/dev/null &
 WH_PID=$!
-for _ in {1..30}; do
-  { ss -ltn 2>/dev/null || netstat -an 2>/dev/null; } | grep -qE "[.:]$WH_PORT[[:space:]].*LISTEN|[.:]$WH_PORT[[:space:]]+[^ ]+[[:space:]]+LISTEN|LISTEN.*[.:]$WH_PORT[[:space:]]" && break
-  sleep 0.1
-done
+for _ in {1..50}; do curl -s -o /dev/null "http://127.0.0.1:$WH_PORT/" && break; sleep 0.1; done
+: > "$WH_CAPTURE"
 call POST "/api/workspaces/$SLUG/webhooks/" '{"url":"http://127.0.0.1:'"$WH_PORT"'/","issue":true,"is_active":true}'
 WH_ID=$(field '.id')
 call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/" '{"name":"Webhook smoke"}'
