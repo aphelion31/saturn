@@ -17,7 +17,7 @@ use crate::workitems::{self, ACTIVE, Arg, Base, Scope};
 
 fn uuid_list(body: &Value, field: &str) -> Result<Vec<Uuid>, ApiError> {
     match body.get(field) {
-        None => Ok(Vec::new()),
+        None | Some(Value::Null) => Ok(Vec::new()),
         Some(Value::Array(values)) => values
             .iter()
             .map(|v| {
@@ -2317,6 +2317,19 @@ async fn create_issue(
 ) -> Result<Value, ApiError> {
     let project_id = p.project_id;
     let tx = &mut **tx;
+    // Plane's web client posts its whole form model (`createIssuePayload`): read-only keys such as
+    // `project_id`/`workspace_id`/`id` are ignored by Plane's serializer, so drop them here too, and an
+    // empty `state_id` means "use the default state".
+    let mut body = body.clone();
+    if let Some(obj) = body.as_object_mut() {
+        for k in ["id", "project_id", "workspace_id", "tempId", "sequence_id", "sub_issues_count", "attachment_count", "link_count"] {
+            obj.remove(k);
+        }
+        if obj.get("state_id").and_then(Value::as_str) == Some("") {
+            obj.remove("state_id");
+        }
+    }
+    let body = &body;
     let name = s(&body, "name")
         .filter(|n| !n.trim().is_empty() && n.chars().count() <= 255)
         .ok_or_else(|| ApiError::bad("A name of at most 255 characters is required"))?;

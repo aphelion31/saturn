@@ -5,6 +5,9 @@ call GET "/api/workspaces/$SLUG/projects/$PROJECT/issues/list/"
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/v2/issues/"
 call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/" '{"name":"Smoke issue"}'
 ISSUE=$(field '.id')
+# Exact body Plane's create modal sends (read-only project_id, empty state_id, null module_ids).
+call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/" '{"project_id":"'"$PROJECT"'","type_id":null,"name":"Modal issue","description_html":"<p></p>","estimate_point":null,"state_id":"","parent_id":null,"priority":"none","assignee_ids":[],"label_ids":[],"cycle_id":null,"module_ids":null,"start_date":null,"target_date":null}'
+[[ "$(field '.state_id')" != "null" && "$(field '.state_id')" != "" ]] || { echo "✖ modal create did not get default state" >&2; exit 1; }
 call PATCH "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/" '{"start_date":"2030-01-01","target_date":"2030-01-20"}'
 call PATCH "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/" '{"target_date":"2030-01-10"}'
 [[ "$(field '.target_date')" == '2030-01-10' ]]
