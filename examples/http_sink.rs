@@ -38,9 +38,13 @@ async fn main() -> std::io::Result<()> {
                 let _ = f.write_all(&got);
                 let _ = f.write_all(b"\n");
             }
-            let _ = sock
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
-                .await;
+            let body = std::env::var("HTTP_SINK_BODY").unwrap_or_else(|_| "OK".into());
+            let ct = std::env::var("HTTP_SINK_CT").unwrap_or_else(|_| "text/html; charset=utf-8".into());
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
         });
     }
 }

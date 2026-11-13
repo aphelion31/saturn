@@ -1492,6 +1492,7 @@ async fn link_create(
     event.new_identifier = Some(id);
     crate::activity::record(&mut *tx, event).await?;
     tx.commit().await?;
+    crate::side_effects::spawn_crawl_work_item_link_title(st.clone(), p.workspace_id(), id, url);
     let Json(v) = link_detail(State(st), user, Path((slug, pid, iid, id))).await?;
     created(v)
 }
@@ -1525,6 +1526,9 @@ async fn link_update(
         crate::activity::record(&mut *tx, event).await?;
     }
     tx.commit().await?;
+    if let Some(url) = url {
+        crate::side_effects::spawn_crawl_work_item_link_title(st.clone(), p.workspace_id(), id, url);
+    }
     link_detail(State(st), user, Path((slug, pid, iid, id))).await
 }
 async fn link_delete(

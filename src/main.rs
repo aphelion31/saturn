@@ -12,6 +12,7 @@ mod notify;
 mod oauth;
 mod outbound;
 mod session;
+mod side_effects;
 mod web;
 mod webhook_out;
 mod workitems;
