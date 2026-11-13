@@ -1512,6 +1512,7 @@ async fn intake_issue_create(
     .execute(&mut *tx)
     .await?;
 
+    crate::activity::record(&mut *tx, crate::activity::ActivityEvent::new(issue_id, b.project_id, b.workspace_id, user.id, "created", "created the issue")).await?;
     tx.commit().await?;
 
     let out: (Value,) = sqlx::query_as(

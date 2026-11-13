@@ -1055,6 +1055,7 @@ async fn intake_issues_create(
     .bind(user.id)
     .fetch_one(&mut *tx)
     .await?;
+    crate::activity::record(&mut *tx, crate::activity::ActivityEvent::new(issue_id, project_id, p.workspace_id(), user.id, "created", "created the issue")).await?;
     tx.commit().await?;
     let v = intake_issue_detail(&st.db, ii_id, project_id, p.workspace_id()).await?;
     created(v)
