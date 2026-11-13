@@ -1,0 +1,705 @@
+{
+ "basic": {
+  "input": "<p>Hello <strong>world</strong> and <em>it</em> <u>u</u> <s>s</s> <code>c</code> <a href=\"https://x.dev\">link</a></p>",
+  "binary": "AhrV57/zBgAHAQdkZWZhdWx0AwlwYXJhZ3JhcGgHANXnv/MGAAYEANXnv/MGAQZIZWxsbyCG1ee/8wYHBGJvbGQCe32E1ee/8wYIBXdvcmxkhtXnv/MGDQRib2xkBG51bGyE1ee/8wYOBSBhbmQghtXnv/MGEwZpdGFsaWMCe32E1ee/8wYUAml0htXnv/MGFgZpdGFsaWMEbnVsbITV57/zBhcBIIbV57/zBhgJdW5kZXJsaW5lAnt9hNXnv/MGGQF1htXnv/MGGgl1bmRlcmxpbmUEbnVsbITV57/zBhsBIIbV57/zBhwGc3RyaWtlAnt9hNXnv/MGHQFzhtXnv/MGHgZzdHJpa2UEbnVsbITV57/zBh8BIIbV57/zBiAEY29kZQJ7fYTV57/zBiEBY4bV57/zBiIEY29kZQRudWxshNXnv/MGIwEghtXnv/MGJARsaW5rywF7ImhyZWYiOiJodHRwczovL3guZGV2IiwidGFyZ2V0IjoiX2JsYW5rIiwicmVsIjoibm9vcGVuZXIgbm9yZWZlcnJlciBub2ZvbGxvdyIsImNsYXNzIjoidGV4dC1hY2NlbnQtc2Vjb25kYXJ5IHVuZGVybGluZSB1bmRlcmxpbmUtb2Zmc2V0LVszcHhdIGhvdmVyOnRleHQtYWNjZW50LXByaW1hcnkgdHJhbnNpdGlvbi1jb2xvcnMgY3Vyc29yLXBvaW50ZXIifYTV57/zBiUEbGlua4bV57/zBikEbGluawRudWxsBIiGsZoGAAcBBXRpdGxlAwdoZWFkaW5nBwCIhrGaBgAGBACIhrGaBgELVGl0bGUgYmFzaWMoAIiGsZoGAAVsZXZlbAF9AQA=",
+  "html": "<p class=\"editor-paragraph-block\">Hello <strong>world</strong> and <em>it</em> <u>u</u> <s>s</s> <code class=\"rounded-sm bg-layer-3 px-[6px] py-[1.5px] font-code font-medium text-(--extended-color-orange-600) border-[0.5px] border-subtle\" spellcheck=\"false\">c</code> <a target=\"_blank\" rel=\"noopener noreferrer nofollow\" class=\"text-accent-secondary underline underline-offset-[3px] hover:text-accent-primary transition-colors cursor-pointer\" href=\"https://x.dev\">link</a></p>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "paragraph",
+     "attrs": {
+      "textAlign": null
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "Hello "
+      },
+      {
+       "type": "text",
+       "marks": [
+        {
+         "type": "bold"
+        }
+       ],
+       "text": "world"
+      },
+      {
+       "type": "text",
+       "text": " and "
+      },
+      {
+       "type": "text",
+       "marks": [
+        {
+         "type": "italic"
+        }
+       ],
+       "text": "it"
+      },
+      {
+       "type": "text",
+       "text": " "
+      },
+      {
+       "type": "text",
+       "marks": [
+        {
+         "type": "underline"
+        }
+       ],
+       "text": "u"
+      },
+      {
+       "type": "text",
+       "text": " "
+      },
+      {
+       "type": "text",
+       "marks": [
+        {
+         "type": "strike"
+        }
+       ],
+       "text": "s"
+      },
+      {
+       "type": "text",
+       "text": " "
+      },
+      {
+       "type": "text",
+       "marks": [
+        {
+         "type": "code"
+        }
+       ],
+       "text": "c"
+      },
+      {
+       "type": "text",
+       "text": " "
+      },
+      {
+       "type": "text",
+       "marks": [
+        {
+         "type": "link",
+         "attrs": {
+          "href": "https://x.dev",
+          "target": "_blank",
+          "rel": "noopener noreferrer nofollow",
+          "class": "text-accent-secondary underline underline-offset-[3px] hover:text-accent-primary transition-colors cursor-pointer"
+         }
+        }
+       ],
+       "text": "link"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "headings": {
+  "input": "<h1>One</h1><h2>Two</h2><h3>Three</h3><p></p>",
+  "binary": "Ag3qqfe/DgAHAQdkZWZhdWx0AwdoZWFkaW5nBwDqqfe/DgAGBADqqfe/DgEDT25lKADqqfe/DgAFbGV2ZWwBfQGH6qn3vw4AAwdoZWFkaW5nBwDqqfe/DgYGBADqqfe/DgcDVHdvKADqqfe/DgYFbGV2ZWwBfQKH6qn3vw4GAwdoZWFkaW5nBwDqqfe/DgwGBADqqfe/Dg0FVGhyZWUoAOqp978ODAVsZXZlbAF9A4fqqfe/DgwDCXBhcmFncmFwaAS18fW8DgAHAQV0aXRsZQMHaGVhZGluZwcAtfH1vA4ABgQAtfH1vA4BDlRpdGxlIGhlYWRpbmdzKAC18fW8DgAFbGV2ZWwBfQEA",
+  "html": "<h1 class=\"editor-heading-block\">One</h1><h2 class=\"editor-heading-block\">Two</h2><h3 class=\"editor-heading-block\">Three</h3><p class=\"editor-paragraph-block\"></p>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "heading",
+     "attrs": {
+      "textAlign": null,
+      "level": 1
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "One"
+      }
+     ]
+    },
+    {
+     "type": "heading",
+     "attrs": {
+      "textAlign": null,
+      "level": 2
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "Two"
+      }
+     ]
+    },
+    {
+     "type": "heading",
+     "attrs": {
+      "textAlign": null,
+      "level": 3
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "Three"
+      }
+     ]
+    },
+    {
+     "type": "paragraph",
+     "attrs": {
+      "textAlign": null
+     }
+    }
+   ]
+  }
+ },
+ "lists": {
+  "input": "<ul><li><p>a</p></li><li><p>b</p><ul><li><p>c</p></li></ul></li></ul><ol><li><p>1</p></li></ol>",
+  "binary": "AhSk5YHwCgAHAQdkZWZhdWx0AwpidWxsZXRMaXN0BwCk5YHwCgADCGxpc3RJdGVtBwCk5YHwCgEDCXBhcmFncmFwaAcApOWB8AoCBgQApOWB8AoDAWGHpOWB8AoBAwhsaXN0SXRlbQcApOWB8AoFAwlwYXJhZ3JhcGgHAKTlgfAKBgYEAKTlgfAKBwFih6TlgfAKBgMKYnVsbGV0TGlzdAcApOWB8AoJAwhsaXN0SXRlbQcApOWB8AoKAwlwYXJhZ3JhcGgHAKTlgfAKCwYEAKTlgfAKDAFjh6TlgfAKAAMLb3JkZXJlZExpc3QHAKTlgfAKDgMIbGlzdEl0ZW0HAKTlgfAKDwMJcGFyYWdyYXBoBwCk5YHwChAGBACk5YHwChEBMSgApOWB8AoOBXN0YXJ0AX0BBLXEqO8DAAcBBXRpdGxlAwdoZWFkaW5nBwC1xKjvAwAGBAC1xKjvAwELVGl0bGUgbGlzdHMoALXEqO8DAAVsZXZlbAF9AQA=",
+  "html": "<ul class=\"list-disc pl-7 space-y-(--list-spacing-y)\"><li class=\"not-prose space-y-2\"><p class=\"editor-paragraph-block\">a</p></li><li class=\"not-prose space-y-2\"><p class=\"editor-paragraph-block\">b</p><ul class=\"list-disc pl-7 space-y-(--list-spacing-y)\"><li class=\"not-prose space-y-2\"><p class=\"editor-paragraph-block\">c</p></li></ul></li></ul><ol class=\"list-decimal pl-7 space-y-(--list-spacing-y)\"><li class=\"not-prose space-y-2\"><p class=\"editor-paragraph-block\">1</p></li></ol>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "bulletList",
+     "content": [
+      {
+       "type": "listItem",
+       "content": [
+        {
+         "type": "paragraph",
+         "attrs": {
+          "textAlign": null
+         },
+         "content": [
+          {
+           "type": "text",
+           "text": "a"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "type": "listItem",
+       "content": [
+        {
+         "type": "paragraph",
+         "attrs": {
+          "textAlign": null
+         },
+         "content": [
+          {
+           "type": "text",
+           "text": "b"
+          }
+         ]
+        },
+        {
+         "type": "bulletList",
+         "content": [
+          {
+           "type": "listItem",
+           "content": [
+            {
+             "type": "paragraph",
+             "attrs": {
+              "textAlign": null
+             },
+             "content": [
+              {
+               "type": "text",
+               "text": "c"
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "type": "orderedList",
+     "attrs": {
+      "start": 1,
+      "type": null
+     },
+     "content": [
+      {
+       "type": "listItem",
+       "content": [
+        {
+         "type": "paragraph",
+         "attrs": {
+          "textAlign": null
+         },
+         "content": [
+          {
+           "type": "text",
+           "text": "1"
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "tasks": {
+  "input": "<ul data-type=\"taskList\"><li data-type=\"taskItem\" data-checked=\"true\"><p>done</p></li><li data-type=\"taskItem\" data-checked=\"false\"><p>todo</p></li></ul>",
+  "binary": "AgTmybC3DQAHAQV0aXRsZQMHaGVhZGluZwcA5smwtw0ABgQA5smwtw0BC1RpdGxlIHRhc2tzKADmybC3DQAFbGV2ZWwBfQELqL/dsQsABwEHZGVmYXVsdAMIdGFza0xpc3QHAKi/3bELAAMIdGFza0l0ZW0HAKi/3bELAQMJcGFyYWdyYXBoBwCov92xCwIGBACov92xCwMEZG9uZSgAqL/dsQsBB2NoZWNrZWQBeIeov92xCwEDCHRhc2tJdGVtBwCov92xCwkDCXBhcmFncmFwaAcAqL/dsQsKBgQAqL/dsQsLBHRvZG8oAKi/3bELCQdjaGVja2VkAXkA",
+  "html": "<ul class=\"not-prose pl-2 space-y-2\" data-type=\"taskList\"><li class=\"flex\" data-checked=\"true\" data-type=\"taskItem\"><label><input type=\"checkbox\" checked=\"checked\"><span></span></label><div><p class=\"editor-paragraph-block\">done</p></div></li><li class=\"flex\" data-checked=\"false\" data-type=\"taskItem\"><label><input type=\"checkbox\"><span></span></label><div><p class=\"editor-paragraph-block\">todo</p></div></li></ul>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "taskList",
+     "content": [
+      {
+       "type": "taskItem",
+       "attrs": {
+        "checked": true
+       },
+       "content": [
+        {
+         "type": "paragraph",
+         "attrs": {
+          "textAlign": null
+         },
+         "content": [
+          {
+           "type": "text",
+           "text": "done"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "type": "taskItem",
+       "attrs": {
+        "checked": false
+       },
+       "content": [
+        {
+         "type": "paragraph",
+         "attrs": {
+          "textAlign": null
+         },
+         "content": [
+          {
+           "type": "text",
+           "text": "todo"
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "quote_code": {
+  "input": "<blockquote><p>q</p></blockquote><pre><code class=\"language-rust\">fn main() {}\nx &lt; y</code></pre><hr>",
+  "binary": "AgmzkJ+7DQAHAQdkZWZhdWx0AwpibG9ja3F1b3RlBwCzkJ+7DQADCXBhcmFncmFwaAcAs5Cfuw0BBgQAs5Cfuw0CAXGHs5Cfuw0AAwljb2RlQmxvY2sHALOQn7sNBAYEALOQn7sNBRJmbiBtYWluKCkge30KeCA8IHkoALOQn7sNBAhsYW5ndWFnZQF3BHJ1c3SHs5Cfuw0EAw5ob3Jpem9udGFsUnVsZQT9/MTxAwAHAQV0aXRsZQMHaGVhZGluZwcA/fzE8QMABgQA/fzE8QMBEFRpdGxlIHF1b3RlX2NvZGUoAP38xPEDAAVsZXZlbAF9AQA=",
+  "html": "<blockquote><p class=\"editor-paragraph-block\">q</p></blockquote><pre><code class=\"language-rust\">fn main() {}\nx &lt; y</code></pre><div class=\"py-4 border-strong-1\" data-type=\"horizontalRule\"><div></div></div>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "blockquote",
+     "content": [
+      {
+       "type": "paragraph",
+       "attrs": {
+        "textAlign": null
+       },
+       "content": [
+        {
+         "type": "text",
+         "text": "q"
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "type": "codeBlock",
+     "attrs": {
+      "language": "rust"
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "fn main() {}\nx < y"
+      }
+     ]
+    },
+    {
+     "type": "horizontalRule"
+    }
+   ]
+  }
+ },
+ "mention": {
+  "input": "<p>hi <mention-component id=\"m1\" entity_identifier=\"11111111-1111-1111-1111-111111111111\" entity_name=\"user_mention\"></mention-component></p>",
+  "binary": "AgTp4ojOCgAHAQV0aXRsZQMHaGVhZGluZwcA6eKIzgoABgQA6eKIzgoBDVRpdGxlIG1lbnRpb24oAOniiM4KAAVsZXZlbAF9AQe5lPvBBwAHAQdkZWZhdWx0AwlwYXJhZ3JhcGgHALmU+8EHAAYEALmU+8EHAQNoaSCHuZT7wQcBAwdtZW50aW9uKAC5lPvBBwUCaWQBdwJtMSgAuZT7wQcFEWVudGl0eV9pZGVudGlmaWVyAXckMTExMTExMTEtMTExMS0xMTExLTExMTEtMTExMTExMTExMTExKAC5lPvBBwULZW50aXR5X25hbWUBdwx1c2VyX21lbnRpb24A",
+  "html": "<p class=\"editor-paragraph-block\">hi <mention-component id=\"m1\" entity_identifier=\"11111111-1111-1111-1111-111111111111\" entity_name=\"user_mention\"></mention-component></p>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "paragraph",
+     "attrs": {
+      "textAlign": null
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "hi "
+      },
+      {
+       "type": "mention",
+       "attrs": {
+        "id": "m1",
+        "entity_identifier": "11111111-1111-1111-1111-111111111111",
+        "entity_name": "user_mention"
+       }
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "image": {
+  "input": "<image-component src=\"22222222-2222-2222-2222-222222222222\" width=\"35%\" height=\"auto\" aspectratio=\"1.5\" alignment=\"center\" id=\"img1\"></image-component>",
+  "binary": "AgiRjojdCwAHAQdkZWZhdWx0Aw5pbWFnZUNvbXBvbmVudCgAkY6I3QsAA3NyYwF3JDIyMjIyMjIyLTIyMjItMjIyMi0yMjIyLTIyMjIyMjIyMjIyMigAkY6I3QsABXdpZHRoAXcDMzUlKACRjojdCwAGaGVpZ2h0AXcEYXV0bygAkY6I3QsAAmlkAXcEaW1nMSgAkY6I3QsAC2FzcGVjdFJhdGlvAXw/wAAAKACRjojdCwAJYWxpZ25tZW50AXcGY2VudGVyKACRjojdCwAGc3RhdHVzAXcHcGVuZGluZwTo0dXICgAHAQV0aXRsZQMHaGVhZGluZwcA6NHVyAoABgQA6NHVyAoBC1RpdGxlIGltYWdlKADo0dXICgAFbGV2ZWwBfQEA",
+  "html": "<image-component src=\"22222222-2222-2222-2222-222222222222\" width=\"35%\" height=\"auto\" id=\"img1\" aspectratio=\"1.5\" alignment=\"center\" status=\"pending\"></image-component>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "imageComponent",
+     "attrs": {
+      "src": "22222222-2222-2222-2222-222222222222",
+      "alt": null,
+      "title": null,
+      "width": "35%",
+      "height": "auto",
+      "id": "img1",
+      "aspectRatio": 1.5,
+      "alignment": "center",
+      "status": "pending"
+     }
+    }
+   ]
+  }
+ },
+ "callout": {
+  "input": "<div data-block-type=\"callout-component\" data-icon-color=\"#6d7b8a\" data-icon-name=\"FileText\" data-emoji-unicode=\"128512\" data-emoji-url=\"https://cdn.jsdelivr.net/npm/emoji-datasource-apple/img/apple/64/1f600.png\" data-logo-in-use=\"emoji\" data-background=\"gray\"><p>note</p></div>",
+  "binary": "AgTAm7GKDQAHAQV0aXRsZQMHaGVhZGluZwcAwJuxig0ABgQAwJuxig0BDVRpdGxlIGNhbGxvdXQoAMCbsYoNAAVsZXZlbAF9AQuDt4vaCwAHAQdkZWZhdWx0AxBjYWxsb3V0Q29tcG9uZW50BwCDt4vaCwADCXBhcmFncmFwaAcAg7eL2gsBBgQAg7eL2gsCBG5vdGUoAIO3i9oLAA9kYXRhLWljb24tY29sb3IBdwcjNmQ3YjhhKACDt4vaCwAOZGF0YS1pY29uLW5hbWUBdwhGaWxlVGV4dCgAg7eL2gsAEmRhdGEtZW1vamktdW5pY29kZQF9gNgPKACDt4vaCwAOZGF0YS1lbW9qaS11cmwBd0podHRwczovL2Nkbi5qc2RlbGl2ci5uZXQvbnBtL2Vtb2ppLWRhdGFzb3VyY2UtYXBwbGUvaW1nL2FwcGxlLzY0LzFmNjAwLnBuZygAg7eL2gsAEGRhdGEtbG9nby1pbi11c2UBdwVlbW9qaSgAg7eL2gsAD2RhdGEtYmFja2dyb3VuZAF3BGdyYXkoAIO3i9oLAA9kYXRhLWJsb2NrLXR5cGUBdxFjYWxsb3V0LWNvbXBvbmVudAA=",
+  "html": "<div data-icon-color=\"#6d7b8a\" data-icon-name=\"FileText\" data-emoji-unicode=\"128512\" data-emoji-url=\"https://cdn.jsdelivr.net/npm/emoji-datasource-apple/img/apple/64/1f600.png\" data-logo-in-use=\"emoji\" data-background=\"gray\" data-block-type=\"callout-component\"><p class=\"editor-paragraph-block\">note</p></div>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "calloutComponent",
+     "attrs": {
+      "id": null,
+      "data-icon-color": "#6d7b8a",
+      "data-icon-name": "FileText",
+      "data-emoji-unicode": 128512,
+      "data-emoji-url": "https://cdn.jsdelivr.net/npm/emoji-datasource-apple/img/apple/64/1f600.png",
+      "data-logo-in-use": "emoji",
+      "data-background": "gray",
+      "data-block-type": "callout-component"
+     },
+     "content": [
+      {
+       "type": "paragraph",
+       "attrs": {
+        "textAlign": null
+       },
+       "content": [
+        {
+         "type": "text",
+         "text": "note"
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "table": {
+  "input": "<table><tbody><tr><th><p>h</p></th><th><p>h2</p></th></tr><tr><td><p>c</p></td><td><p>d</p></td></tr></tbody></table>",
+  "binary": "AgSFh7uDCgAHAQV0aXRsZQMHaGVhZGluZwcAhYe7gwoABgQAhYe7gwoBC1RpdGxlIHRhYmxlKACFh7uDCgAFbGV2ZWwBfQEh6djZ4AMABwEHZGVmYXVsdAMFdGFibGUHAOnY2eADAAMIdGFibGVSb3cHAOnY2eADAQMLdGFibGVIZWFkZXIHAOnY2eADAgMJcGFyYWdyYXBoBwDp2NngAwMGBADp2NngAwQBaCgA6djZ4AMCB2NvbHNwYW4BfQEoAOnY2eADAgdyb3dzcGFuAX0BKADp2NngAwIIY29sd2lkdGgBdQF9lgIoAOnY2eADAgpiYWNrZ3JvdW5kAXcEbm9uZYfp2NngAwIDC3RhYmxlSGVhZGVyBwDp2NngAwoDCXBhcmFncmFwaAcA6djZ4AMLBgQA6djZ4AMMAmgyKADp2NngAwoHY29sc3BhbgF9ASgA6djZ4AMKB3Jvd3NwYW4BfQEoAOnY2eADCghjb2x3aWR0aAF1AX2WAigA6djZ4AMKCmJhY2tncm91bmQBdwRub25lh+nY2eADAQMIdGFibGVSb3cHAOnY2eADEwMJdGFibGVDZWxsBwDp2NngAxQDCXBhcmFncmFwaAcA6djZ4AMVBgQA6djZ4AMWAWMoAOnY2eADFAdjb2xzcGFuAX0BKADp2NngAxQHcm93c3BhbgF9ASgA6djZ4AMUCGNvbHdpZHRoAXUBfZYCh+nY2eADFAMJdGFibGVDZWxsBwDp2NngAxsDCXBhcmFncmFwaAcA6djZ4AMcBgQA6djZ4AMdAWQoAOnY2eADGwdjb2xzcGFuAX0BKADp2NngAxsHcm93c3BhbgF9ASgA6djZ4AMbCGNvbHdpZHRoAXUBfZYCAA==",
+  "html": "<table><tbody><tr style=\"\"><th colspan=\"1\" rowspan=\"1\" colwidth=\"150\" background=\"none\" style=\"background-color: none;\"><p class=\"editor-paragraph-block\">h</p></th><th colspan=\"1\" rowspan=\"1\" colwidth=\"150\" background=\"none\" style=\"background-color: none;\"><p class=\"editor-paragraph-block\">h2</p></th></tr><tr style=\"\"><td colspan=\"1\" rowspan=\"1\" colwidth=\"150\" style=\"\"><p class=\"editor-paragraph-block\">c</p></td><td colspan=\"1\" rowspan=\"1\" colwidth=\"150\" style=\"\"><p class=\"editor-paragraph-block\">d</p></td></tr></tbody></table>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "table",
+     "content": [
+      {
+       "type": "tableRow",
+       "attrs": {
+        "background": null,
+        "textColor": null
+       },
+       "content": [
+        {
+         "type": "tableHeader",
+         "attrs": {
+          "colspan": 1,
+          "rowspan": 1,
+          "colwidth": [
+           150
+          ],
+          "background": "none"
+         },
+         "content": [
+          {
+           "type": "paragraph",
+           "attrs": {
+            "textAlign": null
+           },
+           "content": [
+            {
+             "type": "text",
+             "text": "h"
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "type": "tableHeader",
+         "attrs": {
+          "colspan": 1,
+          "rowspan": 1,
+          "colwidth": [
+           150
+          ],
+          "background": "none"
+         },
+         "content": [
+          {
+           "type": "paragraph",
+           "attrs": {
+            "textAlign": null
+           },
+           "content": [
+            {
+             "type": "text",
+             "text": "h2"
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "type": "tableRow",
+       "attrs": {
+        "background": null,
+        "textColor": null
+       },
+       "content": [
+        {
+         "type": "tableCell",
+         "attrs": {
+          "colspan": 1,
+          "rowspan": 1,
+          "colwidth": [
+           150
+          ],
+          "background": null,
+          "textColor": null
+         },
+         "content": [
+          {
+           "type": "paragraph",
+           "attrs": {
+            "textAlign": null
+           },
+           "content": [
+            {
+             "type": "text",
+             "text": "c"
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "type": "tableCell",
+         "attrs": {
+          "colspan": 1,
+          "rowspan": 1,
+          "colwidth": [
+           150
+          ],
+          "background": null,
+          "textColor": null
+         },
+         "content": [
+          {
+           "type": "paragraph",
+           "attrs": {
+            "textAlign": null
+           },
+           "content": [
+            {
+             "type": "text",
+             "text": "d"
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "color": {
+  "input": "<p><span style=\"color: var(--editor-colors-red-text)\" data-text-color=\"red\">red</span> <span data-background-color=\"blue\" style=\"background-color: var(--editor-colors-blue-background)\">bg</span></p>",
+  "binary": "AgTNqJq9CAAHAQV0aXRsZQMHaGVhZGluZwcAzaiavQgABgQAzaiavQgBC1RpdGxlIGNvbG9yKADNqJq9CAAFbGV2ZWwBfQEJk4CSoAcABwEHZGVmYXVsdAMJcGFyYWdyYXBoBwCTgJKgBwAGBgCTgJKgBwEJdGV4dFN0eWxlAnt9hJOAkqAHAgNyZWSGk4CSoAcFCXRleHRTdHlsZQRudWxshJOAkqAHBgEghpOAkqAHBwl0ZXh0U3R5bGUCe32Ek4CSoAcIAmJnhpOAkqAHCgl0ZXh0U3R5bGUEbnVsbAA=",
+  "html": "<p class=\"editor-paragraph-block\"><span>red</span> <span>bg</span></p>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "paragraph",
+     "attrs": {
+      "textAlign": null
+     },
+     "content": [
+      {
+       "type": "text",
+       "marks": [
+        {
+         "type": "textStyle"
+        }
+       ],
+       "text": "red"
+      },
+      {
+       "type": "text",
+       "text": " "
+      },
+      {
+       "type": "text",
+       "marks": [
+        {
+         "type": "textStyle"
+        }
+       ],
+       "text": "bg"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "align": {
+  "input": "<p style=\"text-align: center\">mid</p><h2 style=\"text-align: right\">r</h2>",
+  "binary": "Agm6vNndDgAHAQdkZWZhdWx0AwlwYXJhZ3JhcGgHALq82d0OAAYEALq82d0OAQNtaWQoALq82d0OAAl0ZXh0QWxpZ24BdwZjZW50ZXKHurzZ3Q4AAwdoZWFkaW5nBwC6vNndDgYGBAC6vNndDgcBcigAurzZ3Q4GCXRleHRBbGlnbgF3BXJpZ2h0KAC6vNndDgYFbGV2ZWwBfQIEivuo+A0ABwEFdGl0bGUDB2hlYWRpbmcHAIr7qPgNAAYEAIr7qPgNAQtUaXRsZSBhbGlnbigAivuo+A0ABWxldmVsAX0BAA==",
+  "html": "<p class=\"editor-paragraph-block\" style=\"text-align: center;\">mid</p><h2 class=\"editor-heading-block\" style=\"text-align: right;\">r</h2>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "paragraph",
+     "attrs": {
+      "textAlign": "center"
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "mid"
+      }
+     ]
+    },
+    {
+     "type": "heading",
+     "attrs": {
+      "textAlign": "right",
+      "level": 2
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "r"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "breaks": {
+  "input": "<p>a<br>b</p>",
+  "binary": "AgSowcenBAAHAQV0aXRsZQMHaGVhZGluZwcAqMHHpwQABgQAqMHHpwQBDFRpdGxlIGJyZWFrcygAqMHHpwQABWxldmVsAX0BBuL7thQABwEHZGVmYXVsdAMJcGFyYWdyYXBoBwDi+7YUAAYEAOL7thQBAWGH4vu2FAEDCWhhcmRCcmVha4fi+7YUAwYEAOL7thQEAWIA",
+  "html": "<p class=\"editor-paragraph-block\">a<br>b</p>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "paragraph",
+     "attrs": {
+      "textAlign": null
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "a"
+      },
+      {
+       "type": "hardBreak"
+      },
+      {
+       "type": "text",
+       "text": "b"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "escape": {
+  "input": "<p>&lt;script&gt;alert(1)&lt;/script&gt; &amp; \"q\"</p>",
+  "binary": "AgOpxqXcDQAHAQdkZWZhdWx0AwlwYXJhZ3JhcGgHAKnGpdwNAAYEAKnGpdwNAR88c2NyaXB0PmFsZXJ0KDEpPC9zY3JpcHQ+ICYgInEiBPHYtu4IAAcBBXRpdGxlAwdoZWFkaW5nBwDx2LbuCAAGBADx2LbuCAEMVGl0bGUgZXNjYXBlKADx2LbuCAAFbGV2ZWwBfQEA",
+  "html": "<p class=\"editor-paragraph-block\">&lt;script&gt;alert(1)&lt;/script&gt; &amp; \"q\"</p>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "paragraph",
+     "attrs": {
+      "textAlign": null
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "<script>alert(1)</script> & \"q\""
+      }
+     ]
+    }
+   ]
+  }
+ }
+}
