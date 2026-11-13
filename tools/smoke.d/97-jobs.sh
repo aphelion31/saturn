@@ -65,17 +65,48 @@ echo "✔ archive_and_close_old_issues archived old completed issue and logged a
 # -----------------------------------------------------------------------------
 # 3. hard_delete
 # -----------------------------------------------------------------------------
-echo "== [jobs] fixture: old soft-deleted issue"
+echo "== [jobs] fixture: old soft-deleted issue with comment + old soft-deleted project"
 DEL_ISSUE_ID=$(query "INSERT INTO issues (project_id, workspace_id, name, created_by_id, updated_by_id, state_id, deleted_at) VALUES ('$PROJECT', '$WS_ID', 'Old Deleted Issue', '$USER_ID', '$USER_ID', '$COMPLETED_STATE_ID', now() - interval '90 days') RETURNING id")
+DEL_COMMENT_ID=$(query "INSERT INTO issue_comments (issue_id, project_id, workspace_id, actor_id, comment_json, comment_html, created_by_id, updated_by_id) VALUES ('$DEL_ISSUE_ID', '$PROJECT', '$WS_ID', '$USER_ID', '{}'::jsonb, '<p>bye</p>', '$USER_ID', '$USER_ID') RETURNING id")
+
+call POST "/api/workspaces/$SLUG/projects/" '{"name":"HardDeleteProj","identifier":"HDP"}'
+PROJECT2=$(field '.id')
+call POST "/api/workspaces/$SLUG/projects/$PROJECT2/issue-labels/" '{"name":"HDLabel","color":"#ff0000"}'
+LBL2=$(field '.id')
+call POST "/api/workspaces/$SLUG/projects/$PROJECT2/cycles/" '{"name":"HDCycle"}'
+CYC2=$(field '.id')
+call POST "/api/workspaces/$SLUG/projects/$PROJECT2/issues/" "{\"name\":\"HDIssue\",\"label_ids\":[\"$LBL2\"]}"
+ISS2=$(field '.id')
+call POST "/api/workspaces/$SLUG/projects/$PROJECT2/cycles/$CYC2/cycle-issues/" "{\"issues\":[\"$ISS2\"]}"
+
+query "UPDATE projects SET deleted_at = now() - interval '90 days' WHERE id='$PROJECT2'" >/dev/null
 
 "$SATURN_BIN" jobs run hard_delete
 
-EXISTS_DEL=$(query "SELECT count(*) FROM issues WHERE id='$DEL_ISSUE_ID'")
-if [ "$EXISTS_DEL" != "0" ]; then
-  echo "✖ soft-deleted issue was not hard-deleted" >&2
+for tbl_check in \
+  "SELECT count(*) FROM projects WHERE id='$PROJECT2'" \
+  "SELECT count(*) FROM issues WHERE project_id='$PROJECT2'" \
+  "SELECT count(*) FROM states WHERE project_id='$PROJECT2'" \
+  "SELECT count(*) FROM project_identifiers WHERE project_id='$PROJECT2'" \
+  "SELECT count(*) FROM project_members WHERE project_id='$PROJECT2'" \
+  "SELECT count(*) FROM labels WHERE project_id='$PROJECT2'" \
+  "SELECT count(*) FROM cycles WHERE project_id='$PROJECT2'" \
+  "SELECT count(*) FROM issues WHERE id='$DEL_ISSUE_ID'" \
+  "SELECT count(*) FROM issue_comments WHERE id='$DEL_COMMENT_ID'"
+do
+  CNT=$(query "$tbl_check")
+  if [ "$CNT" != "0" ]; then
+    echo "✖ hard_delete left rows for: $tbl_check (count=$CNT)" >&2
+    exit 1
+  fi
+done
+
+SEEDED_CNT=$(query "SELECT count(*) FROM projects WHERE id='$PROJECT'")
+if [ "$SEEDED_CNT" != "1" ]; then
+  echo "✖ seeded first project was affected: count=$SEEDED_CNT" >&2
   exit 1
 fi
-echo "✔ hard_delete removed expired soft-deleted issue"
+echo "✔ hard_delete cascaded project, issues, states, identifiers, members, and issue comments"
 
 # -----------------------------------------------------------------------------
 # 4. delete_unuploaded_file_asset

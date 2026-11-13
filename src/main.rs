@@ -5,13 +5,14 @@ mod api_v1_extra;
 mod auth;
 mod common;
 mod instance;
+mod jobs;
+mod jobs_fk;
 mod oauth;
 mod outbound;
 mod session;
 mod web;
 mod webhook_out;
 mod workitems;
-mod jobs;
 
 // API areas. Each module owns its routes (full paths, trailing slash, as Plane's apps call them).
 mod analytics;

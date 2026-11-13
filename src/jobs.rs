@@ -12,11 +12,15 @@
 //!
 //! Note on telemetry `push_instance_metrics`: deliberately not ported (no phoning home in Saturn).
 
-use std::time::Duration;
 use chrono::{DateTime, NaiveTime, Timelike, Utc};
+use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::jobs_fk::{OnDelete, PLANE_FKS};
 
 pub const JOB_NAMES: &[&str] = &[
     "archive_and_close_old_issues",
@@ -175,7 +179,7 @@ async fn run_archive_and_close(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -
     }
 
     let archive_projects: Vec<ArchiveProject> = sqlx::query_as(
-        "SELECT id, workspace_id, archive_in, created_by_id FROM projects WHERE archive_in > 0 AND deleted_at IS NULL"
+        "SELECT id, workspace_id, archive_in, created_by_id FROM projects WHERE archive_in > 0 AND deleted_at IS NULL",
     )
     .fetch_all(&mut **tx)
     .await?;
@@ -219,7 +223,7 @@ async fn run_archive_and_close(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -
                        WHERE ii.issue_id = i.id AND ii.deleted_at IS NULL AND ii.status IN (-1, 1, 2)
                    )
                )
-             FOR UPDATE OF i"
+             FOR UPDATE OF i",
         )
         .bind(p.id)
         .bind(p.workspace_id)
@@ -228,13 +232,11 @@ async fn run_archive_and_close(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -
         .await?;
 
         if !issue_ids.is_empty() {
-            sqlx::query(
-                "UPDATE issues SET archived_at = $1, updated_at = now() WHERE id = ANY($2)"
-            )
-            .bind(today)
-            .bind(&issue_ids)
-            .execute(&mut **tx)
-            .await?;
+            sqlx::query("UPDATE issues SET archived_at = $1, updated_at = now() WHERE id = ANY($2)")
+                .bind(today)
+                .bind(&issue_ids)
+                .execute(&mut **tx)
+                .await?;
 
             for issue_id in issue_ids {
                 insert_issue_activity(
@@ -325,7 +327,7 @@ async fn run_archive_and_close(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -
                        WHERE ii.issue_id = i.id AND ii.deleted_at IS NULL AND ii.status IN (-1, 1, 2)
                    )
                )
-             FOR UPDATE OF i"
+             FOR UPDATE OF i",
         )
         .bind(p.id)
         .bind(p.workspace_id)
@@ -334,13 +336,11 @@ async fn run_archive_and_close(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -
         .await?;
 
         if !issue_ids.is_empty() {
-            sqlx::query(
-                "UPDATE issues SET state_id = $1, updated_at = now() WHERE id = ANY($2)"
-            )
-            .bind(target_state_id)
-            .bind(&issue_ids)
-            .execute(&mut **tx)
-            .await?;
+            sqlx::query("UPDATE issues SET state_id = $1, updated_at = now() WHERE id = ANY($2)")
+                .bind(target_state_id)
+                .bind(&issue_ids)
+                .execute(&mut **tx)
+                .await?;
 
             for issue_id in issue_ids {
                 insert_issue_activity(
@@ -369,7 +369,7 @@ async fn run_unsnooze_intake(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> 
     let count = sqlx::query(
         "UPDATE intake_issues
          SET status = -2, snoozed_till = NULL, updated_at = now()
-         WHERE status = 0 AND snoozed_till <= now() AND deleted_at IS NULL"
+         WHERE status = 0 AND snoozed_till <= now() AND deleted_at IS NULL",
     )
     .execute(&mut **tx)
     .await?
@@ -381,12 +381,123 @@ async fn run_unsnooze_intake(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> 
     Ok(())
 }
 
+fn has_fk_children(table: &str) -> bool {
+    PLANE_FKS
+        .iter()
+        .any(|&(_, _, pt, od)| pt == table && od != OnDelete::DoNothing)
+}
+
+async fn cascade_delete(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table: &'static str,
+    ids: &[Uuid],
+) -> anyhow::Result<u64> {
+    let mut visited = HashSet::new();
+    cascade_delete_inner(tx, table, ids, &mut visited).await
+}
+
+fn cascade_delete_inner<'a>(
+    tx: &'a mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table: &'static str,
+    ids: &'a [Uuid],
+    visited: &'a mut HashSet<&'static str>,
+) -> Pin<Box<dyn Future<Output = anyhow::Result<u64>> + Send + 'a>> {
+    Box::pin(async move {
+        if ids.is_empty() || !visited.insert(table) {
+            return Ok(0);
+        }
+
+        // Expand self-referencing CASCADE FKs (e.g. parent_id -> id) before recursing.
+        let mut all_ids: Vec<Uuid> = ids.to_vec();
+        let mut seen: HashSet<Uuid> = all_ids.iter().copied().collect();
+        let self_cols: Vec<&'static str> = PLANE_FKS
+            .iter()
+            .filter(|&&(ct, _, pt, od)| ct == table && pt == table && od == OnDelete::Cascade)
+            .map(|&(_, cc, _, _)| cc)
+            .collect();
+        if !self_cols.is_empty() {
+            let mut frontier = all_ids.clone();
+            while !frontier.is_empty() {
+                let mut next_frontier = Vec::new();
+                for &col in &self_cols {
+                    let q = format!("SELECT id FROM {table} WHERE {col} = ANY($1)");
+                    let children: Vec<Uuid> = sqlx::query_scalar(&q).bind(&frontier).fetch_all(&mut **tx).await?;
+                    for cid in children {
+                        if seen.insert(cid) {
+                            all_ids.push(cid);
+                            next_frontier.push(cid);
+                        }
+                    }
+                }
+                frontier = next_frontier;
+            }
+        }
+
+        for &(child, col, parent, on_delete) in PLANE_FKS {
+            if parent != table || child == table {
+                continue;
+            }
+            match on_delete {
+                OnDelete::DoNothing => continue,
+                OnDelete::SetNull => {
+                    let q = format!("UPDATE {child} SET {col} = NULL WHERE {col} = ANY($1)");
+                    sqlx::query(&q).bind(&all_ids).execute(&mut **tx).await?;
+                }
+                OnDelete::Cascade => {
+                    if has_fk_children(child) {
+                        let q = format!("SELECT id FROM {child} WHERE {col} = ANY($1)");
+                        let child_ids: Vec<Uuid> = sqlx::query_scalar(&q).bind(&all_ids).fetch_all(&mut **tx).await?;
+                        if !child_ids.is_empty() {
+                            cascade_delete_inner(tx, child, &child_ids, visited).await?;
+                        }
+                    } else {
+                        let q = format!("DELETE FROM {child} WHERE {col} = ANY($1)");
+                        sqlx::query(&q).bind(&all_ids).execute(&mut **tx).await?;
+                    }
+                }
+            }
+        }
+
+        let q = format!("DELETE FROM {table} WHERE id = ANY($1)");
+        let n = sqlx::query(&q).bind(&all_ids).execute(&mut **tx).await?.rows_affected();
+        visited.remove(table);
+        Ok(n)
+    })
+}
+
+async fn hard_delete_table(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tbl: &str,
+    cutoff: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    if !tbl.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return Ok(());
+    }
+    if let Some(static_tbl) = PLANE_FKS
+        .iter()
+        .find(|&&(_, _, pt, od)| pt == tbl && od != OnDelete::DoNothing)
+        .map(|&(_, _, pt, _)| pt)
+    {
+        let q = format!("SELECT id FROM {static_tbl} WHERE deleted_at IS NOT NULL AND deleted_at < $1");
+        let ids: Vec<Uuid> = sqlx::query_scalar(&q).bind(cutoff).fetch_all(&mut **tx).await?;
+        if !ids.is_empty() {
+            let n = cascade_delete(tx, static_tbl, &ids).await?;
+            if n > 0 {
+                tracing::info!(table = static_tbl, count = n, "hard-deleted expired rows");
+            }
+        }
+    } else {
+        let q = format!("DELETE FROM \"{tbl}\" WHERE deleted_at IS NOT NULL AND deleted_at < $1");
+        let n = sqlx::query(&q).bind(cutoff).execute(&mut **tx).await?.rows_affected();
+        if n > 0 {
+            tracing::info!(table = tbl, count = n, "hard-deleted expired rows");
+        }
+    }
+    Ok(())
+}
+
 /// 3. hard_delete
 /// Deletes rows whose deleted_at < now() - HARD_DELETE_AFTER_DAYS.
-/// Models covered in Plane:
-/// workspaces, projects, cycles, modules, issues, pages, issue_views, labels, states,
-/// issue_activities, issue_comments, issue_links, issue_reactions, user_favorites,
-/// module_issues, cycle_issues, estimates, estimate_points.
 /// Plane default: 60 days (read HARD_DELETE_AFTER_DAYS env).
 async fn run_hard_delete(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> anyhow::Result<()> {
     let days: i64 = std::env::var("HARD_DELETE_AFTER_DAYS")
@@ -397,41 +508,47 @@ async fn run_hard_delete(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> anyh
 
     let cutoff = Utc::now() - chrono::Duration::days(days);
 
-    // Dependent child tables deleted before parent tables to respect foreign keys where applicable
-    const TABLES: &[&str] = &[
-        "user_favorites",
-        "issue_reactions",
-        "comment_reactions",
-        "issue_links",
-        "issue_comments",
-        "issue_activities",
-        "issue_assignees",
-        "issue_labels",
-        "issue_subscribers",
-        "module_issues",
-        "cycle_issues",
-        "intake_issues",
-        "draft_issues",
+    const PRIORITY_TABLES: &[&str] = &[
+        "workspaces",
+        "projects",
+        "cycles",
+        "modules",
         "issues",
+        "pages",
         "issue_views",
         "labels",
         "states",
-        "estimate_points",
+        "issue_activities",
+        "issue_comments",
+        "issue_links",
+        "issue_reactions",
+        "user_favorites",
+        "module_issues",
+        "cycle_issues",
         "estimates",
-        "modules",
-        "cycles",
-        "pages",
-        "project_members",
-        "projects",
-        "workspace_members",
-        "workspaces",
+        "estimate_points",
     ];
 
-    for &tbl in TABLES {
-        let q = format!("DELETE FROM {tbl} WHERE deleted_at IS NOT NULL AND deleted_at < $1");
-        let n = sqlx::query(&q).bind(cutoff).execute(&mut **tx).await?.rows_affected();
-        if n > 0 {
-            tracing::info!(table = tbl, count = n, "hard-deleted expired rows");
+    for &tbl in PRIORITY_TABLES {
+        hard_delete_table(tx, tbl, cutoff).await?;
+    }
+
+    let other_tables: Vec<String> = sqlx::query_scalar(
+        "SELECT c.table_name
+         FROM information_schema.columns c
+         JOIN information_schema.tables t
+           ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+         WHERE c.table_schema = 'public'
+           AND t.table_type = 'BASE TABLE'
+           AND c.column_name = 'deleted_at'
+         ORDER BY c.table_name",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+
+    for tbl in other_tables {
+        if !PRIORITY_TABLES.contains(&tbl.as_str()) {
+            hard_delete_table(tx, &tbl, cutoff).await?;
         }
     }
 
@@ -441,7 +558,10 @@ async fn run_hard_delete(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> anyh
 /// 4. delete_unuploaded_file_asset
 /// Deletes file_assets with is_uploaded = false and created_at < now() - UNUPLOADED_ASSET_DELETE_DAYS (Plane default: 7).
 /// Also cleans up the disk file under STORAGE_DIR if present, safely preventing traversal.
-async fn run_delete_unuploaded_assets(st: &AppState, tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> anyhow::Result<()> {
+async fn run_delete_unuploaded_assets(
+    st: &AppState,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> anyhow::Result<()> {
     let days: i64 = std::env::var("UNUPLOADED_ASSET_DELETE_DAYS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -452,7 +572,7 @@ async fn run_delete_unuploaded_assets(st: &AppState, tx: &mut sqlx::Transaction<
 
     let assets: Vec<(Uuid, String)> = sqlx::query_as(
         "SELECT id, asset FROM file_assets
-         WHERE is_uploaded = false AND created_at < $1"
+         WHERE is_uploaded = false AND created_at < $1",
     )
     .bind(cutoff)
     .fetch_all(&mut **tx)
@@ -528,7 +648,7 @@ async fn run_delete_page_versions(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>
                  SELECT id, ROW_NUMBER() OVER (PARTITION BY page_id ORDER BY created_at DESC) as rn
                  FROM page_versions
              ) sub WHERE sub.rn > 20
-         )"
+         )",
     )
     .execute(&mut **tx)
     .await?;
@@ -545,7 +665,7 @@ async fn run_delete_issue_description_versions(tx: &mut sqlx::Transaction<'_, sq
                  SELECT id, ROW_NUMBER() OVER (PARTITION BY issue_id ORDER BY created_at DESC) as rn
                  FROM issue_description_versions
              ) sub WHERE sub.rn > 20
-         )"
+         )",
     )
     .execute(&mut **tx)
     .await?;
@@ -577,7 +697,7 @@ async fn run_delete_old_s3_link(st: &AppState, tx: &mut sqlx::Transaction<'_, sq
 
     let rows: Vec<(Uuid, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT id, key, token FROM exporters
-         WHERE url IS NOT NULL AND created_at <= $1"
+         WHERE url IS NOT NULL AND created_at <= $1",
     )
     .bind(cutoff)
     .fetch_all(&mut **tx)
