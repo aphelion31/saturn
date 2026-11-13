@@ -84,8 +84,19 @@ async fn retrieve(
     State(st): State<AppState>,
     user: CurrentUser,
     Path((slug, project, id)): Path<PagePath>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> ApiResult {
     let ctx = require_project(&st.db, &user, &slug, project).await?;
+    ctx.require(&[ADMIN, MEMBER, GUEST])?;
+    if !q.get("track_visit").is_some_and(|v| v.eq_ignore_ascii_case("false")) {
+        crate::recent_visits::record(&st.db, crate::recent_visits::Visit { workspace_id: ctx.workspace_id(), user_id: user.id, entity_name: "page", entity_identifier: id, project_id: Some(project) });
+    }
+    fetch(&st, &user, &slug, project, id).await
+}
+
+/// Page detail without visit tracking, used by create/update which return the page.
+async fn fetch(st: &AppState, user: &CurrentUser, slug: &str, project: Uuid, id: Uuid) -> ApiResult {
+    let ctx = require_project(&st.db, user, slug, project).await?;
     ctx.require(&[ADMIN, MEMBER, GUEST])?;
     json_row(sqlx::query_scalar(&format!("SELECT {PAGE} || jsonb_build_object('issue_ids',COALESCE((SELECT jsonb_agg(l.entity_identifier) FROM page_logs l WHERE l.page_id=p.id AND l.workspace_id=p.workspace_id AND l.entity_name='issue' AND l.deleted_at IS NULL),'[]'::jsonb)) FROM pages p WHERE {SCOPE} AND p.id=$5"))
         .bind(ctx.workspace_id()).bind(project).bind(user.id).bind(ctx.restricted_guest()).bind(id), &st.db).await
@@ -117,7 +128,7 @@ async fn create(
     sqlx::query("INSERT INTO project_pages (workspace_id,project_id,page_id,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$4)")
         .bind(ctx.workspace_id()).bind(project).bind(id).bind(user.id).execute(&mut *tx).await?;
     tx.commit().await?;
-    let Json(v) = retrieve(State(st), user, Path((slug, project, id))).await?;
+    let Json(v) = fetch(&st, &user, &slug, project, id).await?;
     Ok((StatusCode::CREATED, Json(v)))
 }
 async fn update(
@@ -153,7 +164,7 @@ async fn update(
     let stripped = html.as_deref().map(strip_tags);
     sqlx::query(&format!("WITH updated AS (UPDATE pages p SET name=COALESCE($6,p.name),color=COALESCE($7,p.color),access=$8,view_props=COALESCE($9,p.view_props),logo_props=COALESCE($10,p.logo_props),description_html=COALESCE($11,p.description_html),description_stripped=COALESCE($12,p.description_stripped),updated_by_id=$3,updated_at=now() WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked RETURNING p.*) INSERT INTO page_versions (workspace_id,page_id,owned_by_id,created_by_id,updated_by_id,last_saved_at,description_binary,description_html,description_json,description_stripped) SELECT workspace_id,id,owned_by_id,$3,$3,now(),description_binary,description_html,description_json,description_stripped FROM updated WHERE $11::text IS NOT NULL"))
         .bind(ctx.workspace_id()).bind(project).bind(user.id).bind(ctx.restricted_guest()).bind(id).bind(s(&b,"name")).bind(s(&b,"color")).bind(access as i16).bind(b.get("view_props")).bind(b.get("logo_props")).bind(html).bind(stripped).execute(&st.db).await?;
-    retrieve(State(st), user, Path((slug, project, id))).await
+    fetch(&st, &user, &slug, project, id).await
 }
 async fn destroy(
     State(st): State<AppState>,
@@ -356,7 +367,7 @@ async fn duplicate(
     let new_id = new_id.ok_or_else(ApiError::not_found)?;
     sqlx::query("INSERT INTO project_pages (workspace_id,project_id,page_id,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$4)").bind(ctx.workspace_id()).bind(project).bind(new_id).bind(user.id).execute(&mut *tx).await?;
     tx.commit().await?;
-    let Json(v) = retrieve(State(st), user, Path((slug, project, new_id))).await?;
+    let Json(v) = fetch(&st, &user, &slug, project, new_id).await?;
     Ok((StatusCode::CREATED, Json(v)))
 }
 

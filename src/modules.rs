@@ -313,6 +313,7 @@ async fn retrieve(
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER])?;
+    crate::recent_visits::record(&st.db, crate::recent_visits::Visit { workspace_id: p.workspace_id(), user_id: user.id, entity_name: "module", entity_identifier: pk, project_id: Some(project_id) });
     let mut v: Value = sqlx::query_scalar(&format!(
         "{} WHERE m.id = $2 AND m.project_id = $3 AND m.workspace_id = $4 AND m.archived_at IS NULL AND m.deleted_at IS NULL",
         module_select("$1")

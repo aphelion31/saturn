@@ -340,13 +340,23 @@ async fn add_members(
         sqlx::query("INSERT INTO project_user_properties (workspace_id,project_id,user_id,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$4) ON CONFLICT DO NOTHING").bind(p.workspace_id()).bind(project).bind(id).bind(user.id).execute(&mut *tx).await?;
     }
     tx.commit().await?;
+    // Plane: project_add_user_email per added member (project_addition.html template).
+    let (project_name, workspace_name, inviter): (String, String, String) = sqlx::query_as(
+        "SELECT p.name, w.name, COALESCE(NULLIF(u.first_name,''), NULLIF(u.display_name,''), u.email)
+         FROM projects p JOIN workspaces w ON w.id = p.workspace_id JOIN users u ON u.id = $3
+         WHERE p.id = $1 AND p.workspace_id = $2",
+    )
+    .bind(project)
+    .bind(p.workspace_id())
+    .bind(user.id)
+    .fetch_one(&st.db)
+    .await?;
     for member in requested {
-        if let Some(id) = uuid_of(member, "member_id") {
-            if let Ok(email) = sqlx::query_scalar::<_, String>("SELECT u.email FROM users u JOIN workspace_members m ON m.member_id=u.id WHERE u.id=$1 AND m.workspace_id=$2 AND m.deleted_at IS NULL").bind(id).bind(p.workspace_id()).fetch_one(&st.db).await {
-                let text = format!("You have been invited to a Plane project. {}/{}/projects/{}/issues", st.cfg.web_url.trim_end_matches('/'), slug, project);
-                crate::outbound::send_mail_bg(&st, email, "You have been invited to a Plane project".into(), ammonia::clean(&text), text);
-            }
-        }
+        let Some(id) = uuid_of(member, "member_id") else { continue };
+        let Ok(email) = sqlx::query_scalar::<_, String>("SELECT u.email FROM users u WHERE u.id = $1").bind(id).fetch_one(&st.db).await else { continue };
+        let url = format!("{}/{}/projects/{}/issues", st.cfg.web_url.trim_end_matches('/'), slug, project);
+        let (html, text) = crate::outbound::project_addition_mail(&project_name, &workspace_name, &email, &inviter, &url);
+        crate::outbound::send_mail_bg(&st, email, "You have been invited to a Plane project".into(), html, text);
     }
     let Json(rows) = members(State(st), user, Path((slug, project))).await?;
     Ok((StatusCode::CREATED, Json(rows)))
@@ -962,6 +972,7 @@ async fn retrieve(
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER, GUEST])?;
+    crate::recent_visits::record(&st.db, crate::recent_visits::Visit { workspace_id: p.workspace_id(), user_id: user.id, entity_name: "project", entity_identifier: project_id, project_id: Some(project_id) });
     let Json(projects) = list_projects(State(st), user, Path(slug)).await?;
     projects
         .as_array()

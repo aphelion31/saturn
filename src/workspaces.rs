@@ -191,6 +191,8 @@ async fn create(
             }
         })?;
     tx.commit().await?;
+    // Plane: workspace_seed runs after the create commits. Failures are logged only.
+    crate::workspace_seed::spawn(&st, id);
     let v: Value = sqlx::query_scalar(&format!(
         "SELECT {WS_JSON} || jsonb_build_object('role', 20::smallint) FROM workspaces w WHERE w.id = $1"
     ))

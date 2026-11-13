@@ -257,6 +257,7 @@ async fn retrieve(
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER])?;
+    crate::recent_visits::record(&st.db, crate::recent_visits::Visit { workspace_id: p.workspace_id(), user_id: user.id, entity_name: "cycle", entity_identifier: pk, project_id: Some(project_id) });
     fetch_cycle(&st.db, &p, &user, pk).await
 }
 

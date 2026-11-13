@@ -338,6 +338,7 @@ async fn project_retrieve(
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER, GUEST])?;
+    crate::recent_visits::record(&st.db, crate::recent_visits::Visit { workspace_id: p.workspace_id(), user_id: user.id, entity_name: "view", entity_identifier: pk, project_id: Some(project_id) });
     let row: Option<(Uuid, bool)> = sqlx::query_as(
         "SELECT owned_by_id, access = 1 FROM issue_views
          WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL AND archived_at IS NULL",
@@ -428,6 +429,7 @@ async fn ws_retrieve(
 ) -> ApiResult {
     let ws = require_workspace(&st.db, &user, &slug).await?;
     ws.require(&[ADMIN, MEMBER, GUEST])?;
+    crate::recent_visits::record(&st.db, crate::recent_visits::Visit { workspace_id: ws.workspace_id, user_id: user.id, entity_name: "view", entity_identifier: pk, project_id: None });
     let row: Option<(Uuid, bool)> = sqlx::query_as(
         "SELECT owned_by_id, access = 1 FROM issue_views
          WHERE id = $1 AND workspace_id = $2 AND project_id IS NULL AND deleted_at IS NULL AND archived_at IS NULL",
