@@ -5,6 +5,8 @@ mod api_v1_extra;
 mod auth;
 mod common;
 mod instance;
+mod jobs;
+mod jobs_fk;
 mod oauth;
 mod outbound;
 mod session;
@@ -152,8 +154,13 @@ async fn main() -> anyhow::Result<()> {
     match args.get(1).map(String::as_str) {
         Some("migrate") => return Ok(()),
         Some("seed") => return users::seed(&state, &args[2..]).await,
+        Some("jobs") if args.get(2).map(String::as_str) == Some("run") => {
+            return jobs::cli_run(&state, &args[3..]).await;
+        }
         _ => {}
     }
+
+    jobs::spawn(state.clone());
 
     let addr = env("BIND", "0.0.0.0:3000");
     tracing::info!("saturn listening on {addr}");
