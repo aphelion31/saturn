@@ -1289,7 +1289,7 @@ async fn relation_remove(
     no_content()
 }
 
-fn inverse_relation(kind: &str) -> &str {
+pub(crate) fn inverse_relation(kind: &str) -> &str {
     match kind {
         "blocking" => "blocked_by",
         "blocked_by" => "blocking",
@@ -1301,7 +1301,7 @@ fn inverse_relation(kind: &str) -> &str {
     }
 }
 
-async fn relation_activity(
+pub(crate) async fn relation_activity(
     tx: &mut sqlx::PgConnection,
     issue: Uuid,
     other: Uuid,

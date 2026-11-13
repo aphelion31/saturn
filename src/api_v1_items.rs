@@ -257,6 +257,17 @@ async fn relation_create(
         .fetch_optional(&mut *tx)
         .await?;
         if inserted.is_some() {
+            crate::issues::relation_activity(
+                &mut tx,
+                issue_id,
+                other,
+                project_id,
+                p.workspace_id(),
+                user.id,
+                kind,
+                true,
+            )
+            .await?;
             out.push(json!({"issue_id": a, "related_issue_id": b_id, "relation_type": stored}));
         }
     }
@@ -278,21 +289,37 @@ async fn relation_remove(
         .and_then(|s| Uuid::parse_str(s).ok())
         .ok_or_else(|| ApiError::bad("Invalid related_issue"))?;
 
-    let r = sqlx::query(
+    let mut tx = st.db.begin().await?;
+    let row: Option<(String, Uuid)> = sqlx::query_as(
         "UPDATE issue_relations SET deleted_at = now(), updated_at = now(), updated_by_id = $4
          WHERE workspace_id = $1 AND deleted_at IS NULL
-           AND ((issue_id = $2 AND related_issue_id = $3) OR (issue_id = $3 AND related_issue_id = $2))",
+           AND ((issue_id = $2 AND related_issue_id = $3) OR (issue_id = $3 AND related_issue_id = $2)) RETURNING relation_type,issue_id",
     )
     .bind(p.workspace_id())
     .bind(issue_id)
     .bind(related_id)
     .bind(user.id)
-    .execute(&st.db)
+    .fetch_optional(&mut *tx)
     .await?;
 
-    if r.rows_affected() == 0 {
-        return Err(ApiError::not_found());
-    }
+    let (stored, source) = row.ok_or_else(ApiError::not_found)?;
+    let kind = s(&b, "relation_type").unwrap_or(if source == issue_id {
+        &stored
+    } else {
+        crate::issues::inverse_relation(&stored)
+    });
+    crate::issues::relation_activity(
+        &mut tx,
+        issue_id,
+        related_id,
+        project_id,
+        p.workspace_id(),
+        user.id,
+        kind,
+        false,
+    )
+    .await?;
+    tx.commit().await?;
     no_content()
 }
 
@@ -452,17 +479,31 @@ async fn attachment_confirm(
     if owner.ok_or_else(ApiError::not_found)? != Some(user.id) {
         p.require(&[ADMIN])?;
     }
-    sqlx::query(
+    let mut tx = st.db.begin().await?;
+    let asset: String = sqlx::query_scalar(
         "UPDATE file_assets SET is_uploaded = true, updated_at = now(), updated_by_id = $5
-         WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
+         WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL RETURNING asset",
     )
     .bind(pk)
     .bind(issue_id)
     .bind(project_id)
     .bind(p.workspace_id())
     .bind(user.id)
-    .execute(&st.db)
+    .fetch_one(&mut *tx)
     .await?;
+    let mut event = crate::activity::ActivityEvent::new(
+        issue_id,
+        project_id,
+        p.workspace_id(),
+        user.id,
+        "created",
+        "created an attachment",
+    );
+    event.field = Some("attachment");
+    event.new_value = Some(&asset);
+    event.new_identifier = Some(pk);
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     no_content()
 }
 
@@ -486,6 +527,7 @@ async fn attachment_delete(
     if owner.ok_or_else(ApiError::not_found)? != Some(user.id) {
         p.require(&[ADMIN])?;
     }
+    let mut tx = st.db.begin().await?;
     sqlx::query(
         "UPDATE file_assets SET deleted_at = now(), is_deleted = true, updated_at = now(), updated_by_id = $5
          WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
@@ -495,8 +537,19 @@ async fn attachment_delete(
     .bind(project_id)
     .bind(p.workspace_id())
     .bind(user.id)
-    .execute(&st.db)
+    .execute(&mut *tx)
     .await?;
+    let mut event = crate::activity::ActivityEvent::new(
+        issue_id,
+        project_id,
+        p.workspace_id(),
+        user.id,
+        "deleted",
+        "deleted the attachment",
+    );
+    event.field = Some("attachment");
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     no_content()
 }
 
@@ -806,6 +859,7 @@ async fn link_create(
             json!({"title": ["Ensure this field has no more than 255 characters."]}),
         ));
     }
+    let mut tx = st.db.begin().await?;
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO issue_links (workspace_id, project_id, issue_id, url, title, metadata, created_by_id, updated_by_id)
          SELECT $1,$2,$3,$4,$5,'{}'::jsonb,$6,$6
@@ -818,9 +872,22 @@ async fn link_create(
     .bind(&url)
     .bind(title)
     .bind(user.id)
-    .fetch_optional(&st.db)
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| ApiError::bad_body(json!({"error": "URL already exists for this work item."})))?;
+    let mut event = crate::activity::ActivityEvent::new(
+        issue_id,
+        project_id,
+        p.workspace_id(),
+        user.id,
+        "created",
+        "created a link",
+    );
+    event.field = Some("link");
+    event.new_value = Some(&url);
+    event.new_identifier = Some(id);
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     let Json(v) = link_retrieve(State(st), user, Path((slug, project_id, issue_id, id))).await?;
     created(v)
 }
@@ -843,6 +910,9 @@ async fn link_update(
             json!({"title": ["Ensure this field has no more than 255 characters."]}),
         ));
     }
+    let mut tx = st.db.begin().await?;
+    let old: Option<String> = sqlx::query_scalar("SELECT url FROM issue_links WHERE id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND deleted_at IS NULL FOR UPDATE")
+        .bind(pk).bind(issue_id).bind(project_id).bind(p.workspace_id()).fetch_optional(&mut *tx).await?;
     let r = sqlx::query(
         "UPDATE issue_links SET url = COALESCE($5, url), title = COALESCE($6, title), updated_by_id = $7, updated_at = now()
          WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
@@ -854,11 +924,28 @@ async fn link_update(
     .bind(url.as_deref())
     .bind(title)
     .bind(user.id)
-    .execute(&st.db)
+    .execute(&mut *tx)
     .await?;
     if r.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
+    if url.is_some() && old != url {
+        let mut event = crate::activity::ActivityEvent::new(
+            issue_id,
+            project_id,
+            p.workspace_id(),
+            user.id,
+            "updated",
+            "updated a link",
+        );
+        event.field = Some("link");
+        event.old_value = old.as_deref();
+        event.new_value = url.as_deref();
+        event.old_identifier = Some(pk);
+        event.new_identifier = Some(pk);
+        crate::activity::record(&mut *tx, event).await?;
+    }
+    tx.commit().await?;
     link_retrieve(State(st), user, Path((slug, project_id, issue_id, pk))).await
 }
 
@@ -869,20 +956,32 @@ async fn link_delete(
 ) -> ApiResult<StatusCode> {
     let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
     p.require(&[ADMIN, MEMBER])?;
-    let r = sqlx::query(
+    let mut tx = st.db.begin().await?;
+    let old: Option<String> = sqlx::query_scalar(
         "UPDATE issue_links SET deleted_at = now(), updated_at = now(), updated_by_id = $5
-         WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
+         WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL RETURNING url",
     )
     .bind(pk)
     .bind(issue_id)
     .bind(project_id)
     .bind(p.workspace_id())
     .bind(user.id)
-    .execute(&st.db)
+    .fetch_optional(&mut *tx)
     .await?;
-    if r.rows_affected() == 0 {
-        return Err(ApiError::not_found());
-    }
+    let old = old.ok_or_else(ApiError::not_found)?;
+    let mut event = crate::activity::ActivityEvent::new(
+        issue_id,
+        project_id,
+        p.workspace_id(),
+        user.id,
+        "deleted",
+        "deleted the link",
+    );
+    event.field = Some("link");
+    event.old_value = Some(&old);
+    event.new_value = Some("");
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     no_content()
 }
 
