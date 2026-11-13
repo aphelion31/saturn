@@ -1,3 +1,4 @@
+mod activity;
 mod api_v1;
 mod api_v1_assets;
 mod api_v1_extra;
