@@ -86,11 +86,7 @@ pub async fn grouping(
     name: &str,
     added: bool,
 ) -> Result<(), sqlx::Error> {
-    let comment = if added {
-        format!("added {} {name}", if kind == "cycles" { "cycle" } else { "module" })
-    } else {
-        format!("removed this issue from {name}")
-    };
+    let comment = grouping_comment(kind, name, added);
     let mut event = ActivityEvent::new(
         issue,
         project,
@@ -108,4 +104,27 @@ pub async fn grouping(
         event.old_identifier = Some(id);
     }
     record(conn, event).await
+}
+
+fn grouping_comment(kind: &str, name: &str, added: bool) -> String {
+    if added {
+        format!("added {} {name}", if kind == "cycles" { "cycle" } else { "module" })
+    } else {
+        format!("removed this issue from {name}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::grouping_comment;
+
+    #[test]
+    fn plane_grouping_comments() {
+        assert_eq!(grouping_comment("cycles", "Sprint", true), "added cycle Sprint");
+        assert_eq!(grouping_comment("modules", "API", true), "added module API");
+        assert_eq!(
+            grouping_comment("cycles", "Sprint", false),
+            "removed this issue from Sprint"
+        );
+    }
 }
