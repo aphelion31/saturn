@@ -831,6 +831,16 @@ async fn ci_add(
         ));
     }
     let mut tx = st.db.begin().await?;
+    let cycle_name: String = sqlx::query_scalar(
+        "SELECT name FROM cycles WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+    )
+    .bind(cycle_id)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .fetch_one(&mut *tx)
+    .await?;
+    let previous: Vec<(Uuid, Uuid, String)> = sqlx::query_as("SELECT ci.issue_id,ci.cycle_id,c.name FROM cycle_issues ci JOIN cycles c ON c.id=ci.cycle_id AND c.project_id=ci.project_id AND c.workspace_id=ci.workspace_id WHERE ci.issue_id=ANY($1) AND ci.project_id=$2 AND ci.workspace_id=$3 AND ci.deleted_at IS NULL AND ci.cycle_id<>$4")
+        .bind(&issues).bind(project_id).bind(p.workspace_id()).bind(cycle_id).fetch_all(&mut *tx).await?;
     sqlx::query(
         "UPDATE cycle_issues SET cycle_id = $1, updated_by_id = $2, updated_at = now()
          WHERE issue_id = ANY($3) AND project_id = $4 AND workspace_id = $5 AND deleted_at IS NULL AND cycle_id <> $1",
@@ -842,21 +852,46 @@ async fn ci_add(
     .bind(p.workspace_id())
     .execute(&mut *tx)
     .await?;
-    sqlx::query(&format!(
+    let inserted: Vec<Uuid> = sqlx::query_scalar(&format!(
         "INSERT INTO cycle_issues (id, cycle_id, issue_id, project_id, workspace_id, created_by_id, updated_by_id)
          SELECT gen_random_uuid(), $1, i.id, i.project_id, i.workspace_id, $2, $2 FROM issues i
          WHERE i.id = ANY($3) AND i.project_id = $4 AND i.workspace_id = $5 AND {ACTIVE}
            AND NOT EXISTS (SELECT 1 FROM cycle_issues ci
                            WHERE ci.issue_id = i.id AND ci.cycle_id = $1 AND ci.deleted_at IS NULL)
-         ON CONFLICT DO NOTHING"
+         ON CONFLICT DO NOTHING RETURNING issue_id"
     ))
     .bind(cycle_id)
     .bind(user.id)
     .bind(&issues)
     .bind(project_id)
     .bind(p.workspace_id())
-    .execute(&mut *tx)
+    .fetch_all(&mut *tx)
     .await?;
+    for issue in inserted {
+        crate::activity::grouping(
+            &mut tx,
+            issue,
+            project_id,
+            p.workspace_id(),
+            user.id,
+            "cycles",
+            cycle_id,
+            &cycle_name,
+            true,
+        )
+        .await?;
+    }
+    for (issue, old_id, old_name) in previous {
+        let comment = format!("updated cycle from {old_name}\n                to {cycle_name}");
+        let mut event =
+            crate::activity::ActivityEvent::new(issue, project_id, p.workspace_id(), user.id, "updated", &comment);
+        event.field = Some("cycles");
+        event.old_value = Some(&old_name);
+        event.new_value = Some(&cycle_name);
+        event.old_identifier = Some(old_id);
+        event.new_identifier = Some(cycle_id);
+        crate::activity::record(&mut *tx, event).await?;
+    }
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(json!({"message": "success"}))))
 }
@@ -896,7 +931,8 @@ async fn ci_destroy(
 ) -> ApiResult<StatusCode> {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER])?;
-    sqlx::query(
+    let mut tx = st.db.begin().await?;
+    let result = sqlx::query(
         "UPDATE cycle_issues SET deleted_at = now(), updated_by_id = $5
          WHERE issue_id = $1 AND cycle_id = $2 AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
     )
@@ -905,8 +941,30 @@ async fn ci_destroy(
     .bind(project_id)
     .bind(p.workspace_id())
     .bind(user.id)
-    .execute(&st.db)
+    .execute(&mut *tx)
     .await?;
+    if result.rows_affected() > 0 {
+        let name: String =
+            sqlx::query_scalar("SELECT name FROM cycles WHERE id=$1 AND project_id=$2 AND workspace_id=$3")
+                .bind(cycle_id)
+                .bind(project_id)
+                .bind(p.workspace_id())
+                .fetch_one(&mut *tx)
+                .await?;
+        crate::activity::grouping(
+            &mut tx,
+            issue_id,
+            project_id,
+            p.workspace_id(),
+            user.id,
+            "cycles",
+            cycle_id,
+            &name,
+            false,
+        )
+        .await?;
+    }
+    tx.commit().await?;
     no_content()
 }
 
@@ -966,11 +1024,11 @@ async fn transfer(
     .bind(c.5)
     .execute(&mut *tx)
     .await?;
-    sqlx::query(&format!(
+    let moved: Vec<Uuid> = sqlx::query_scalar(&format!(
         "UPDATE cycle_issues ci SET cycle_id = $1, updated_by_id = $2, updated_at = now()
          WHERE ci.cycle_id = $3 AND ci.project_id = $4 AND ci.workspace_id = $5 AND ci.deleted_at IS NULL
            AND ci.issue_id IN (SELECT i.id FROM issues i JOIN states s ON s.id = i.state_id
-               WHERE s.group = ANY($6) AND {ACTIVE})"
+               WHERE s.group = ANY($6) AND {ACTIVE}) RETURNING ci.issue_id"
     ))
     .bind(new_id)
     .bind(user.id)
@@ -978,8 +1036,37 @@ async fn transfer(
     .bind(project_id)
     .bind(p.workspace_id())
     .bind(vec!["backlog", "unstarted", "started"])
-    .execute(&mut *tx)
+    .fetch_all(&mut *tx)
     .await?;
+    let names: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id,name FROM cycles WHERE id=ANY($1) AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+    )
+    .bind(vec![cycle_id, new_id])
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .fetch_all(&mut *tx)
+    .await?;
+    let old_name = names
+        .iter()
+        .find(|(id, _)| *id == cycle_id)
+        .map(|(_, name)| name.as_str())
+        .unwrap_or("");
+    let new_name = names
+        .iter()
+        .find(|(id, _)| *id == new_id)
+        .map(|(_, name)| name.as_str())
+        .unwrap_or("");
+    for issue in moved {
+        let comment = format!("updated cycle from {old_name}\n                to {new_name}");
+        let mut event =
+            crate::activity::ActivityEvent::new(issue, project_id, p.workspace_id(), user.id, "updated", &comment);
+        event.field = Some("cycles");
+        event.old_value = Some(old_name);
+        event.new_value = Some(new_name);
+        event.old_identifier = Some(cycle_id);
+        event.new_identifier = Some(new_id);
+        crate::activity::record(&mut *tx, event).await?;
+    }
     tx.commit().await?;
     Ok(Json(json!({"message": "Success"})))
 }

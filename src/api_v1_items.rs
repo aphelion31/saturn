@@ -257,6 +257,17 @@ async fn relation_create(
         .fetch_optional(&mut *tx)
         .await?;
         if inserted.is_some() {
+            crate::issues::relation_activity(
+                &mut tx,
+                issue_id,
+                other,
+                project_id,
+                p.workspace_id(),
+                user.id,
+                kind,
+                true,
+            )
+            .await?;
             out.push(json!({"issue_id": a, "related_issue_id": b_id, "relation_type": stored}));
         }
     }
@@ -278,21 +289,37 @@ async fn relation_remove(
         .and_then(|s| Uuid::parse_str(s).ok())
         .ok_or_else(|| ApiError::bad("Invalid related_issue"))?;
 
-    let r = sqlx::query(
+    let mut tx = st.db.begin().await?;
+    let row: Option<(String, Uuid)> = sqlx::query_as(
         "UPDATE issue_relations SET deleted_at = now(), updated_at = now(), updated_by_id = $4
          WHERE workspace_id = $1 AND deleted_at IS NULL
-           AND ((issue_id = $2 AND related_issue_id = $3) OR (issue_id = $3 AND related_issue_id = $2))",
+           AND ((issue_id = $2 AND related_issue_id = $3) OR (issue_id = $3 AND related_issue_id = $2)) RETURNING relation_type,issue_id",
     )
     .bind(p.workspace_id())
     .bind(issue_id)
     .bind(related_id)
     .bind(user.id)
-    .execute(&st.db)
+    .fetch_optional(&mut *tx)
     .await?;
 
-    if r.rows_affected() == 0 {
-        return Err(ApiError::not_found());
-    }
+    let (stored, source) = row.ok_or_else(ApiError::not_found)?;
+    let kind = s(&b, "relation_type").unwrap_or(if source == issue_id {
+        &stored
+    } else {
+        crate::issues::inverse_relation(&stored)
+    });
+    crate::issues::relation_activity(
+        &mut tx,
+        issue_id,
+        related_id,
+        project_id,
+        p.workspace_id(),
+        user.id,
+        kind,
+        false,
+    )
+    .await?;
+    tx.commit().await?;
     no_content()
 }
 
@@ -452,17 +479,31 @@ async fn attachment_confirm(
     if owner.ok_or_else(ApiError::not_found)? != Some(user.id) {
         p.require(&[ADMIN])?;
     }
-    sqlx::query(
+    let mut tx = st.db.begin().await?;
+    let asset: String = sqlx::query_scalar(
         "UPDATE file_assets SET is_uploaded = true, updated_at = now(), updated_by_id = $5
-         WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
+         WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL RETURNING asset",
     )
     .bind(pk)
     .bind(issue_id)
     .bind(project_id)
     .bind(p.workspace_id())
     .bind(user.id)
-    .execute(&st.db)
+    .fetch_one(&mut *tx)
     .await?;
+    let mut event = crate::activity::ActivityEvent::new(
+        issue_id,
+        project_id,
+        p.workspace_id(),
+        user.id,
+        "created",
+        "created an attachment",
+    );
+    event.field = Some("attachment");
+    event.new_value = Some(&asset);
+    event.new_identifier = Some(pk);
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     no_content()
 }
 
@@ -486,6 +527,7 @@ async fn attachment_delete(
     if owner.ok_or_else(ApiError::not_found)? != Some(user.id) {
         p.require(&[ADMIN])?;
     }
+    let mut tx = st.db.begin().await?;
     sqlx::query(
         "UPDATE file_assets SET deleted_at = now(), is_deleted = true, updated_at = now(), updated_by_id = $5
          WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
@@ -495,8 +537,19 @@ async fn attachment_delete(
     .bind(project_id)
     .bind(p.workspace_id())
     .bind(user.id)
-    .execute(&st.db)
+    .execute(&mut *tx)
     .await?;
+    let mut event = crate::activity::ActivityEvent::new(
+        issue_id,
+        project_id,
+        p.workspace_id(),
+        user.id,
+        "deleted",
+        "deleted the attachment",
+    );
+    event.field = Some("attachment");
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     no_content()
 }
 
@@ -593,6 +646,7 @@ async fn comment_create(
         Some(_) => return Err(ApiError::bad_body(json!({"access": ["Invalid access"]}))),
     };
     // ponytail: Plane also writes a `descriptions` row and `comment_json`; skipped, UI reads comment_html.
+    let mut tx = st.db.begin().await?;
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO issue_comments (workspace_id, project_id, issue_id, actor_id, created_by_id, updated_by_id,
             comment_html, comment_stripped, comment_json, access, attachments)
@@ -606,8 +660,22 @@ async fn comment_create(
     .bind(&html)
     .bind(strip_tags(&html))
     .bind(access)
-    .fetch_one(&st.db)
+    .fetch_one(&mut *tx)
     .await?;
+    let mut event = crate::activity::ActivityEvent::new(
+        issue_id,
+        project_id,
+        p.workspace_id(),
+        user.id,
+        "created",
+        "created a comment",
+    );
+    event.field = Some("comment");
+    event.new_value = Some(&html);
+    event.new_identifier = Some(id);
+    event.issue_comment_id = Some(id);
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     crate::webhook_out::emit(&st, p.workspace_id(), "issue_comment", "created", json!({"id": id}));
     let Json(v) = comment_retrieve(State(st), user, Path((slug, project_id, issue_id, id))).await?;
     created(v)
@@ -632,6 +700,9 @@ async fn comment_update(
         Some(v) if v == "INTERNAL" || v == "EXTERNAL" => Some(v),
         Some(_) => return Err(ApiError::bad_body(json!({"access": ["Invalid access"]}))),
     };
+    let mut tx = st.db.begin().await?;
+    let old: Option<String> = sqlx::query_scalar("SELECT comment_html FROM issue_comments WHERE id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND created_by_id=$5 AND deleted_at IS NULL FOR UPDATE")
+        .bind(pk).bind(issue_id).bind(project_id).bind(p.workspace_id()).bind(user.id).fetch_optional(&mut *tx).await?;
     let r = sqlx::query(
         "UPDATE issue_comments SET comment_html = COALESCE($5, comment_html),
             comment_stripped = CASE WHEN $5::text IS NULL THEN comment_stripped ELSE $6 END,
@@ -648,11 +719,29 @@ async fn comment_update(
     .bind(html.as_deref().map(strip_tags))
     .bind(access)
     .bind(p.workspace_id())
-    .execute(&st.db)
+    .execute(&mut *tx)
     .await?;
     if r.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
+    if html.is_some() && old != html {
+        let mut event = crate::activity::ActivityEvent::new(
+            issue_id,
+            project_id,
+            p.workspace_id(),
+            user.id,
+            "updated",
+            "updated a comment",
+        );
+        event.field = Some("comment");
+        event.old_value = old.as_deref();
+        event.new_value = html.as_deref();
+        event.old_identifier = Some(pk);
+        event.new_identifier = Some(pk);
+        event.issue_comment_id = Some(pk);
+        crate::activity::record(&mut *tx, event).await?;
+    }
+    tx.commit().await?;
     crate::webhook_out::emit(&st, p.workspace_id(), "issue_comment", "updated", json!({"id": pk}));
     comment_retrieve(State(st), user, Path((slug, project_id, issue_id, pk))).await
 }
@@ -665,6 +754,7 @@ async fn comment_delete(
 ) -> ApiResult<StatusCode> {
     let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
     p.require(&[ADMIN, MEMBER, GUEST])?;
+    let mut tx = st.db.begin().await?;
     let r = sqlx::query(
         "UPDATE issue_comments SET deleted_at = now(), updated_at = now(), updated_by_id = $4
          WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $5 AND deleted_at IS NULL AND created_by_id = $4",
@@ -674,11 +764,23 @@ async fn comment_delete(
     .bind(project_id)
     .bind(user.id)
     .bind(p.workspace_id())
-    .execute(&st.db)
+    .execute(&mut *tx)
     .await?;
     if r.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
+    let mut event = crate::activity::ActivityEvent::new(
+        issue_id,
+        project_id,
+        p.workspace_id(),
+        user.id,
+        "deleted",
+        "deleted the comment",
+    );
+    event.field = Some("comment");
+    event.issue_comment_id = Some(pk);
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     crate::webhook_out::emit(&st, p.workspace_id(), "issue_comment", "deleted", json!({"id": pk}));
     no_content()
 }
@@ -757,6 +859,7 @@ async fn link_create(
             json!({"title": ["Ensure this field has no more than 255 characters."]}),
         ));
     }
+    let mut tx = st.db.begin().await?;
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO issue_links (workspace_id, project_id, issue_id, url, title, metadata, created_by_id, updated_by_id)
          SELECT $1,$2,$3,$4,$5,'{}'::jsonb,$6,$6
@@ -769,9 +872,22 @@ async fn link_create(
     .bind(&url)
     .bind(title)
     .bind(user.id)
-    .fetch_optional(&st.db)
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| ApiError::bad_body(json!({"error": "URL already exists for this work item."})))?;
+    let mut event = crate::activity::ActivityEvent::new(
+        issue_id,
+        project_id,
+        p.workspace_id(),
+        user.id,
+        "created",
+        "created a link",
+    );
+    event.field = Some("link");
+    event.new_value = Some(&url);
+    event.new_identifier = Some(id);
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     let Json(v) = link_retrieve(State(st), user, Path((slug, project_id, issue_id, id))).await?;
     created(v)
 }
@@ -794,6 +910,9 @@ async fn link_update(
             json!({"title": ["Ensure this field has no more than 255 characters."]}),
         ));
     }
+    let mut tx = st.db.begin().await?;
+    let old: Option<String> = sqlx::query_scalar("SELECT url FROM issue_links WHERE id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND deleted_at IS NULL FOR UPDATE")
+        .bind(pk).bind(issue_id).bind(project_id).bind(p.workspace_id()).fetch_optional(&mut *tx).await?;
     let r = sqlx::query(
         "UPDATE issue_links SET url = COALESCE($5, url), title = COALESCE($6, title), updated_by_id = $7, updated_at = now()
          WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
@@ -805,11 +924,28 @@ async fn link_update(
     .bind(url.as_deref())
     .bind(title)
     .bind(user.id)
-    .execute(&st.db)
+    .execute(&mut *tx)
     .await?;
     if r.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
+    if url.is_some() && old != url {
+        let mut event = crate::activity::ActivityEvent::new(
+            issue_id,
+            project_id,
+            p.workspace_id(),
+            user.id,
+            "updated",
+            "updated a link",
+        );
+        event.field = Some("link");
+        event.old_value = old.as_deref();
+        event.new_value = url.as_deref();
+        event.old_identifier = Some(pk);
+        event.new_identifier = Some(pk);
+        crate::activity::record(&mut *tx, event).await?;
+    }
+    tx.commit().await?;
     link_retrieve(State(st), user, Path((slug, project_id, issue_id, pk))).await
 }
 
@@ -820,20 +956,32 @@ async fn link_delete(
 ) -> ApiResult<StatusCode> {
     let p = visible_item(&st, &user, &slug, project_id, issue_id).await?;
     p.require(&[ADMIN, MEMBER])?;
-    let r = sqlx::query(
+    let mut tx = st.db.begin().await?;
+    let old: Option<String> = sqlx::query_scalar(
         "UPDATE issue_links SET deleted_at = now(), updated_at = now(), updated_by_id = $5
-         WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
+         WHERE id = $1 AND issue_id = $2 AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL RETURNING url",
     )
     .bind(pk)
     .bind(issue_id)
     .bind(project_id)
     .bind(p.workspace_id())
     .bind(user.id)
-    .execute(&st.db)
+    .fetch_optional(&mut *tx)
     .await?;
-    if r.rows_affected() == 0 {
-        return Err(ApiError::not_found());
-    }
+    let old = old.ok_or_else(ApiError::not_found)?;
+    let mut event = crate::activity::ActivityEvent::new(
+        issue_id,
+        project_id,
+        p.workspace_id(),
+        user.id,
+        "deleted",
+        "deleted the link",
+    );
+    event.field = Some("link");
+    event.old_value = Some(&old);
+    event.new_value = Some("");
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     no_content()
 }
 
@@ -1103,14 +1251,18 @@ async fn create(
         .bind(user.id)
         .execute(&mut *tx)
         .await?;
-    // Activity feed row, same as issues.rs::create_issue. Other fan-out (notifications, webhooks) is skipped.
-    sqlx::query("INSERT INTO issue_activities (issue_id, project_id, workspace_id, actor_id, created_by_id, updated_by_id, verb, comment, attachments, epoch) VALUES ($1,$2,$3,$4,$4,$4,'created','',ARRAY[]::varchar[],extract(epoch from now()))")
-        .bind(id)
-        .bind(project_id)
-        .bind(p.workspace_id())
-        .bind(user.id)
-        .execute(&mut *tx)
-        .await?;
+    crate::activity::record(
+        &mut *tx,
+        crate::activity::ActivityEvent::new(
+            id,
+            project_id,
+            p.workspace_id(),
+            user.id,
+            "created",
+            "created the issue",
+        ),
+    )
+    .await?;
     for a in assignees {
         sqlx::query("INSERT INTO issue_assignees (issue_id,project_id,workspace_id,assignee_id,created_by_id,updated_by_id) SELECT $1,$2,$3,$4,$5,$5 WHERE EXISTS (SELECT 1 FROM project_members WHERE project_id=$2 AND workspace_id=$3 AND member_id=$4 AND is_active AND role>=15 AND deleted_at IS NULL)")
             .bind(id)
@@ -1193,6 +1345,14 @@ async fn update(
     .fetch_optional(&mut *tx)
     .await?;
     let (old_start, old_target, old_state_id) = old.ok_or_else(ApiError::not_found)?;
+    let before: Value = sqlx::query_scalar(
+        "SELECT to_jsonb(i) FROM issues i WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .fetch_one(&mut *tx)
+    .await?;
 
     let target_state_id = if b.get("state_id").is_some() || b.get("state").is_some() {
         opt_uuid(&b, "state_id")?.or(opt_uuid(&b, "state")?)
@@ -1290,6 +1450,96 @@ async fn update(
     .bind(user.id)
     .execute(&mut *tx)
     .await?;
+    let after: Value = sqlx::query_scalar(
+        "SELECT to_jsonb(i) FROM issues i WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .fetch_one(&mut *tx)
+    .await?;
+    if old_state_id != target_state_id {
+        let ids: Vec<Uuid> = [old_state_id, target_state_id].into_iter().flatten().collect();
+        let states: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT id,name FROM states WHERE id=ANY($1) AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+        )
+        .bind(ids)
+        .bind(project_id)
+        .bind(p.workspace_id())
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut event = crate::activity::ActivityEvent::new(
+            pk,
+            project_id,
+            p.workspace_id(),
+            user.id,
+            "updated",
+            "updated the state to",
+        );
+        event.field = Some("state");
+        event.old_identifier = old_state_id;
+        event.new_identifier = target_state_id;
+        event.old_value = states
+            .iter()
+            .find(|(id, _)| Some(*id) == old_state_id)
+            .map(|(_, name)| name.as_str());
+        event.new_value = states
+            .iter()
+            .find(|(id, _)| Some(*id) == target_state_id)
+            .map(|(_, name)| name.as_str());
+        crate::activity::record(&mut *tx, event).await?;
+    }
+    if before.get("archived_at") != after.get("archived_at") {
+        let archived = after.get("archived_at").is_some_and(|v| !v.is_null());
+        let mut event = crate::activity::ActivityEvent::new(
+            pk,
+            project_id,
+            p.workspace_id(),
+            user.id,
+            "updated",
+            if archived {
+                "Actor has archived the issue"
+            } else {
+                "has restored the issue"
+            },
+        );
+        event.field = Some("archived_at");
+        event.old_value = if archived { None } else { Some("archive") };
+        event.new_value = Some(if archived { "manual_archive" } else { "restore" });
+        crate::activity::record(&mut *tx, event).await?;
+    }
+    for (key, field, comment) in [
+        ("name", "name", "updated the name to"),
+        ("priority", "priority", "updated the priority to"),
+        ("description_html", "description", "updated the description to"),
+        ("start_date", "start_date", "updated the start date to "),
+        ("target_date", "target_date", "updated the target date to"),
+    ] {
+        if before.get(key) != after.get(key) {
+            let mut event =
+                crate::activity::ActivityEvent::new(pk, project_id, p.workspace_id(), user.id, "updated", comment);
+            event.field = Some(field);
+            event.old_value =
+                before
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .or(if key.ends_with("_date") { Some("") } else { None });
+            event.new_value =
+                after
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .or(if key.ends_with("_date") { Some("") } else { None });
+            crate::activity::record(&mut *tx, event).await?;
+            if key == "description_html" {
+                let result = sqlx::query("UPDATE issue_description_versions v SET description_html=i.description_html,description_stripped=i.description_stripped,description_json=i.description_json,description_binary=i.description_binary,last_saved_at=now() FROM issues i WHERE v.id=(SELECT id FROM issue_description_versions WHERE issue_id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL ORDER BY last_saved_at DESC LIMIT 1) AND v.owned_by_id=$4 AND v.last_saved_at >= now() - interval '10 minutes' AND i.id=$1 AND i.project_id=$2 AND i.workspace_id=$3 AND i.deleted_at IS NULL")
+                    .bind(pk).bind(project_id).bind(p.workspace_id()).bind(user.id).execute(&mut *tx).await?;
+                if result.rows_affected() == 0 {
+                    sqlx::query("INSERT INTO issue_description_versions (issue_id,project_id,workspace_id,owned_by_id,created_by_id,updated_by_id,description_html,description_stripped,description_json,description_binary) SELECT id,project_id,workspace_id,$4,$4,$4,description_html,description_stripped,description_json,description_binary FROM issues WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL")
+                        .bind(pk).bind(project_id).bind(p.workspace_id()).bind(user.id).execute(&mut *tx).await?;
+                }
+            }
+        }
+    }
     tx.commit().await?;
     crate::webhook_out::emit(&st, p.workspace_id(), "issue", "updated", serde_json::json!({"id": pk}));
     Ok(Json(read_item(&st, &p, pk).await?))
@@ -1303,6 +1553,7 @@ async fn destroy(
 ) -> ApiResult<StatusCode> {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER, GUEST])?;
+    let mut tx = st.db.begin().await?;
     let r = sqlx::query(
         "UPDATE issues SET deleted_at = now(), updated_at = now(), updated_by_id = $4
          WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL AND ($5 OR created_by_id = $4)",
@@ -1312,11 +1563,22 @@ async fn destroy(
     .bind(p.workspace_id())
     .bind(user.id)
     .bind(p.is_admin() || p.ws.is_admin())
-    .execute(&st.db)
+    .execute(&mut *tx)
     .await?;
     if r.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
+    let mut event = crate::activity::ActivityEvent::new(
+        pk,
+        project_id,
+        p.workspace_id(),
+        user.id,
+        "deleted",
+        "deleted the issue",
+    );
+    event.field = Some("issue");
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     crate::webhook_out::emit(&st, p.workspace_id(), "issue", "deleted", serde_json::json!({"id": pk}));
     no_content()
 }

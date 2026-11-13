@@ -2451,6 +2451,7 @@ async fn v1_create_intake_issue(
     .fetch_one(&mut *tx)
     .await?;
 
+    crate::activity::record(&mut *tx, crate::activity::ActivityEvent::new(issue_id, pid, p.workspace_id(), user.id, "created", "created the issue")).await?;
     tx.commit().await?;
 
     let val: Value = sqlx::query_scalar(&format!(

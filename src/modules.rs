@@ -533,8 +533,17 @@ async fn add_module_issues(
     .bind(p.workspace_id())
     .fetch_all(&st.db)
     .await?;
+    let mut tx = st.db.begin().await?;
+    let name: String = sqlx::query_scalar(
+        "SELECT name FROM modules WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+    )
+    .bind(module_id)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .fetch_one(&mut *tx)
+    .await?;
     for id in valid {
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO module_issues (issue_id, module_id, project_id, workspace_id, created_by_id, updated_by_id)
              VALUES ($1, $2, $3, $4, $5, $5) ON CONFLICT DO NOTHING",
         )
@@ -543,10 +552,24 @@ async fn add_module_issues(
         .bind(project_id)
         .bind(p.workspace_id())
         .bind(user.id)
-        .execute(&st.db)
+        .execute(&mut *tx)
         .await?;
+        if result.rows_affected() > 0 {
+            crate::activity::grouping(
+                &mut tx,
+                id,
+                project_id,
+                p.workspace_id(),
+                user.id,
+                "modules",
+                module_id,
+                &name,
+                true,
+            )
+            .await?;
+        }
     }
-    // ponytail: issue activity rows skipped; the UI reads them only in the module activity tab.
+    tx.commit().await?;
     created(json!({"message": "success"}))
 }
 
@@ -588,8 +611,9 @@ async fn add_issue_modules(
     .bind(p.workspace_id())
     .fetch_all(&st.db)
     .await?;
+    let mut tx = st.db.begin().await?;
     for m in valid {
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO module_issues (issue_id, module_id, project_id, workspace_id, created_by_id, updated_by_id)
              VALUES ($1, $2, $3, $4, $5, $5) ON CONFLICT DO NOTHING",
         )
@@ -598,11 +622,16 @@ async fn add_issue_modules(
         .bind(project_id)
         .bind(p.workspace_id())
         .bind(user.id)
-        .execute(&st.db)
+        .execute(&mut *tx)
         .await?;
+        if result.rows_affected() > 0 {
+            let name: String = sqlx::query_scalar("SELECT name FROM modules WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL")
+                .bind(m).bind(project_id).bind(p.workspace_id()).fetch_one(&mut *tx).await?;
+            crate::activity::grouping(&mut tx, issue_id, project_id, p.workspace_id(), user.id, "modules", m, &name, true).await?;
+        }
     }
     for m in body.removed_modules.unwrap_or_default() {
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE module_issues SET deleted_at = now() WHERE issue_id = $1 AND module_id = $2
              AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
         )
@@ -610,9 +639,15 @@ async fn add_issue_modules(
         .bind(m)
         .bind(project_id)
         .bind(p.workspace_id())
-        .execute(&st.db)
+        .execute(&mut *tx)
         .await?;
+        if result.rows_affected() > 0 {
+            let name: String = sqlx::query_scalar("SELECT name FROM modules WHERE id=$1 AND project_id=$2 AND workspace_id=$3")
+                .bind(m).bind(project_id).bind(p.workspace_id()).fetch_one(&mut *tx).await?;
+            crate::activity::grouping(&mut tx, issue_id, project_id, p.workspace_id(), user.id, "modules", m, &name, false).await?;
+        }
     }
+    tx.commit().await?;
     created(json!({"message": "success"}))
 }
 
@@ -648,7 +683,8 @@ async fn remove_issue(
 ) -> ApiResult<StatusCode> {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER])?;
-    sqlx::query(
+    let mut tx = st.db.begin().await?;
+    let result = sqlx::query(
         "UPDATE module_issues SET deleted_at = now() WHERE module_id = $1 AND issue_id = $2 AND project_id = $3
          AND workspace_id = $4 AND deleted_at IS NULL",
     )
@@ -656,8 +692,30 @@ async fn remove_issue(
     .bind(issue_id)
     .bind(project_id)
     .bind(p.workspace_id())
-    .execute(&st.db)
+    .execute(&mut *tx)
     .await?;
+    if result.rows_affected() > 0 {
+        let name: String =
+            sqlx::query_scalar("SELECT name FROM modules WHERE id=$1 AND project_id=$2 AND workspace_id=$3")
+                .bind(module_id)
+                .bind(project_id)
+                .bind(p.workspace_id())
+                .fetch_one(&mut *tx)
+                .await?;
+        crate::activity::grouping(
+            &mut tx,
+            issue_id,
+            project_id,
+            p.workspace_id(),
+            user.id,
+            "modules",
+            module_id,
+            &name,
+            false,
+        )
+        .await?;
+    }
+    tx.commit().await?;
     no_content()
 }
 
