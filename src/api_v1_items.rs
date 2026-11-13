@@ -1551,6 +1551,70 @@ async fn update(
             }
         }
     }
+    // Plane `IssueSerializer.update`: `labels` / `assignees` replace the whole set when present.
+    for (keys, table, col) in [
+        (["labels", "label_ids"], "issue_labels", "label_id"),
+        (["assignees", "assignee_ids"], "issue_assignees", "assignee_id"),
+    ] {
+        let Some(key) = keys.into_iter().find(|k| b.get(*k).is_some()) else { continue };
+        let wanted = uuid_list(&b, key)?;
+        let valid: Vec<Uuid> = if table == "issue_labels" {
+            sqlx::query_scalar("SELECT id FROM labels WHERE id=ANY($1) AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL")
+                .bind(&wanted).bind(project_id).bind(p.workspace_id()).fetch_all(&mut *tx).await?
+        } else {
+            sqlx::query_scalar("SELECT member_id FROM project_members WHERE member_id=ANY($1) AND project_id=$2 AND workspace_id=$3 AND is_active AND role>=15 AND deleted_at IS NULL")
+                .bind(&wanted).bind(project_id).bind(p.workspace_id()).fetch_all(&mut *tx).await?
+        };
+        if let Some(bad) = wanted.iter().find(|id| !valid.contains(id)) {
+            let msg = if table == "issue_labels" {
+                format!("Labels ['{bad}'] do not belong to this project")
+            } else {
+                format!("Assignees ['{bad}'] are not active members of this project")
+            };
+            return Err(ApiError::bad_body(json!({"non_field_errors": [msg]})));
+        }
+        let before_ids: Vec<Uuid> = sqlx::query_scalar(&format!(
+            "SELECT {col} FROM {table} WHERE issue_id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL"
+        ))
+        .bind(pk).bind(project_id).bind(p.workspace_id()).fetch_all(&mut *tx).await?;
+        sqlx::query(&format!(
+            "UPDATE {table} SET deleted_at=now(), updated_at=now(), updated_by_id=$5 WHERE issue_id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL AND NOT ({col}=ANY($4))"
+        ))
+        .bind(pk).bind(project_id).bind(p.workspace_id()).bind(&valid).bind(user.id).execute(&mut *tx).await?;
+        let added: Vec<Uuid> = valid.iter().copied().filter(|id| !before_ids.contains(id)).collect();
+        let removed: Vec<Uuid> = before_ids.iter().copied().filter(|id| !valid.contains(id)).collect();
+        for id in &added {
+            sqlx::query(&format!(
+                "INSERT INTO {table} (issue_id,project_id,workspace_id,{col},created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$5,$5)"
+            ))
+            .bind(pk).bind(project_id).bind(p.workspace_id()).bind(id).bind(user.id).execute(&mut *tx).await?;
+        }
+        for (id, is_added) in added.iter().map(|i| (*i, true)).chain(removed.iter().map(|i| (*i, false))) {
+            let name: Option<String> = if table == "issue_labels" {
+                sqlx::query_scalar("SELECT name FROM labels WHERE id=$1 AND project_id=$2 AND workspace_id=$3")
+                    .bind(id).bind(project_id).bind(p.workspace_id()).fetch_optional(&mut *tx).await?
+            } else {
+                sqlx::query_scalar("SELECT display_name FROM users WHERE id=$1").bind(id).fetch_optional(&mut *tx).await?
+            };
+            let Some(name) = name else { continue };
+            let (field, comment) = match (table, is_added) {
+                ("issue_labels", true) => ("labels", "added label "),
+                ("issue_labels", false) => ("labels", "removed label "),
+                (_, true) => ("assignees", "added assignee "),
+                (_, false) => ("assignees", "removed assignee "),
+            };
+            let mut event = crate::activity::ActivityEvent::new(pk, project_id, p.workspace_id(), user.id, "updated", comment);
+            event.field = Some(field);
+            event.old_value = Some(if is_added { "" } else { name.as_str() });
+            event.new_value = Some(if is_added { name.as_str() } else { "" });
+            if is_added {
+                event.new_identifier = Some(id);
+            } else {
+                event.old_identifier = Some(id);
+            }
+            crate::activity::record(&mut *tx, event).await?;
+        }
+    }
     let activities = crate::notify::snapshots(&mut tx, pk, project_id, p.workspace_id()).await?;
     tx.commit().await?;
     crate::notify::after_activity(&st, pk, project_id, p.workspace_id(), user.id, activities);
