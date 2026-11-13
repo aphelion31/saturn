@@ -504,6 +504,7 @@ async fn attachment_confirm(
     event.new_identifier = Some(pk);
     crate::activity::record(&mut *tx, event).await?;
     tx.commit().await?;
+    crate::side_effects::spawn_asset_storage_metadata(st.clone(), pk);
     no_content()
 }
 
@@ -892,6 +893,7 @@ async fn link_create(
     event.new_identifier = Some(id);
     crate::activity::record(&mut *tx, event).await?;
     tx.commit().await?;
+    crate::side_effects::spawn_crawl_work_item_link_title(st.clone(), p.workspace_id(), id, url);
     let Json(v) = link_retrieve(State(st), user, Path((slug, project_id, issue_id, id))).await?;
     created(v)
 }
@@ -950,6 +952,9 @@ async fn link_update(
         crate::activity::record(&mut *tx, event).await?;
     }
     tx.commit().await?;
+    if let Some(url) = url {
+        crate::side_effects::spawn_crawl_work_item_link_title(st.clone(), p.workspace_id(), pk, url);
+    }
     link_retrieve(State(st), user, Path((slug, project_id, issue_id, pk))).await
 }
 

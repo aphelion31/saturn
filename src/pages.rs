@@ -128,6 +128,7 @@ async fn create(
     sqlx::query("INSERT INTO project_pages (workspace_id,project_id,page_id,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$4)")
         .bind(ctx.workspace_id()).bind(project).bind(id).bind(user.id).execute(&mut *tx).await?;
     tx.commit().await?;
+    crate::side_effects::spawn_page_transaction(st.clone(), ctx.workspace_id(), id, Some(html), None);
     let Json(v) = fetch(&st, &user, &slug, project, id).await?;
     Ok((StatusCode::CREATED, Json(v)))
 }
@@ -139,8 +140,8 @@ async fn update(
 ) -> ApiResult {
     let ctx = require_project(&st.db, &user, &slug, project).await?;
     ctx.require(&[ADMIN, MEMBER])?;
-    let row: Option<(bool, Uuid, i16)> = sqlx::query_as(&format!(
-        "SELECT p.is_locked,p.owned_by_id,p.access FROM pages p WHERE {SCOPE} AND p.id=$5"
+    let row: Option<(bool, Uuid, i16, Option<String>)> = sqlx::query_as(&format!(
+        "SELECT p.is_locked,p.owned_by_id,p.access,p.description_html FROM pages p WHERE {SCOPE} AND p.id=$5"
     ))
     .bind(ctx.workspace_id())
     .bind(project)
@@ -149,7 +150,7 @@ async fn update(
     .bind(id)
     .fetch_optional(&st.db)
     .await?;
-    let (locked, owner, old_access) = row.ok_or_else(ApiError::not_found)?;
+    let (locked, owner, old_access, old_html) = row.ok_or_else(ApiError::not_found)?;
     if locked {
         return Err(ApiError::bad("Page is locked"));
     }
@@ -163,7 +164,10 @@ async fn update(
     let html = s(&b, "description_html").map(sanitize_html).transpose()?;
     let stripped = html.as_deref().map(strip_tags);
     sqlx::query(&format!("WITH updated AS (UPDATE pages p SET name=COALESCE($6,p.name),color=COALESCE($7,p.color),access=$8,view_props=COALESCE($9,p.view_props),logo_props=COALESCE($10,p.logo_props),description_html=COALESCE($11,p.description_html),description_stripped=COALESCE($12,p.description_stripped),updated_by_id=$3,updated_at=now() WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked RETURNING p.*) INSERT INTO page_versions (workspace_id,page_id,owned_by_id,created_by_id,updated_by_id,last_saved_at,description_binary,description_html,description_json,description_stripped) SELECT workspace_id,id,owned_by_id,$3,$3,now(),description_binary,description_html,description_json,description_stripped FROM updated WHERE $11::text IS NOT NULL"))
-        .bind(ctx.workspace_id()).bind(project).bind(user.id).bind(ctx.restricted_guest()).bind(id).bind(s(&b,"name")).bind(s(&b,"color")).bind(access as i16).bind(b.get("view_props")).bind(b.get("logo_props")).bind(html).bind(stripped).execute(&st.db).await?;
+        .bind(ctx.workspace_id()).bind(project).bind(user.id).bind(ctx.restricted_guest()).bind(id).bind(s(&b,"name")).bind(s(&b,"color")).bind(access as i16).bind(b.get("view_props")).bind(b.get("logo_props")).bind(&html).bind(stripped).execute(&st.db).await?;
+    if html.is_some() {
+        crate::side_effects::spawn_page_transaction(st.clone(), ctx.workspace_id(), id, html, old_html);
+    }
     fetch(&st, &user, &slug, project, id).await
 }
 async fn destroy(
@@ -239,10 +243,26 @@ async fn update_description(
         Some(Value::String(v)) => Some(STANDARD.decode(v).map_err(|_| ApiError::bad("Invalid base64"))?),
         _ => return Err(ApiError::bad("Invalid description_binary")),
     };
+    let old_html: Option<String> = if html.is_some() {
+        sqlx::query_scalar(&format!("SELECT p.description_html FROM pages p WHERE {SCOPE} AND p.id=$5"))
+            .bind(ctx.workspace_id())
+            .bind(project)
+            .bind(user.id)
+            .bind(ctx.restricted_guest())
+            .bind(id)
+            .fetch_optional(&st.db)
+            .await?
+            .flatten()
+    } else {
+        None
+    };
     let r = sqlx::query(&format!("WITH updated AS (UPDATE pages p SET description_binary=COALESCE($6,p.description_binary),description_html=COALESCE($7,p.description_html),description_json=COALESCE($8,p.description_json),description_stripped=COALESCE($9,p.description_stripped),updated_at=now(),updated_by_id=$3 WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL RETURNING p.*) INSERT INTO page_versions (workspace_id,page_id,owned_by_id,created_by_id,updated_by_id,last_saved_at,description_binary,description_html,description_json,description_stripped) SELECT workspace_id,id,owned_by_id,$3,$3,now(),description_binary,description_html,description_json,description_stripped FROM updated"))
-        .bind(ctx.workspace_id()).bind(project).bind(user.id).bind(ctx.restricted_guest()).bind(id).bind(binary).bind(html).bind(b.get("description_json")).bind(stripped).execute(&st.db).await?;
+        .bind(ctx.workspace_id()).bind(project).bind(user.id).bind(ctx.restricted_guest()).bind(id).bind(binary).bind(&html).bind(b.get("description_json")).bind(stripped).execute(&st.db).await?;
     if r.rows_affected() == 0 {
         return Err(ApiError::not_found());
+    }
+    if html.is_some() {
+        crate::side_effects::spawn_page_transaction(st.clone(), ctx.workspace_id(), id, html, old_html);
     }
     Ok(Json(json!({"message":"Updated successfully"})))
 }
@@ -362,11 +382,13 @@ async fn duplicate(
     let ctx = require_project(&st.db, &user, &slug, project).await?;
     ctx.require(&[ADMIN, MEMBER])?;
     let mut tx = st.db.begin().await?;
-    let new_id: Option<Uuid> = sqlx::query_scalar(&format!("INSERT INTO pages (workspace_id,name,color,owned_by_id,created_by_id,updated_by_id,access,description_html,description_stripped,description_json,view_props,logo_props) SELECT p.workspace_id,p.name || ' (Copy)',p.color,$3,$3,$3,p.access,p.description_html,p.description_stripped,p.description_json,p.view_props,p.logo_props FROM pages p WHERE {SCOPE} AND p.id=$5 RETURNING id"))
+    let row: Option<(Uuid, Option<String>)> = sqlx::query_as(&format!("INSERT INTO pages (workspace_id,name,color,owned_by_id,created_by_id,updated_by_id,access,description_html,description_stripped,description_json,view_props,logo_props) SELECT p.workspace_id,p.name || ' (Copy)',p.color,$3,$3,$3,p.access,p.description_html,p.description_stripped,p.description_json,p.view_props,p.logo_props FROM pages p WHERE {SCOPE} AND p.id=$5 RETURNING id,description_html"))
         .bind(ctx.workspace_id()).bind(project).bind(user.id).bind(ctx.restricted_guest()).bind(id).fetch_optional(&mut *tx).await?;
-    let new_id = new_id.ok_or_else(ApiError::not_found)?;
+    let (new_id, copied_html) = row.ok_or_else(ApiError::not_found)?;
     sqlx::query("INSERT INTO project_pages (workspace_id,project_id,page_id,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$4)").bind(ctx.workspace_id()).bind(project).bind(new_id).bind(user.id).execute(&mut *tx).await?;
     tx.commit().await?;
+    crate::side_effects::spawn_copy_page_assets(st.clone(), ctx.workspace_id(), project, new_id, user.id);
+    crate::side_effects::spawn_page_transaction(st.clone(), ctx.workspace_id(), new_id, copied_html, None);
     let Json(v) = fetch(&st, &user, &slug, project, new_id).await?;
     Ok((StatusCode::CREATED, Json(v)))
 }

@@ -12,7 +12,7 @@ fn signature(secret: &str, body: &[u8]) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
-async fn client(raw: &str) -> Result<reqwest::Client, String> {
+pub(crate) async fn pinned_client(raw: &str, timeout: Duration) -> Result<reqwest::Client, String> {
     let url = url::Url::parse(raw).map_err(|e| e.to_string())?;
     if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() {
         return Err("invalid URL".into());
@@ -31,7 +31,7 @@ async fn client(raw: &str) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(30))
+        .timeout(timeout)
         .resolve_to_addrs(host, &addresses)
         .build()
         .map_err(|e| e.to_string())
@@ -72,7 +72,7 @@ pub fn emit(st: &AppState, workspace_id: Uuid, event: &str, action: &str, payloa
                 let delivery = Uuid::new_v4().to_string();
                 let sig = signature(&secret, body.as_bytes());
                 let headers = json!({"Content-Type":"application/json","User-Agent":"Autopilot","X-Plane-Delivery":delivery,"X-Plane-Event":event,"X-Plane-Signature":sig}).to_string();
-                let resolved = client(&url).await;
+                let resolved = pinned_client(&url, Duration::from_secs(30)).await;
                 let rejected = resolved.is_err();
                 let result = match resolved {
                     Ok(client) => client

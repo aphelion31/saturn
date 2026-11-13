@@ -617,6 +617,7 @@ async fn set_uploaded(st: &AppState, asset_id: Uuid, entity_type: &str, b: &Valu
         .bind(b.get("attributes"))
         .execute(&st.db)
         .await?;
+    crate::side_effects::spawn_asset_storage_metadata(st.clone(), asset_id);
     // Point the owning entity at the new asset, as Plane's entity_asset_save does.
     let sql = match entity_type {
         "WORKSPACE_LOGO" => {
@@ -1124,6 +1125,7 @@ async fn mark_attachment_uploaded(
     event.new_identifier = Some(asset_id);
     crate::activity::record(&mut *tx, event).await?;
     tx.commit().await?;
+    crate::side_effects::spawn_asset_storage_metadata(st.clone(), asset_id);
     no_content()
 }
 

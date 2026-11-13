@@ -231,6 +231,9 @@ async fn update(
         .bind(uploaded)
         .execute(&st.db)
         .await?;
+    if uploaded {
+        crate::side_effects::spawn_asset_storage_metadata(st.clone(), id);
+    }
     no_content()
 }
 
