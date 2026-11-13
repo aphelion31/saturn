@@ -1075,6 +1075,7 @@ async fn identifier_detail(
     State(st): State<AppState>,
     user: CurrentUser,
     Path((slug, ident)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> ApiResult {
     let (project, seq) = ident
         .rsplit_once('-')
@@ -1092,11 +1093,29 @@ async fn identifier_detail(
     let p = require_project(&st.db, &user, &slug, pid).await?;
     let id:Uuid=sqlx::query_scalar("SELECT id FROM issues WHERE workspace_id=$1 AND project_id=$2 AND sequence_id=$3 AND deleted_at IS NULL AND (NOT $4 OR created_by_id=$5)").bind(ws.workspace_id).bind(pid).bind(seq).bind(p.restricted_guest()).bind(user.id).fetch_optional(&st.db).await?.ok_or_else(ApiError::not_found)?;
     let sql = format!(
-        "SELECT {} || jsonb_build_object('description_html',i.description_html) FROM issues i WHERE i.workspace_id=$1 AND i.project_id=$2 AND i.id=$3 AND i.deleted_at IS NULL",
+        "SELECT ({} - 'state__group' - 'type_id') || jsonb_build_object('description_html',i.description_html,
+         'is_subscribed', EXISTS(SELECT 1 FROM issue_subscribers s WHERE s.workspace_id=i.workspace_id AND s.project_id=i.project_id AND s.issue_id=i.id AND s.subscriber_id=$4 AND s.deleted_at IS NULL),
+         'is_intake', EXISTS(SELECT 1 FROM intake_issues t WHERE t.workspace_id=i.workspace_id AND t.project_id=i.project_id AND t.issue_id=i.id AND t.status IN (-2,0) AND t.deleted_at IS NULL))
+         || CASE WHEN $5 THEN jsonb_build_object('parent', (SELECT jsonb_build_object('id',p.id,'sequence_id',p.sequence_id,'project_id',p.project_id) FROM issues p WHERE p.id=i.parent_id AND p.workspace_id=i.workspace_id AND p.project_id=i.project_id AND p.deleted_at IS NULL)) ELSE '{{}}'::jsonb END
+         || CASE WHEN $6 THEN jsonb_build_object('issue_reactions', COALESCE((SELECT jsonb_agg(jsonb_build_object('id',r.id,'actor',r.actor_id,'issue',r.issue_id,'reaction',r.reaction,'display_name',u.display_name)) FROM issue_reactions r JOIN users u ON u.id=r.actor_id WHERE r.workspace_id=i.workspace_id AND r.project_id=i.project_id AND r.issue_id=i.id AND r.deleted_at IS NULL),'[]'::jsonb)) ELSE '{{}}'::jsonb END
+         || CASE WHEN $7 THEN jsonb_build_object('issue_link', COALESCE((SELECT jsonb_agg(jsonb_build_object('id',l.id,'issue_id',l.issue_id,'title',l.title,'url',l.url,'metadata',l.metadata,'created_by_id',l.created_by_id,'created_at',l.created_at)) FROM issue_links l WHERE l.workspace_id=i.workspace_id AND l.project_id=i.project_id AND l.issue_id=i.id AND l.deleted_at IS NULL),'[]'::jsonb)) ELSE '{{}}'::jsonb END
+         || CASE WHEN $8 THEN jsonb_build_object('issue_attachments', COALESCE((SELECT jsonb_agg(jsonb_build_object('id',f.id,'asset',f.asset,'attributes',f.attributes,'created_by',f.created_by_id,'updated_at',f.updated_at,'updated_by',f.updated_by_id,'asset_url','/api/assets/v2/workspaces/' || $9 || '/projects/' || f.project_id || '/issues/' || f.issue_id || '/attachments/' || f.id || '/')) FROM file_assets f WHERE f.workspace_id=i.workspace_id AND f.project_id=i.project_id AND f.issue_id=i.id AND f.entity_type='ISSUE_ATTACHMENT' AND f.deleted_at IS NULL),'[]'::jsonb)) ELSE '{{}}'::jsonb END
+         FROM issues i WHERE i.workspace_id=$1 AND i.project_id=$2 AND i.id=$3 AND i.deleted_at IS NULL",
         workitems::ITEM_JSON
     );
+    let expand = query.get("expand").map(String::as_str).unwrap_or("");
+    let has = |name| expand.split(',').any(|part| part == name);
     json_row(
-        sqlx::query_scalar(&sql).bind(ws.workspace_id).bind(pid).bind(id),
+        sqlx::query_scalar(&sql)
+            .bind(ws.workspace_id)
+            .bind(pid)
+            .bind(id)
+            .bind(user.id)
+            .bind(has("parent"))
+            .bind(has("issue_reactions"))
+            .bind(has("issue_link"))
+            .bind(has("issue_attachments"))
+            .bind(slug),
         &st.db,
     )
     .await

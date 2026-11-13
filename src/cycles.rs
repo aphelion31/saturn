@@ -1115,7 +1115,21 @@ async fn workspace_list(State(st): State<AppState>, user: CurrentUser, Path(slug
             .bind(user.id)
             .fetch_all(&st.db)
             .await?;
-        out.extend(rows);
+        out.extend(rows.into_iter().map(|mut row| {
+            if let Some(obj) = row.as_object_mut() {
+                for key in [
+                    "archived_at",
+                    "assignee_ids",
+                    "created_by",
+                    "is_favorite",
+                    "status",
+                    "version",
+                ] {
+                    obj.remove(key);
+                }
+            }
+            row
+        }));
     }
     Ok(Json(Value::Array(out)))
 }

@@ -24,10 +24,10 @@ mod assets;
 mod cycles;
 mod external;
 mod issues;
+mod live_doc;
 mod modules;
 mod notifications;
 mod pages;
-mod live_doc;
 mod projects;
 mod public;
 mod recent_visits;
@@ -79,7 +79,7 @@ pub fn app(state: AppState) -> Router {
         .merge(analytics::routes())
         .merge(user_dash::routes())
         .merge(external::routes())
-        .route("/api/{*rest}", any(web::not_implemented))
+        .route("/api/{*rest}", any(web::api_not_found))
         .route("/auth/{*rest}", any(web::not_implemented))
         .layer(middleware::from_fn_with_state(state.clone(), web::origin_check));
     Router::new()

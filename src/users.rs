@@ -32,10 +32,18 @@ pub fn routes() -> Router<AppState> {
         .route("/api/users/me/onboard/", patch(onboard))
         .route("/api/users/me/tour-completed/", patch(tour_completed))
         .route("/api/users/api-tokens/", get(tokens_list).post(token_create))
-        .route("/api/users/api-tokens/{pk}/", get(token_retrieve).patch(token_update).delete(token_delete))
+        .route(
+            "/api/users/api-tokens/{pk}/",
+            get(token_retrieve).patch(token_update).delete(token_delete),
+        )
 }
 
-async fn token_update(State(st): State<AppState>, user: CurrentUser, Path(pk): Path<Uuid>, Json(b): Json<Value>) -> ApiResult {
+async fn token_update(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path(pk): Path<Uuid>,
+    Json(b): Json<Value>,
+) -> ApiResult {
     for key in ["label", "description"] {
         if b.get(key).is_some_and(|v| !v.is_string()) {
             return Err(ApiError::bad_body(json!({key: ["Not a valid string."]})));
@@ -50,7 +58,9 @@ async fn token_update(State(st): State<AppState>, user: CurrentUser, Path(pk): P
 /// reset onboarding, scramble the password and deactivate. One transaction so a refusal changes nothing.
 async fn deactivate(State(st): State<AppState>, user: CurrentUser) -> Result<Response, ApiError> {
     if crate::auth::is_instance_admin(&st, user.id).await? {
-        return Err(ApiError::bad("You cannot deactivate your account since you are an instance admin"));
+        return Err(ApiError::bad(
+            "You cannot deactivate your account since you are an instance admin",
+        ));
     }
     // A membership blocks deactivation when it has other members but no other active admin. Plane's
     // annotate counts only the user's own row (total_members is always 1), so its guard never fires and
@@ -64,19 +74,40 @@ async fn deactivate(State(st): State<AppState>, user: CurrentUser) -> Result<Res
         )
     };
     let mut tx = st.db.begin().await?;
-    sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR UPDATE").bind(user.id).execute(&mut *tx).await?;
-    for (table, scope, what) in [("project_members", "project_id", "projects"), ("workspace_members", "workspace_id", "workspaces")] {
-        let blocked: bool = sqlx::query_scalar(&sole(table, scope)).bind(user.id).fetch_one(&mut *tx).await?;
+    sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR UPDATE")
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+    for (table, scope, what) in [
+        ("project_members", "project_id", "projects"),
+        ("workspace_members", "workspace_id", "workspaces"),
+    ] {
+        let blocked: bool = sqlx::query_scalar(&sole(table, scope))
+            .bind(user.id)
+            .fetch_one(&mut *tx)
+            .await?;
         if blocked {
             return Err(ApiError::bad(format!(
                 "You cannot deactivate account as you are the only admin in some {what}."
             )));
         }
     }
-    sqlx::query("UPDATE project_members SET is_active = false WHERE member_id = $1 AND is_active").bind(user.id).execute(&mut *tx).await?;
-    sqlx::query("UPDATE workspace_members SET is_active = false WHERE member_id = $1 AND is_active").bind(user.id).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM workspace_member_invites WHERE email = $1").bind(&user.email).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM sessions WHERE user_id = $1").bind(user.id.to_string()).execute(&mut *tx).await?;
+    sqlx::query("UPDATE project_members SET is_active = false WHERE member_id = $1 AND is_active")
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE workspace_members SET is_active = false WHERE member_id = $1 AND is_active")
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM workspace_member_invites WHERE email = $1")
+        .bind(&user.email)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+        .bind(user.id.to_string())
+        .execute(&mut *tx)
+        .await?;
     sqlx::query(
         "UPDATE profiles SET last_workspace_id = NULL, is_tour_completed = false, is_onboarded = false,
            onboarding_step = '{\"workspace_join\": false, \"profile_complete\": false, \"workspace_create\": false, \"workspace_invite\": false}'::jsonb
@@ -94,10 +125,22 @@ async fn deactivate(State(st): State<AppState>, user: CurrentUser) -> Result<Res
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    let text = format!("Your account has been deactivated on Plane. {}/login", st.cfg.web_url.trim_end_matches('/'));
-    crate::outbound::send_mail_bg(&st, user.email.clone(), format!("{} has been deactivated on Plane", user.email), ammonia::clean(&text), text);
+    let text = format!(
+        "Your account has been deactivated on Plane. {}/login",
+        st.cfg.web_url.trim_end_matches('/')
+    );
+    crate::outbound::send_mail_bg(
+        &st,
+        user.email.clone(),
+        format!("{} has been deactivated on Plane", user.email),
+        ammonia::clean(&text),
+        text,
+    );
     let mut headers = HeaderMap::new();
-    headers.insert(header::SET_COOKIE, session::set_cookie(&st, session::COOKIE, None, 0).parse().unwrap());
+    headers.insert(
+        header::SET_COOKIE,
+        session::set_cookie(&st, session::COOKIE, None, 0).parse().unwrap(),
+    );
     Ok((StatusCode::NO_CONTENT, headers).into_response())
 }
 
@@ -106,7 +149,7 @@ async fn deactivate(State(st): State<AppState>, user: CurrentUser) -> Result<Res
 /// APITokenReadSerializer fields (no `token`). `is_active` is computed from `expired_at`, as Plane does.
 const TOKEN_READ_JSON: &str = "jsonb_build_object('id', t.id, 'label', t.label, 'description', t.description,
     'user', t.user_id, 'user_type', t.user_type, 'workspace', t.workspace_id, 'expired_at', t.expired_at,
-    'last_used', t.last_used, 'created_at', t.created_at, 'updated_at', t.updated_at,
+    'last_used', t.last_used, 'created_at', t.created_at, 'updated_at', t.updated_at, 'deleted_at', t.deleted_at,
     'created_by', t.created_by_id, 'updated_by', t.updated_by_id,
     'is_active', (t.expired_at IS NULL OR t.expired_at > now()))";
 
@@ -325,7 +368,7 @@ async fn settings(State(st): State<AppState>, user: CurrentUser) -> ApiResult {
 }
 
 /// ProfileSerializer is `fields = "__all__"`: every column, with the FK as `user`.
-const PROFILE_JSON: &str = "to_jsonb(p) - 'user_id' || jsonb_build_object('user', p.user_id, 'user_timezone', (SELECT u.user_timezone FROM users u WHERE u.id = p.user_id))";
+const PROFILE_JSON: &str = "to_jsonb(p) - 'user_id' || jsonb_build_object('user', p.user_id)";
 
 async fn ensure_profile(st: &AppState, user_id: Uuid) -> Result<(), ApiError> {
     sqlx::query(

@@ -265,7 +265,8 @@ const MEMBER_JSON: &str =
     "jsonb_build_object('id', m.id, 'role', m.role, 'member', {USER}, 'workspace', m.workspace_id,
     'is_active', m.is_active, 'created_at', m.created_at, 'updated_at', m.updated_at, 'view_props', m.view_props,
     'default_props', m.default_props, 'issue_props', m.issue_props, 'company_role', m.company_role,
-    'created_by', m.created_by_id, 'updated_by', m.updated_by_id, 'deleted_at', m.deleted_at)";
+    'created_by', m.created_by_id, 'updated_by', m.updated_by_id, 'deleted_at', m.deleted_at,
+    'explored_features', m.explored_features, 'getting_started_checklist', m.getting_started_checklist, 'tips', m.tips)";
 
 async fn members_list(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>) -> ApiResult {
     let ws = require_workspace(&st.db, &user, &slug).await?;
@@ -494,7 +495,7 @@ async fn member_me(State(st): State<AppState>, user: CurrentUser, Path(slug): Pa
     let ws = require_workspace(&st.db, &user, &slug).await?;
     json_row(
         sqlx::query_scalar(
-            "SELECT to_jsonb(m) || jsonb_build_object('draft_issue_count', (
+            "SELECT (to_jsonb(m) - 'member_id' - 'workspace_id' - 'created_by_id' - 'updated_by_id') || jsonb_build_object('member', m.member_id, 'workspace', m.workspace_id, 'created_by', m.created_by_id, 'updated_by', m.updated_by_id, 'draft_issue_count', (
                 SELECT count(*) FROM draft_issues d WHERE d.created_by_id = $2 AND d.workspace_id = $1 AND d.deleted_at IS NULL))
              FROM workspace_members m WHERE m.workspace_id = $1 AND m.member_id = $2 AND m.is_active AND m.deleted_at IS NULL",
         )
@@ -557,7 +558,7 @@ const USER_PROPERTIES_FIELDS: &[(&str, &str)] = &[
 ];
 
 const USER_PROPERTIES_JSON: &str = "to_jsonb(p) - 'user_id' - 'workspace_id' - 'created_by_id' - 'updated_by_id'
-    || jsonb_build_object('user', p.user_id, 'workspace', p.workspace_id)";
+    || jsonb_build_object('user', p.user_id, 'workspace', p.workspace_id, 'created_by', p.created_by_id, 'updated_by', p.updated_by_id)";
 
 /// Get-or-create the caller's properties row for the workspace, then return it.
 async fn user_properties_row(st: &AppState, user: &CurrentUser, ws_id: Uuid) -> Result<Value, ApiError> {
@@ -754,10 +755,25 @@ pub(crate) async fn send_workspace_invitation(st: &AppState, workspace: Uuid, in
         .bind(workspace).bind(email).bind(inviter).fetch_one(&st.db).await;
     match row {
         Ok((id, token, slug, workspace_name, name)) => {
-            let Ok(mut link) = url::Url::parse(&format!("{}/workspace-invitations/", st.cfg.web_url.trim_end_matches('/'))) else { tracing::warn!("invalid WEB_URL"); return; };
-            link.query_pairs_mut().append_pair("invitation_id", &id.to_string()).append_pair("slug", &slug).append_pair("token", &token);
+            let Ok(mut link) = url::Url::parse(&format!(
+                "{}/workspace-invitations/",
+                st.cfg.web_url.trim_end_matches('/')
+            )) else {
+                tracing::warn!("invalid WEB_URL");
+                return;
+            };
+            link.query_pairs_mut()
+                .append_pair("invitation_id", &id.to_string())
+                .append_pair("slug", &slug)
+                .append_pair("token", &token);
             let text = format!("{name} has invited you to join them in {workspace_name} on Plane. Visit {link}");
-            crate::outbound::send_mail_bg(st, email.to_owned(), format!("{name} has invited you to join them in {workspace_name} on Plane"), ammonia::clean(&text), text);
+            crate::outbound::send_mail_bg(
+                st,
+                email.to_owned(),
+                format!("{name} has invited you to join them in {workspace_name} on Plane"),
+                ammonia::clean(&text),
+                text,
+            );
         }
         Err(e) => tracing::warn!(error=%e, "workspace invitation email lookup failed"),
     }
