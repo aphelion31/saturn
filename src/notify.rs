@@ -73,6 +73,11 @@ async fn dispatch(
     }
     for a in activities {
         let field = a["field"].as_str().unwrap_or("");
+        // Plane writes "created the issue" with IssueActivity.objects.create, outside the list handed to
+        // notification_task, so issue creation itself never notifies (only e.g. its assignee rows do).
+        if a["field"].is_null() && a["verb"] == "created" {
+            continue;
+        }
         let new_mentions = if field == "comment" || field == "description" {
             mentions(a["new_value"].as_str().unwrap_or(""))
         } else {
@@ -87,17 +92,41 @@ async fn dispatch(
             .bind(issue).bind(project).bind(workspace).bind(&new_mentions).execute(&mut *tx).await?;
         let rows: Vec<(Uuid,String,Value,bool)> = sqlx::query_as("SELECT pm.member_id, CASE WHEN pm.member_id=ANY($5) THEN 'mentioned' WHEN i.created_by_id=pm.member_id THEN 'created' WHEN ia.assignee_id IS NOT NULL THEN 'assigned' ELSE 'subscribed' END, jsonb_build_object('issue',jsonb_build_object('id',i.id,'name',i.name,'identifier',p.identifier,'sequence_id',i.sequence_id,'state_name',s.name,'state_group',s.\"group\",'project_id',p.id,'workspace_slug',w.slug),'issue_activity',jsonb_build_object('id',$6::jsonb->>'id','verb',$6::jsonb->>'verb','field',$6::jsonb->>'field','actor',$6::jsonb->>'actor_id','new_value',$6::jsonb->>'new_value','old_value',$6::jsonb->>'old_value','old_identifier',$6::jsonb->>'old_identifier','new_identifier',$6::jsonb->>'new_identifier','issue_comment',COALESCE(c.comment_stripped,''),'activity_time',$6::jsonb->>'created_at')), CASE WHEN pm.member_id=ANY($5) THEN COALESCE(pref.mention,true) WHEN $7='state' THEN COALESCE(pref.state_change,true) OR (s.\"group\"='completed' AND COALESCE(pref.issue_completed,true)) OR COALESCE(pref.property_change,true) WHEN $7='comment' THEN COALESCE(pref.comment,true) OR COALESCE(pref.property_change,true) ELSE COALESCE(pref.property_change,true) END FROM issues i JOIN projects p ON p.id=i.project_id AND p.workspace_id=i.workspace_id JOIN workspaces w ON w.id=i.workspace_id LEFT JOIN states s ON s.id=i.state_id AND s.project_id=i.project_id AND s.workspace_id=i.workspace_id LEFT JOIN issue_comments c ON c.id=($6::jsonb->>'issue_comment_id')::uuid AND c.issue_id=i.id AND c.project_id=i.project_id AND c.workspace_id=i.workspace_id AND c.deleted_at IS NULL JOIN project_members pm ON pm.project_id=i.project_id AND pm.workspace_id=i.workspace_id AND pm.is_active AND pm.deleted_at IS NULL LEFT JOIN issue_assignees ia ON ia.issue_id=i.id AND ia.project_id=i.project_id AND ia.workspace_id=i.workspace_id AND ia.assignee_id=pm.member_id AND ia.deleted_at IS NULL LEFT JOIN user_notification_preferences pref ON pref.user_id=pm.member_id AND pref.deleted_at IS NULL AND pref.project_id IS NULL AND pref.workspace_id IS NULL WHERE i.id=$1 AND i.project_id=$2 AND i.workspace_id=$3 AND i.deleted_at IS NULL AND pm.member_id<>$4 AND (pm.member_id=ANY($5) OR ($7<>'description' AND (ia.assignee_id IS NOT NULL OR EXISTS (SELECT 1 FROM issue_subscribers sub WHERE sub.issue_id=i.id AND sub.project_id=i.project_id AND sub.workspace_id=i.workspace_id AND sub.subscriber_id=pm.member_id AND sub.deleted_at IS NULL))))")
             .bind(issue).bind(project).bind(workspace).bind(actor).bind(&new_mentions).bind(&a).bind(field).fetch_all(&mut *tx).await?;
-        for (receiver, kind, data, email) in rows {
+        for (receiver, kind, mut data, email) in rows {
             let message = if kind == "mentioned" {
-                Some(format!(
-                    "You have been mentioned in the issue {}",
-                    data["issue"]["name"].as_str().unwrap_or("")
-                ))
+                let issue_name = data["issue"]["name"].as_str().unwrap_or("").to_string();
+                // Plane create_mention_notification: comment mentions name the actor, description ones do not.
+                Some(if field == "comment" {
+                    let actor_name: String = sqlx::query_scalar("SELECT display_name FROM users WHERE id=$1")
+                        .bind(actor).fetch_optional(&mut *tx).await?.unwrap_or_default();
+                    format!("{actor_name} has mentioned you in a comment in issue {issue_name}")
+                } else {
+                    format!("You have been mentioned in the issue {issue_name}")
+                })
             } else {
                 None
             };
+            // Plane: in-app data never carries activity_time; mention rows also omit issue_comment
+            // (both in-app and email), and mention emails use field "mention".
+            let mut in_app = data.clone();
+            if let Some(i) = in_app["issue"].as_object_mut() {
+                i.remove("project_id");
+                i.remove("workspace_slug");
+            }
+            if let Some(ia) = in_app["issue_activity"].as_object_mut() {
+                ia.remove("activity_time");
+                if kind == "mentioned" {
+                    ia.remove("issue_comment");
+                }
+            }
+            if kind == "mentioned" {
+                if let Some(ia) = data["issue_activity"].as_object_mut() {
+                    ia.remove("issue_comment");
+                }
+                data["issue_activity"]["field"] = Value::String("mention".into());
+            }
             sqlx::query("INSERT INTO notifications (workspace_id,project_id,receiver_id,triggered_by_id,entity_identifier,entity_name,sender,title,message,data) VALUES ($1,$2,$3,$4,$5,'issue',$6,$7,$8,$9)")
-                .bind(workspace).bind(project).bind(receiver).bind(actor).bind(issue).bind(format!("in_app:issue_activities:{kind}")).bind(if kind == "mentioned" { "" } else { a["comment"].as_str().unwrap_or("") }).bind(message.map(Value::String)).bind(&data).execute(&mut *tx).await?;
+                .bind(workspace).bind(project).bind(receiver).bind(actor).bind(issue).bind(format!("in_app:issue_activities:{kind}")).bind(if kind == "mentioned" { "" } else { a["comment"].as_str().unwrap_or("") }).bind(message.map(Value::String)).bind(&in_app).execute(&mut *tx).await?;
             if email {
                 sqlx::query("INSERT INTO email_notification_logs (receiver_id,triggered_by_id,entity_identifier,entity_name,entity,data) VALUES ($1,$2,$3,'issue','',$4)").bind(receiver).bind(actor).bind(issue).bind(&data).execute(&mut *tx).await?;
             }

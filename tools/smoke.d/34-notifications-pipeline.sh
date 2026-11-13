@@ -22,4 +22,11 @@ nt_body=$(curl -fsS -b "$NT_JAR" "$BASE/api/workspaces/$SLUG/users/notifications
 jq -e --arg id "$NT_ISSUE" 'any(.results[]; .entity_identifier == $id and (.sender | contains("mentioned")))' <<<"$nt_body" >/dev/null
 [[ $(psql "$NT_DB" -X -q -At -v issue="$NT_ISSUE" -v user="$NT_USER" <<< "SELECT count(*) FROM email_notification_logs WHERE entity_identifier=:'issue'::uuid AND receiver_id=:'user'::uuid") -ge 1 ]]
 [[ $(psql "$NT_DB" -X -q -At -v issue="$NT_ISSUE" <<< "SELECT count(*) FROM notifications WHERE entity_identifier=:'issue'::uuid AND receiver_id=triggered_by_id") == 0 ]]
+# Rules verified against a live Plane worker: issue creation itself does not notify, comment mentions
+# name the actor, mention emails use field "mention", in-app data carries no activity_time.
+[[ $(psql "$NT_DB" -X -q -At -v issue="$NT_ISSUE" <<< "SELECT count(*) FROM notifications WHERE entity_identifier=:'issue'::uuid AND data->'issue_activity'->>'verb'='created' AND coalesce(data->'issue_activity'->>'field','')=''") == 0 ]] || { echo "✖ issue creation must not notify" >&2; exit 1; }
+[[ $(psql "$NT_DB" -X -q -At -v issue="$NT_ISSUE" <<< "SELECT count(*) FROM notifications WHERE entity_identifier=:'issue'::uuid AND sender LIKE '%mentioned' AND message::text LIKE '%has mentioned you in a comment in issue%'") -ge 1 ]] || { echo "✖ comment mention message" >&2; exit 1; }
+[[ $(psql "$NT_DB" -X -q -At -v issue="$NT_ISSUE" <<< "SELECT count(*) FROM email_notification_logs WHERE entity_identifier=:'issue'::uuid AND data->'issue_activity'->>'field'='mention'") -ge 1 ]] || { echo "✖ mention email field" >&2; exit 1; }
+[[ $(psql "$NT_DB" -X -q -At -v issue="$NT_ISSUE" <<< "SELECT count(*) FROM notifications WHERE entity_identifier=:'issue'::uuid AND data->'issue_activity' ? 'activity_time'") == 0 ]] || { echo "✖ in-app data has activity_time" >&2; exit 1; }
+echo "✔ notifications follow Plane rules (no create notice, mention message/email shape)"
 rm -f "$NT_JAR"
