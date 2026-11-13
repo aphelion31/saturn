@@ -1803,8 +1803,16 @@ async fn comment_create(
     event.new_identifier = Some(id);
     event.issue_comment_id = Some(id);
     crate::activity::record(&mut *tx, event).await?;
+    let activities = crate::notify::snapshots(&mut tx, issue, project, p.workspace_id()).await?;
     tx.commit().await?;
-    crate::webhook_out::emit(&st, p.workspace_id(), "issue_comment", "created", serde_json::json!({"id": id}));
+    crate::notify::after_activity(&st, issue, project, p.workspace_id(), user.id, activities);
+    crate::webhook_out::emit(
+        &st,
+        p.workspace_id(),
+        "issue_comment",
+        "created",
+        serde_json::json!({"id": id}),
+    );
     let Json(value) = comment_detail(State(st), user, Path((slug, project, issue, id))).await?;
     created(value)
 }
@@ -1844,8 +1852,16 @@ async fn comment_update(
         event.issue_comment_id = Some(comment);
         crate::activity::record(&mut *tx, event).await?;
     }
+    let activities = crate::notify::snapshots(&mut tx, issue, project, p.workspace_id()).await?;
     tx.commit().await?;
-    crate::webhook_out::emit(&st, p.workspace_id(), "issue_comment", "updated", serde_json::json!({"id": comment}));
+    crate::notify::after_activity(&st, issue, project, p.workspace_id(), user.id, activities);
+    crate::webhook_out::emit(
+        &st,
+        p.workspace_id(),
+        "issue_comment",
+        "updated",
+        serde_json::json!({"id": comment}),
+    );
     comment_detail(State(st), user, Path((slug, project, issue, comment))).await
 }
 
@@ -1873,7 +1889,13 @@ async fn comment_delete(
     event.issue_comment_id = Some(comment);
     crate::activity::record(&mut *tx, event).await?;
     tx.commit().await?;
-    crate::webhook_out::emit(&st, p.workspace_id(), "issue_comment", "deleted", serde_json::json!({"id": comment}));
+    crate::webhook_out::emit(
+        &st,
+        p.workspace_id(),
+        "issue_comment",
+        "deleted",
+        serde_json::json!({"id": comment}),
+    );
     no_content()
 }
 
@@ -2218,8 +2240,16 @@ pub(crate) async fn update(
             }
         }
     }
+    let activities = crate::notify::snapshots(&mut tx, issue_id, project_id, p.workspace_id()).await?;
     tx.commit().await?;
-    crate::webhook_out::emit(&st, p.workspace_id(), "issue", "updated", serde_json::json!({"id": issue_id}));
+    crate::notify::after_activity(&st, issue_id, project_id, p.workspace_id(), user.id, activities);
+    crate::webhook_out::emit(
+        &st,
+        p.workspace_id(),
+        "issue",
+        "updated",
+        serde_json::json!({"id": issue_id}),
+    );
     detail(State(st), user, Path((slug, project_id, issue_id))).await
 }
 
@@ -2247,7 +2277,13 @@ async fn destroy(
     event.field = Some("issue");
     crate::activity::record(&mut *tx, event).await?;
     tx.commit().await?;
-    crate::webhook_out::emit(&st, p.workspace_id(), "issue", "deleted", serde_json::json!({"id": issue_id}));
+    crate::webhook_out::emit(
+        &st,
+        p.workspace_id(),
+        "issue",
+        "deleted",
+        serde_json::json!({"id": issue_id}),
+    );
     no_content()
 }
 
@@ -2261,7 +2297,10 @@ async fn create(
     p.require(&[ADMIN, MEMBER])?;
     let mut tx = st.db.begin().await?;
     let result = create_issue(&mut tx, &user, &p, &body).await?;
+    let issue_id = uuid_of(&result, "id").ok_or_else(ApiError::not_found)?;
+    let activities = crate::notify::snapshots(&mut tx, issue_id, project_id, p.workspace_id()).await?;
     tx.commit().await?;
+    crate::notify::after_activity(&st, issue_id, project_id, p.workspace_id(), user.id, activities);
     crate::webhook_out::emit(&st, p.workspace_id(), "issue", "created", result.clone());
     created(result)
 }

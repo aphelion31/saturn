@@ -1056,7 +1056,9 @@ async fn intake_issues_create(
     .fetch_one(&mut *tx)
     .await?;
     crate::activity::record(&mut *tx, crate::activity::ActivityEvent::new(issue_id, project_id, p.workspace_id(), user.id, "created", "created the issue")).await?;
+    let activities = crate::notify::snapshots(&mut tx, issue_id, project_id, p.workspace_id()).await?;
     tx.commit().await?;
+    crate::notify::after_activity(&st, issue_id, project_id, p.workspace_id(), user.id, activities);
     let v = intake_issue_detail(&st.db, ii_id, project_id, p.workspace_id()).await?;
     created(v)
 }

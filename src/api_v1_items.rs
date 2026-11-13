@@ -675,7 +675,9 @@ async fn comment_create(
     event.new_identifier = Some(id);
     event.issue_comment_id = Some(id);
     crate::activity::record(&mut *tx, event).await?;
+    let activities = crate::notify::snapshots(&mut tx, issue_id, project_id, p.workspace_id()).await?;
     tx.commit().await?;
+    crate::notify::after_activity(&st, issue_id, project_id, p.workspace_id(), user.id, activities);
     crate::webhook_out::emit(&st, p.workspace_id(), "issue_comment", "created", json!({"id": id}));
     let Json(v) = comment_retrieve(State(st), user, Path((slug, project_id, issue_id, id))).await?;
     created(v)
@@ -741,7 +743,9 @@ async fn comment_update(
         event.issue_comment_id = Some(pk);
         crate::activity::record(&mut *tx, event).await?;
     }
+    let activities = crate::notify::snapshots(&mut tx, issue_id, project_id, p.workspace_id()).await?;
     tx.commit().await?;
+    crate::notify::after_activity(&st, issue_id, project_id, p.workspace_id(), user.id, activities);
     crate::webhook_out::emit(&st, p.workspace_id(), "issue_comment", "updated", json!({"id": pk}));
     comment_retrieve(State(st), user, Path((slug, project_id, issue_id, pk))).await
 }
@@ -1283,7 +1287,9 @@ async fn create(
             .execute(&mut *tx)
             .await?;
     }
+    let activities = crate::notify::snapshots(&mut tx, id, project_id, p.workspace_id()).await?;
     tx.commit().await?;
+    crate::notify::after_activity(&st, id, project_id, p.workspace_id(), user.id, activities);
     let v = read_item(&st, &p, id).await?;
     crate::webhook_out::emit(&st, p.workspace_id(), "issue", "created", v.clone());
     created(v)
@@ -1540,7 +1546,9 @@ async fn update(
             }
         }
     }
+    let activities = crate::notify::snapshots(&mut tx, pk, project_id, p.workspace_id()).await?;
     tx.commit().await?;
+    crate::notify::after_activity(&st, pk, project_id, p.workspace_id(), user.id, activities);
     crate::webhook_out::emit(&st, p.workspace_id(), "issue", "updated", serde_json::json!({"id": pk}));
     Ok(Json(read_item(&st, &p, pk).await?))
 }

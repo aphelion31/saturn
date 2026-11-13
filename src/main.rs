@@ -7,6 +7,7 @@ mod common;
 mod instance;
 mod jobs;
 mod jobs_fk;
+mod notify;
 mod oauth;
 mod outbound;
 mod session;
