@@ -20,6 +20,18 @@ jq -e '.completed_at | startswith("2026-01-02")' <<<"$body" >/dev/null
 v1 PATCH "$V1/$COMP_ITEM/" '{"completed_at":"2026-01-03T12:00:00Z"}'
 jq -e '.completed_at | startswith("2026-01-03")' <<<"$body" >/dev/null
 v1 DELETE "$V1/$COMP_ITEM/"
+# Plane IssueSerializer.update: labels/assignees replace the set and record activity.
+V1_LBL=$(curl -s -H "X-Api-Key: $TOKEN" -H 'content-type: application/json' -d '{"name":"v1-smoke-label-'"$RANDOM"'","color":"#123456"}' "$BASE/api/v1/workspaces/$SLUG/projects/$PROJECT/labels/" | jq -r .id)
+V1_ME=$(curl -s -b "$jar" "$BASE/api/users/me/" | jq -r .id)
+v1 PATCH "$V1/$ITEM/" '{"labels":["'"$V1_LBL"'"],"assignees":["'"$V1_ME"'"]}'
+jq -e --arg l "$V1_LBL" --arg a "$V1_ME" '(.labels|index($l)) != null and (.assignees|index($a)) != null' <<<"$body" >/dev/null
+v1 PATCH "$V1/$ITEM/" '{"labels":[]}'
+jq -e '.labels == []' <<<"$body" >/dev/null
+V1_ACT=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "select string_agg(field||':'||comment, ',' order by created_at) from issue_activities where issue_id='$ITEM' and field in ('labels','assignees')")
+[[ "$V1_ACT" == *"labels:added label"* && "$V1_ACT" == *"labels:removed label"* && "$V1_ACT" == *"assignees:added assignee"* ]] || { echo "✖ v1 relation activity missing: $V1_ACT" >&2; exit 1; }
+code=$(curl -s -o /dev/null -w '%{http_code}' -H "X-Api-Key: $TOKEN" -H 'content-type: application/json' -X PATCH -d '{"labels":["00000000-0000-0000-0000-000000000009"]}' "$BASE$V1/$ITEM/")
+[[ "$code" == 400 ]] || { echo "✖ v1 foreign label should be 400, got $code" >&2; exit 1; }
+echo "✔ v1 labels/assignees replace, validate and record activity"
 v1 GET "$V1/?per_page=5"
 jq -e '.results and .next_cursor and (has("total_results"))' <<<"$body" >/dev/null
 # 9765: work-items list honors group_by and returns grouped_by
