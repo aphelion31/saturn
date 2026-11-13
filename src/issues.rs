@@ -1317,10 +1317,23 @@ async fn link_update(
     if title.is_some_and(|v| v.chars().count() > 255) {
         return Err(ApiError::bad("Title too long"));
     }
-    let r=sqlx::query("UPDATE issue_links SET url=COALESCE($5,url),title=COALESCE($6,title),updated_by_id=$7,updated_at=now() WHERE id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM issue_links other WHERE other.issue_id=$2 AND other.project_id=$3 AND other.workspace_id=$4 AND other.id<>$1 AND other.url=$5 AND other.deleted_at IS NULL)").bind(id).bind(iid).bind(pid).bind(p.workspace_id()).bind(url).bind(title).bind(user.id).execute(&st.db).await?;
+    let mut tx = st.db.begin().await?;
+    let old: Option<String> = sqlx::query_scalar("SELECT url FROM issue_links WHERE id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND deleted_at IS NULL FOR UPDATE").bind(id).bind(iid).bind(pid).bind(p.workspace_id()).fetch_optional(&mut *tx).await?;
+    let r=sqlx::query("UPDATE issue_links SET url=COALESCE($5,url),title=COALESCE($6,title),updated_by_id=$7,updated_at=now() WHERE id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM issue_links other WHERE other.issue_id=$2 AND other.project_id=$3 AND other.workspace_id=$4 AND other.id<>$1 AND other.url=$5 AND other.deleted_at IS NULL)").bind(id).bind(iid).bind(pid).bind(p.workspace_id()).bind(&url).bind(title).bind(user.id).execute(&mut *tx).await?;
     if r.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
+    if url.is_some() && old != url {
+        let mut event =
+            crate::activity::ActivityEvent::new(iid, pid, p.workspace_id(), user.id, "updated", "updated a link");
+        event.field = Some("link");
+        event.old_value = old.as_deref();
+        event.new_value = url.as_deref();
+        event.old_identifier = Some(id);
+        event.new_identifier = Some(id);
+        crate::activity::record(&mut *tx, event).await?;
+    }
+    tx.commit().await?;
     link_detail(State(st), user, Path((slug, pid, iid, id))).await
 }
 async fn link_delete(
@@ -1330,10 +1343,15 @@ async fn link_delete(
 ) -> ApiResult<axum::http::StatusCode> {
     let p = visible_issue(&st, &user, &slug, pid, iid).await?;
     p.require(&[ADMIN, MEMBER])?;
-    let r=sqlx::query("UPDATE issue_links SET deleted_at=now(),updated_at=now(),updated_by_id=$5 WHERE id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND deleted_at IS NULL").bind(id).bind(iid).bind(pid).bind(p.workspace_id()).bind(user.id).execute(&st.db).await?;
-    if r.rows_affected() == 0 {
-        return Err(ApiError::not_found());
-    }
+    let mut tx = st.db.begin().await?;
+    let old: String = sqlx::query_scalar("UPDATE issue_links SET deleted_at=now(),updated_at=now(),updated_by_id=$5 WHERE id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND deleted_at IS NULL RETURNING url").bind(id).bind(iid).bind(pid).bind(p.workspace_id()).bind(user.id).fetch_optional(&mut *tx).await?.ok_or_else(ApiError::not_found)?;
+    let mut event =
+        crate::activity::ActivityEvent::new(iid, pid, p.workspace_id(), user.id, "deleted", "deleted the link");
+    event.field = Some("link");
+    event.old_value = Some(&old);
+    event.new_value = Some("");
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     no_content()
 }
 
@@ -1828,8 +1846,8 @@ pub(crate) async fn update(
             .chain(before.iter().filter(|id| !ids.contains(id)).map(|id| (*id, false)))
         {
             let name: Option<String> = if field == "assignee_ids" {
-                sqlx::query_scalar("SELECT display_name FROM users WHERE id=$1")
-                    .bind(id)
+                sqlx::query_scalar("SELECT u.display_name FROM users u WHERE u.id=$1 AND EXISTS (SELECT 1 FROM workspace_members wm WHERE wm.member_id=u.id AND wm.workspace_id=$2 AND wm.deleted_at IS NULL)")
+                    .bind(id).bind(p.workspace_id())
                     .fetch_optional(&mut *tx)
                     .await?
             } else {

@@ -1103,14 +1103,18 @@ async fn create(
         .bind(user.id)
         .execute(&mut *tx)
         .await?;
-    // Activity feed row, same as issues.rs::create_issue. Other fan-out (notifications, webhooks) is skipped.
-    sqlx::query("INSERT INTO issue_activities (issue_id, project_id, workspace_id, actor_id, created_by_id, updated_by_id, verb, comment, attachments, epoch) VALUES ($1,$2,$3,$4,$4,$4,'created','',ARRAY[]::varchar[],extract(epoch from now()))")
-        .bind(id)
-        .bind(project_id)
-        .bind(p.workspace_id())
-        .bind(user.id)
-        .execute(&mut *tx)
-        .await?;
+    crate::activity::record(
+        &mut *tx,
+        crate::activity::ActivityEvent::new(
+            id,
+            project_id,
+            p.workspace_id(),
+            user.id,
+            "created",
+            "created the issue",
+        ),
+    )
+    .await?;
     for a in assignees {
         sqlx::query("INSERT INTO issue_assignees (issue_id,project_id,workspace_id,assignee_id,created_by_id,updated_by_id) SELECT $1,$2,$3,$4,$5,$5 WHERE EXISTS (SELECT 1 FROM project_members WHERE project_id=$2 AND workspace_id=$3 AND member_id=$4 AND is_active AND role>=15 AND deleted_at IS NULL)")
             .bind(id)
@@ -1193,6 +1197,14 @@ async fn update(
     .fetch_optional(&mut *tx)
     .await?;
     let (old_start, old_target, old_state_id) = old.ok_or_else(ApiError::not_found)?;
+    let before: Value = sqlx::query_scalar(
+        "SELECT to_jsonb(i) FROM issues i WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .fetch_one(&mut *tx)
+    .await?;
 
     let target_state_id = if b.get("state_id").is_some() || b.get("state").is_some() {
         opt_uuid(&b, "state_id")?.or(opt_uuid(&b, "state")?)
@@ -1290,6 +1302,46 @@ async fn update(
     .bind(user.id)
     .execute(&mut *tx)
     .await?;
+    let after: Value = sqlx::query_scalar(
+        "SELECT to_jsonb(i) FROM issues i WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .fetch_one(&mut *tx)
+    .await?;
+    for (key, field, comment) in [
+        ("name", "name", "updated the name to"),
+        ("priority", "priority", "updated the priority to"),
+        ("description_html", "description", "updated the description to"),
+        ("start_date", "start_date", "updated the start date to "),
+        ("target_date", "target_date", "updated the target date to"),
+    ] {
+        if before.get(key) != after.get(key) {
+            let mut event =
+                crate::activity::ActivityEvent::new(pk, project_id, p.workspace_id(), user.id, "updated", comment);
+            event.field = Some(field);
+            event.old_value =
+                before
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .or(if key.ends_with("_date") { Some("") } else { None });
+            event.new_value =
+                after
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .or(if key.ends_with("_date") { Some("") } else { None });
+            crate::activity::record(&mut *tx, event).await?;
+            if key == "description_html" {
+                let result = sqlx::query("UPDATE issue_description_versions v SET description_html=i.description_html,description_stripped=i.description_stripped,description_json=i.description_json,description_binary=i.description_binary,last_saved_at=now() FROM issues i WHERE v.id=(SELECT id FROM issue_description_versions WHERE issue_id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL ORDER BY last_saved_at DESC LIMIT 1) AND v.owned_by_id=$4 AND v.last_saved_at >= now() - interval '10 minutes' AND i.id=$1 AND i.project_id=$2 AND i.workspace_id=$3 AND i.deleted_at IS NULL")
+                    .bind(pk).bind(project_id).bind(p.workspace_id()).bind(user.id).execute(&mut *tx).await?;
+                if result.rows_affected() == 0 {
+                    sqlx::query("INSERT INTO issue_description_versions (issue_id,project_id,workspace_id,owned_by_id,created_by_id,updated_by_id,description_html,description_stripped,description_json,description_binary) SELECT id,project_id,workspace_id,$4,$4,$4,description_html,description_stripped,description_json,description_binary FROM issues WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL")
+                        .bind(pk).bind(project_id).bind(p.workspace_id()).bind(user.id).execute(&mut *tx).await?;
+                }
+            }
+        }
+    }
     tx.commit().await?;
     crate::webhook_out::emit(&st, p.workspace_id(), "issue", "updated", serde_json::json!({"id": pk}));
     Ok(Json(read_item(&st, &p, pk).await?))

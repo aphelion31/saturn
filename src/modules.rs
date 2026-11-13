@@ -611,8 +611,9 @@ async fn add_issue_modules(
     .bind(p.workspace_id())
     .fetch_all(&st.db)
     .await?;
+    let mut tx = st.db.begin().await?;
     for m in valid {
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO module_issues (issue_id, module_id, project_id, workspace_id, created_by_id, updated_by_id)
              VALUES ($1, $2, $3, $4, $5, $5) ON CONFLICT DO NOTHING",
         )
@@ -621,11 +622,16 @@ async fn add_issue_modules(
         .bind(project_id)
         .bind(p.workspace_id())
         .bind(user.id)
-        .execute(&st.db)
+        .execute(&mut *tx)
         .await?;
+        if result.rows_affected() > 0 {
+            let name: String = sqlx::query_scalar("SELECT name FROM modules WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL")
+                .bind(m).bind(project_id).bind(p.workspace_id()).fetch_one(&mut *tx).await?;
+            crate::activity::grouping(&mut tx, issue_id, project_id, p.workspace_id(), user.id, "modules", m, &name, true).await?;
+        }
     }
     for m in body.removed_modules.unwrap_or_default() {
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE module_issues SET deleted_at = now() WHERE issue_id = $1 AND module_id = $2
              AND project_id = $3 AND workspace_id = $4 AND deleted_at IS NULL",
         )
@@ -633,9 +639,15 @@ async fn add_issue_modules(
         .bind(m)
         .bind(project_id)
         .bind(p.workspace_id())
-        .execute(&st.db)
+        .execute(&mut *tx)
         .await?;
+        if result.rows_affected() > 0 {
+            let name: String = sqlx::query_scalar("SELECT name FROM modules WHERE id=$1 AND project_id=$2 AND workspace_id=$3")
+                .bind(m).bind(project_id).bind(p.workspace_id()).fetch_one(&mut *tx).await?;
+            crate::activity::grouping(&mut tx, issue_id, project_id, p.workspace_id(), user.id, "modules", m, &name, false).await?;
+        }
     }
+    tx.commit().await?;
     created(json!({"message": "success"}))
 }
 
