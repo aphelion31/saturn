@@ -2504,6 +2504,9 @@ async fn detail(
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER, GUEST])?;
+    crate::recent_visits::record(&st.db, crate::recent_visits::Visit {
+        workspace_id: p.workspace_id(), user_id: user.id, entity_name: "issue", entity_identifier: issue_id, project_id: Some(project_id),
+    });
     let sql = format!(
         "SELECT {} || jsonb_build_object('description_html', i.description_html,
           'is_subscribed', EXISTS (SELECT 1 FROM issue_subscribers sub WHERE sub.issue_id = i.id
@@ -2542,5 +2545,6 @@ async fn list(
     if p.restricted_guest() {
         base.and("i.created_by_id = {}", Arg::Uuid(user.id));
     }
+    crate::recent_visits::record(&st.db, crate::recent_visits::Visit { workspace_id: p.workspace_id(), user_id: user.id, entity_name: "project", entity_identifier: project_id, project_id: Some(project_id) });
     workitems::list(&st.db, base, &q, Scope::Project(project_id)).await
 }
