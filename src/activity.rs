@@ -74,3 +74,38 @@ where
     .await?;
     Ok(())
 }
+
+pub async fn grouping(
+    conn: &mut sqlx::PgConnection,
+    issue: Uuid,
+    project: Uuid,
+    workspace: Uuid,
+    actor: Uuid,
+    kind: &str,
+    id: Uuid,
+    name: &str,
+    added: bool,
+) -> Result<(), sqlx::Error> {
+    let comment = if added {
+        format!("added {} {name}", if kind == "cycles" { "cycle" } else { "module" })
+    } else {
+        format!("removed this issue from {name}")
+    };
+    let mut event = ActivityEvent::new(
+        issue,
+        project,
+        workspace,
+        actor,
+        if added { "created" } else { "deleted" },
+        &comment,
+    );
+    event.field = Some(kind);
+    event.old_value = Some(if added { "" } else { name });
+    event.new_value = Some(if added { name } else { "" });
+    if added {
+        event.new_identifier = Some(id);
+    } else {
+        event.old_identifier = Some(id);
+    }
+    record(conn, event).await
+}

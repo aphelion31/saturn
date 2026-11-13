@@ -832,10 +832,22 @@ async fn archive_issue(
 ) -> ApiResult {
     let p = visible_issue(&st, &user, &slug, pid, iid).await?;
     p.require(&[ADMIN, MEMBER])?;
-    let date:Option<chrono::NaiveDate>=sqlx::query_scalar("UPDATE issues i SET archived_at=CURRENT_DATE,updated_at=now(),updated_by_id=$4 WHERE i.id=$1 AND i.project_id=$2 AND i.workspace_id=$3 AND i.deleted_at IS NULL AND i.archived_at IS NULL AND EXISTS(SELECT 1 FROM states s WHERE s.id=i.state_id AND s.project_id=$2 AND s.workspace_id=$3 AND s.deleted_at IS NULL AND s.group IN ('completed','cancelled')) RETURNING archived_at").bind(iid).bind(pid).bind(p.workspace_id()).bind(user.id).fetch_optional(&st.db).await?;
-    Ok(Json(
-        serde_json::json!({"archived_at":date.ok_or_else(||ApiError::bad("Can only archive completed or cancelled issues"))?}),
-    ))
+    let mut tx = st.db.begin().await?;
+    let date:Option<chrono::NaiveDate>=sqlx::query_scalar("UPDATE issues i SET archived_at=CURRENT_DATE,updated_at=now(),updated_by_id=$4 WHERE i.id=$1 AND i.project_id=$2 AND i.workspace_id=$3 AND i.deleted_at IS NULL AND i.archived_at IS NULL AND EXISTS(SELECT 1 FROM states s WHERE s.id=i.state_id AND s.project_id=$2 AND s.workspace_id=$3 AND s.deleted_at IS NULL AND s.group IN ('completed','cancelled')) RETURNING archived_at").bind(iid).bind(pid).bind(p.workspace_id()).bind(user.id).fetch_optional(&mut *tx).await?;
+    let date = date.ok_or_else(|| ApiError::bad("Can only archive completed or cancelled issues"))?;
+    let mut event = crate::activity::ActivityEvent::new(
+        iid,
+        pid,
+        p.workspace_id(),
+        user.id,
+        "updated",
+        "Actor has archived the issue",
+    );
+    event.field = Some("archived_at");
+    event.new_value = Some("manual_archive");
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
+    Ok(Json(serde_json::json!({"archived_at":date})))
 }
 async fn unarchive_issue(
     State(st): State<AppState>,
@@ -844,10 +856,18 @@ async fn unarchive_issue(
 ) -> ApiResult<axum::http::StatusCode> {
     let p = visible_issue(&st, &user, &slug, pid, iid).await?;
     p.require(&[ADMIN, MEMBER])?;
-    let r=sqlx::query("UPDATE issues SET archived_at=NULL,updated_at=now(),updated_by_id=$4 WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL AND archived_at IS NOT NULL").bind(iid).bind(pid).bind(p.workspace_id()).bind(user.id).execute(&st.db).await?;
+    let mut tx = st.db.begin().await?;
+    let r=sqlx::query("UPDATE issues SET archived_at=NULL,updated_at=now(),updated_by_id=$4 WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL AND archived_at IS NOT NULL").bind(iid).bind(pid).bind(p.workspace_id()).bind(user.id).execute(&mut *tx).await?;
     if r.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
+    let mut event =
+        crate::activity::ActivityEvent::new(iid, pid, p.workspace_id(), user.id, "updated", "has restored the issue");
+    event.field = Some("archived_at");
+    event.old_value = Some("archive");
+    event.new_value = Some("restore");
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     no_content()
 }
 async fn bulk_delete(
@@ -1272,7 +1292,15 @@ async fn link_create(
     if title.is_some_and(|v| v.chars().count() > 255) {
         return Err(ApiError::bad("Title too long"));
     }
-    let id: Uuid=sqlx::query_scalar("INSERT INTO issue_links (workspace_id,project_id,issue_id,url,title,created_by_id,updated_by_id) SELECT $1,$2,$3,$4,$5,$6,$6 WHERE NOT EXISTS (SELECT 1 FROM issue_links WHERE workspace_id=$1 AND project_id=$2 AND issue_id=$3 AND url=$4 AND deleted_at IS NULL) RETURNING id").bind(p.workspace_id()).bind(pid).bind(iid).bind(url).bind(title).bind(user.id).fetch_optional(&st.db).await?.ok_or_else(||ApiError::bad("URL already exists"))?;
+    let mut tx = st.db.begin().await?;
+    let id: Uuid=sqlx::query_scalar("INSERT INTO issue_links (workspace_id,project_id,issue_id,url,title,created_by_id,updated_by_id) SELECT $1,$2,$3,$4,$5,$6,$6 WHERE NOT EXISTS (SELECT 1 FROM issue_links WHERE workspace_id=$1 AND project_id=$2 AND issue_id=$3 AND url=$4 AND deleted_at IS NULL) RETURNING id").bind(p.workspace_id()).bind(pid).bind(iid).bind(&url).bind(title).bind(user.id).fetch_optional(&mut *tx).await?.ok_or_else(||ApiError::bad("URL already exists"))?;
+    let mut event =
+        crate::activity::ActivityEvent::new(iid, pid, p.workspace_id(), user.id, "created", "created a link");
+    event.field = Some("link");
+    event.new_value = Some(&url);
+    event.new_identifier = Some(id);
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     let Json(v) = link_detail(State(st), user, Path((slug, pid, iid, id))).await?;
     created(v)
 }
@@ -1894,11 +1922,23 @@ async fn destroy(
 ) -> ApiResult<axum::http::StatusCode> {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER, GUEST])?;
+    let mut tx = st.db.begin().await?;
     let result = sqlx::query("UPDATE issues SET deleted_at=now(), updated_at=now(), updated_by_id=$4 WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL AND ($5 OR created_by_id=$4)")
-        .bind(issue_id).bind(project_id).bind(p.workspace_id()).bind(user.id).bind(p.role == ADMIN || p.ws.is_admin()).execute(&st.db).await?;
+        .bind(issue_id).bind(project_id).bind(p.workspace_id()).bind(user.id).bind(p.role == ADMIN || p.ws.is_admin()).execute(&mut *tx).await?;
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
+    let mut event = crate::activity::ActivityEvent::new(
+        issue_id,
+        project_id,
+        p.workspace_id(),
+        user.id,
+        "deleted",
+        "deleted the issue",
+    );
+    event.field = Some("issue");
+    crate::activity::record(&mut *tx, event).await?;
+    tx.commit().await?;
     crate::webhook_out::emit(&st, p.workspace_id(), "issue", "deleted", serde_json::json!({"id": issue_id}));
     no_content()
 }
