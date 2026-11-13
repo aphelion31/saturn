@@ -1373,19 +1373,28 @@ async fn check_user_asset_pk(st: &AppState, user: &CurrentUser, pk: &str) -> Res
     Ok((id, et))
 }
 
-/// GET /api/users/file-assets/{pk}/
+/// GET /api/users/file-assets/{asset_key}/
+/// Plane `UserAssetsEndpoint.get`: assets with this key created by the caller, always HTTP 200.
+/// Saturn also accepts the asset id or the key without its `users/{id}/` prefix, since Plane keys contain
+/// slashes that `<str:asset_key>` can never match.
 async fn legacy_get_user_asset(State(st): State<AppState>, user: CurrentUser, Path(pk): Path<String>) -> ApiResult {
-    let (id, _) = check_user_asset_pk(&st, &user, &pk).await?;
-    json_row(
-        sqlx::query_scalar(&format!(
-            "SELECT {FILE_ASSET_JSON} FROM file_assets f
-             LEFT JOIN workspaces w ON w.id = f.workspace_id
-             WHERE f.id = $1 AND f.deleted_at IS NULL"
-        ))
-        .bind(id),
-        &st.db,
-    )
-    .await
+    let files: Value = sqlx::query_scalar(&format!(
+        "SELECT COALESCE(jsonb_agg({FILE_ASSET_JSON} ORDER BY f.created_at), '[]'::jsonb) FROM file_assets f
+         LEFT JOIN workspaces w ON w.id = f.workspace_id
+         WHERE (f.asset = $1 OR f.asset = $3 OR ($4::uuid IS NOT NULL AND f.id = $4))
+           AND f.created_by_id = $2 AND f.deleted_at IS NULL"
+    ))
+    .bind(&pk)
+    .bind(user.id)
+    .bind(format!("users/{}/{}", user.id, pk))
+    .bind(Uuid::parse_str(&pk).ok())
+    .fetch_one(&st.db)
+    .await?;
+    if files.as_array().is_some_and(|a| !a.is_empty()) {
+        Ok(Json(json!({"data": files, "status": true})))
+    } else {
+        Ok(Json(json!({"error": "Asset key does not exist", "status": false})))
+    }
 }
 
 /// DELETE /api/users/file-assets/{pk}/

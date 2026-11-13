@@ -134,6 +134,15 @@ pub struct BoardCtx {
     pub workspace_slug: String,
 }
 
+/// Like `require_anchor`, but a missing board is `None` instead of 404 (Plane list endpoints).
+async fn anchor_or_none(db: &sqlx::PgPool, anchor: &str) -> Result<Option<BoardCtx>, ApiError> {
+    match require_anchor(db, anchor).await {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.0 == axum::http::StatusCode::NOT_FOUND => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 pub async fn require_anchor(db: &sqlx::PgPool, anchor: &str) -> Result<BoardCtx, ApiError> {
     sqlx::query_as::<_, BoardCtx>(
         "SELECT b.id, b.anchor, b.project_id, b.workspace_id, b.entity_identifier, b.entity_name,
@@ -464,7 +473,8 @@ async fn comments_list(
     user: MaybeUser,
     Path((anchor, issue_id)): Path<(String, Uuid)>,
 ) -> ApiResult {
-    let b = require_anchor(&st.db, &anchor).await?;
+    // Plane returns an empty list (not 404) when the deploy board does not exist.
+    let Some(b) = anchor_or_none(&st.db, &anchor).await? else { return Ok(Json(json!([]))) };
     if !b.is_comments_enabled {
         return Ok(Json(json!([])));
     }
@@ -859,7 +869,7 @@ async fn issue_reactions_list(
     _user: MaybeUser,
     Path((anchor, issue_id)): Path<(String, Uuid)>,
 ) -> ApiResult {
-    let b = require_anchor(&st.db, &anchor).await?;
+    let Some(b) = anchor_or_none(&st.db, &anchor).await? else { return Ok(Json(json!([]))) };
     if !b.is_reactions_enabled {
         return Ok(Json(json!([])));
     }
@@ -1021,7 +1031,7 @@ async fn comment_reactions_list(
     _user: MaybeUser,
     Path((anchor, comment_id)): Path<(String, Uuid)>,
 ) -> ApiResult {
-    let b = require_anchor(&st.db, &anchor).await?;
+    let Some(b) = anchor_or_none(&st.db, &anchor).await? else { return Ok(Json(json!([]))) };
     if !b.is_reactions_enabled {
         return Ok(Json(json!([])));
     }
@@ -1186,7 +1196,7 @@ async fn issue_votes_list(
     _user: MaybeUser,
     Path((anchor, issue_id)): Path<(String, Uuid)>,
 ) -> ApiResult {
-    let b = require_anchor(&st.db, &anchor).await?;
+    let Some(b) = anchor_or_none(&st.db, &anchor).await? else { return Ok(Json(json!([]))) };
     if !b.is_votes_enabled {
         return Ok(Json(json!([])));
     }

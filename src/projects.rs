@@ -78,7 +78,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/issue-labels/{label_id}/",
-            get(label).patch(update_label).delete(delete_label),
+            get(label).put(update_label).patch(update_label).delete(delete_label),
         )
         .route("/api/workspaces/{slug}/project-identifiers/", get(project_identifiers).delete(delete_identifier))
         .route(
