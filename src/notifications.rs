@@ -15,21 +15,17 @@ use crate::users::USER_LITE_JSON;
 pub fn routes() -> Router<AppState> {
     Router::new()
         // Notifications
-        .route(
-            "/api/workspaces/{slug}/users/notifications/",
-            get(list_notifications),
-        )
-        .route(
-            "/api/workspaces/{slug}/users/notifications/unread/",
-            get(unread_count),
-        )
+        .route("/api/workspaces/{slug}/users/notifications/", get(list_notifications))
+        .route("/api/workspaces/{slug}/users/notifications/unread/", get(unread_count))
         .route(
             "/api/workspaces/{slug}/users/notifications/mark-all-read/",
             post(mark_all_read),
         )
         .route(
             "/api/workspaces/{slug}/users/notifications/{id}/",
-            get(get_notification).patch(update_notification).delete(delete_notification),
+            get(get_notification)
+                .patch(update_notification)
+                .delete(delete_notification),
         )
         .route(
             "/api/workspaces/{slug}/users/notifications/{id}/read/",
@@ -63,10 +59,7 @@ pub fn routes() -> Router<AppState> {
             get(get_quick_link).patch(update_quick_link).delete(delete_quick_link),
         )
         // Recent Visits
-        .route(
-            "/api/workspaces/{slug}/recent-visits/",
-            get(list_recent_visits),
-        )
+        .route("/api/workspaces/{slug}/recent-visits/", get(list_recent_visits))
         // Timezones
         .route("/api/timezones/", get(list_timezones))
 }
@@ -202,7 +195,7 @@ async fn list_notifications(
                           SELECT 1 FROM issue_assignees ia
                           WHERE ia.issue_id = isub.issue_id AND ia.assignee_id = $2 AND ia.deleted_at IS NULL
                       )
-                )"
+                )",
             );
         }
 
@@ -214,7 +207,7 @@ async fn list_notifications(
                       AND ia.workspace_id = $1
                       AND ia.assignee_id = $2
                       AND ia.deleted_at IS NULL
-                )"
+                )",
             );
         }
 
@@ -229,7 +222,7 @@ async fn list_notifications(
                           AND i.workspace_id = $1
                           AND i.created_by_id = $2
                           AND i.deleted_at IS NULL
-                    )"
+                    )",
                 );
             }
         }
@@ -241,13 +234,11 @@ async fn list_notifications(
 
     let where_sql = clauses.join(" AND ");
 
-    let total_count: i64 = sqlx::query_scalar(&format!(
-        "SELECT count(*) FROM notifications n WHERE {where_sql}"
-    ))
-    .bind(ws.workspace_id)
-    .bind(user.id)
-    .fetch_one(&st.db)
-    .await?;
+    let total_count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM notifications n WHERE {where_sql}"))
+        .bind(ws.workspace_id)
+        .bind(user.id)
+        .fetch_one(&st.db)
+        .await?;
 
     let notif_json = notification_json();
     let rows: Vec<Value> = sqlx::query_scalar(&format!(
@@ -291,11 +282,7 @@ async fn list_notifications(
     })))
 }
 
-async fn unread_count(
-    State(st): State<AppState>,
-    user: CurrentUser,
-    Path(slug): Path<String>,
-) -> ApiResult {
+async fn unread_count(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>) -> ApiResult {
     let ws = require_workspace(&st.db, &user, &slug).await?;
     ws.require(&[ADMIN, MEMBER, GUEST])?;
 
@@ -405,11 +392,7 @@ async fn delete_notification(
     no_content()
 }
 
-async fn mark_read(
-    State(st): State<AppState>,
-    user: CurrentUser,
-    Path((slug, id)): Path<(String, Uuid)>,
-) -> ApiResult {
+async fn mark_read(State(st): State<AppState>, user: CurrentUser, Path((slug, id)): Path<(String, Uuid)>) -> ApiResult {
     let ws = require_workspace(&st.db, &user, &slug).await?;
     ws.require(&[ADMIN, MEMBER, GUEST])?;
     let notif_json = notification_json();
@@ -566,7 +549,8 @@ async fn mark_all_read(
                       AND isub.workspace_id = $1
                       AND isub.subscriber_id = $2
                       AND isub.deleted_at IS NULL
-                )".to_string()
+                )"
+                .to_string(),
             );
         } else if ftype == "assigned" {
             clauses.push(
@@ -576,7 +560,8 @@ async fn mark_all_read(
                       AND ia.workspace_id = $1
                       AND ia.assignee_id = $2
                       AND ia.deleted_at IS NULL
-                )".to_string()
+                )"
+                .to_string(),
             );
         } else if ftype == "created" {
             if ws.role < MEMBER {
@@ -589,7 +574,8 @@ async fn mark_all_read(
                           AND i.workspace_id = $1
                           AND i.created_by_id = $2
                           AND i.deleted_at IS NULL
-                    )".to_string()
+                    )"
+                    .to_string(),
                 );
             }
         }
@@ -642,10 +628,7 @@ async fn ensure_user_notification_preference(db: &sqlx::PgPool, user_id: Uuid) -
     Ok(())
 }
 
-async fn get_notification_preferences(
-    State(st): State<AppState>,
-    user: CurrentUser,
-) -> ApiResult {
+async fn get_notification_preferences(State(st): State<AppState>, user: CurrentUser) -> ApiResult {
     ensure_user_notification_preference(&st.db, user.id).await?;
     json_row(
         sqlx::query_scalar(&format!(
@@ -799,6 +782,8 @@ async fn list_stickies(
     let prev_cursor = format!("{limit}:{}:1", if page > 0 { page - 1 } else { 0 });
 
     Ok(Json(json!({
+        "grouped_by": null,
+        "sub_grouped_by": null,
         "next_cursor": next_cursor,
         "prev_cursor": prev_cursor,
         "next_page_results": has_next,
@@ -832,20 +817,15 @@ async fn create_sticky(
     ws.require(&[ADMIN, MEMBER, GUEST])?;
 
     let html = sanitize_html(body.description_html.as_deref().unwrap_or("<p></p>"))?;
-    let stripped = if html.is_empty() {
-        None
-    } else {
-        Some(strip_tags(&html))
-    };
+    let stripped = if html.is_empty() { None } else { Some(strip_tags(&html)) };
     let desc = body.description.unwrap_or_else(|| json!({}));
     let logo = body.logo_props.unwrap_or_else(|| json!({}));
 
-    let max_sort: Option<f64> = sqlx::query_scalar(
-        "SELECT max(sort_order) FROM stickies WHERE workspace_id = $1 AND deleted_at IS NULL"
-    )
-    .bind(ws.workspace_id)
-    .fetch_one(&st.db)
-    .await?;
+    let max_sort: Option<f64> =
+        sqlx::query_scalar("SELECT max(sort_order) FROM stickies WHERE workspace_id = $1 AND deleted_at IS NULL")
+            .bind(ws.workspace_id)
+            .fetch_one(&st.db)
+            .await?;
     let sort_order = max_sort.map(|m| m + 10000.0).unwrap_or(65535.0);
 
     let row: Value = sqlx::query_scalar(&format!(
@@ -977,7 +957,7 @@ async fn delete_sticky(
 
     let res = sqlx::query(
         "UPDATE stickies SET deleted_at = now()
-         WHERE id = $1 AND workspace_id = $2 AND owner_id = $3 AND deleted_at IS NULL"
+         WHERE id = $1 AND workspace_id = $2 AND owner_id = $3 AND deleted_at IS NULL",
     )
     .bind(id)
     .bind(ws.workspace_id)
@@ -1017,11 +997,7 @@ fn normalize_url(raw: &str) -> String {
     }
 }
 
-async fn list_quick_links(
-    State(st): State<AppState>,
-    user: CurrentUser,
-    Path(slug): Path<String>,
-) -> ApiResult {
+async fn list_quick_links(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>) -> ApiResult {
     let ws = require_workspace(&st.db, &user, &slug).await?;
     ws.require(&[ADMIN, MEMBER, GUEST])?;
 
@@ -1061,7 +1037,7 @@ async fn create_quick_link(
         "SELECT EXISTS (
             SELECT 1 FROM workspace_user_links
             WHERE workspace_id = $1 AND owner_id = $2 AND url = $3 AND deleted_at IS NULL
-        )"
+        )",
     )
     .bind(ws.workspace_id)
     .bind(user.id)
@@ -1142,7 +1118,7 @@ async fn update_quick_link(
             "SELECT EXISTS (
                 SELECT 1 FROM workspace_user_links
                 WHERE workspace_id = $1 AND owner_id = $2 AND url = $3 AND id <> $4 AND deleted_at IS NULL
-            )"
+            )",
         )
         .bind(ws.workspace_id)
         .bind(user.id)
@@ -1191,7 +1167,7 @@ async fn delete_quick_link(
 
     let res = sqlx::query(
         "UPDATE workspace_user_links SET deleted_at = now()
-         WHERE id = $1 AND workspace_id = $2 AND owner_id = $3 AND deleted_at IS NULL"
+         WHERE id = $1 AND workspace_id = $2 AND owner_id = $3 AND deleted_at IS NULL",
     )
     .bind(id)
     .bind(ws.workspace_id)
@@ -1299,25 +1275,60 @@ async fn list_timezones() -> ApiResult {
         ("Pacific/Midway", "Midway Island", "UTC-11:00", "GMT-11:00"),
         ("Pacific/Honolulu", "Hawaii", "UTC-10:00", "GMT-10:00"),
         ("America/Anchorage", "Alaska", "UTC-09:00", "GMT-09:00"),
-        ("America/Los_Angeles", "Pacific Time (US and Canada)", "UTC-08:00", "GMT-08:00"),
+        (
+            "America/Los_Angeles",
+            "Pacific Time (US and Canada)",
+            "UTC-08:00",
+            "GMT-08:00",
+        ),
         ("America/Tijuana", "Baja California", "UTC-08:00", "GMT-08:00"),
-        ("America/Denver", "Mountain Time (US and Canada)", "UTC-07:00", "GMT-07:00"),
+        (
+            "America/Denver",
+            "Mountain Time (US and Canada)",
+            "UTC-07:00",
+            "GMT-07:00",
+        ),
         ("America/Phoenix", "Arizona", "UTC-07:00", "GMT-07:00"),
-        ("America/Chicago", "Central Time (US and Canada)", "UTC-06:00", "GMT-06:00"),
-        ("America/Mexico_City", "Guadalajara, Mexico City, Monterrey", "UTC-06:00", "GMT-06:00"),
-        ("America/New_York", "Eastern Time (US and Canada)", "UTC-05:00", "GMT-05:00"),
+        (
+            "America/Chicago",
+            "Central Time (US and Canada)",
+            "UTC-06:00",
+            "GMT-06:00",
+        ),
+        (
+            "America/Mexico_City",
+            "Guadalajara, Mexico City, Monterrey",
+            "UTC-06:00",
+            "GMT-06:00",
+        ),
+        (
+            "America/New_York",
+            "Eastern Time (US and Canada)",
+            "UTC-05:00",
+            "GMT-05:00",
+        ),
         ("America/Bogota", "Bogota", "UTC-05:00", "GMT-05:00"),
         ("America/Lima", "Lima", "UTC-05:00", "GMT-05:00"),
         ("America/Halifax", "Atlantic Time (Canada)", "UTC-04:00", "GMT-04:00"),
         ("America/Santiago", "Santiago", "UTC-04:00", "GMT-04:00"),
         ("America/Buenos_Aires", "Buenos Aires", "UTC-03:00", "GMT-03:00"),
         ("America/Sao_Paulo", "Brasilia", "UTC-03:00", "GMT-03:00"),
-        ("Atlantic/South_Georgia", "South Georgia and the South Sandwich Islands", "UTC-02:00", "GMT-02:00"),
+        (
+            "Atlantic/South_Georgia",
+            "South Georgia and the South Sandwich Islands",
+            "UTC-02:00",
+            "GMT-02:00",
+        ),
         ("Atlantic/Azores", "Azores", "UTC-01:00", "GMT-01:00"),
         ("Atlantic/Cape_Verde", "Cape Verde Islands", "UTC-01:00", "GMT-01:00"),
         ("Europe/London", "London, Edinburgh, Dublin", "UTC+00:00", "GMT+00:00"),
         ("UTC", "UTC", "UTC+00:00", "GMT+00:00"),
-        ("Europe/Paris", "Central European Time (Berlin, Rome, Paris)", "UTC+01:00", "GMT+01:00"),
+        (
+            "Europe/Paris",
+            "Central European Time (Berlin, Rome, Paris)",
+            "UTC+01:00",
+            "GMT+01:00",
+        ),
         ("Africa/Lagos", "West Central Africa, Lagos", "UTC+01:00", "GMT+01:00"),
         ("Europe/Athens", "Athens, Bucharest, Istanbul", "UTC+02:00", "GMT+02:00"),
         ("Africa/Cairo", "Cairo", "UTC+02:00", "GMT+02:00"),
@@ -1328,15 +1339,30 @@ async fn list_timezones() -> ApiResult {
         ("Asia/Dubai", "Abu Dhabi, Muscat", "UTC+04:00", "GMT+04:00"),
         ("Asia/Kabul", "Kabul", "UTC+04:30", "GMT+04:30"),
         ("Asia/Karachi", "Islamabad, Karachi", "UTC+05:00", "GMT+05:00"),
-        ("Asia/Kolkata", "Chennai, Kolkata, Mumbai, New Delhi", "UTC+05:30", "GMT+05:30"),
+        (
+            "Asia/Kolkata",
+            "Chennai, Kolkata, Mumbai, New Delhi",
+            "UTC+05:30",
+            "GMT+05:30",
+        ),
         ("Asia/Kathmandu", "Kathmandu", "UTC+05:45", "GMT+05:45"),
         ("Asia/Dhaka", "Astana, Dhaka", "UTC+06:00", "GMT+06:00"),
         ("Asia/Bangkok", "Bangkok, Hanoi, Jakarta", "UTC+07:00", "GMT+07:00"),
         ("Asia/Singapore", "Kuala Lumpur, Singapore", "UTC+08:00", "GMT+08:00"),
-        ("Asia/Shanghai", "Beijing, Chongqing, Hong Kong, Urumqi", "UTC+08:00", "GMT+08:00"),
+        (
+            "Asia/Shanghai",
+            "Beijing, Chongqing, Hong Kong, Urumqi",
+            "UTC+08:00",
+            "GMT+08:00",
+        ),
         ("Asia/Tokyo", "Osaka, Sapporo, Tokyo", "UTC+09:00", "GMT+09:00"),
         ("Asia/Seoul", "Seoul", "UTC+09:00", "GMT+09:00"),
-        ("Australia/Sydney", "Canberra, Melbourne, Sydney", "UTC+10:00", "GMT+10:00"),
+        (
+            "Australia/Sydney",
+            "Canberra, Melbourne, Sydney",
+            "UTC+10:00",
+            "GMT+10:00",
+        ),
         ("Pacific/Guam", "Guam, Port Moresby", "UTC+10:00", "GMT+10:00"),
         ("Pacific/Noumea", "New Caledonia", "UTC+11:00", "GMT+11:00"),
         ("Pacific/Auckland", "Auckland, Wellington", "UTC+12:00", "GMT+12:00"),

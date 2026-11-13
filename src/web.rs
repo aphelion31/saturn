@@ -1,4 +1,11 @@
 //! Static apps, health, security headers, origin check and the 501 fallback for unported routes.
+
+pub async fn api_not_found() -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({"error": "Page not found."})),
+    )
+}
 use axum::{
     Json, Router,
     body::Body,

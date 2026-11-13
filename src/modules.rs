@@ -1222,7 +1222,7 @@ async fn workspace_list(State(st): State<AppState>, user: CurrentUser, Path(slug
     let ws = require_workspace(&st.db, &user, &slug).await?;
     json_rows(
         sqlx::query_scalar(&format!(
-            "SELECT {} FROM modules m {COUNTS}
+            "SELECT ({} - 'completed_estimate_points' - 'is_favorite' - 'total_estimate_points') FROM modules m {COUNTS}
              JOIN projects p ON p.id = m.project_id AND p.deleted_at IS NULL AND p.archived_at IS NULL
              WHERE m.workspace_id = $2 AND m.archived_at IS NULL AND m.deleted_at IS NULL
                AND EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id = m.project_id AND pm.member_id = $1

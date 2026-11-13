@@ -5,6 +5,12 @@ call GET "/api/workspaces/$SLUG/projects/$PROJECT/issues/list/"
 call GET "/api/workspaces/$SLUG/projects/$PROJECT/v2/issues/"
 call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/" '{"name":"Smoke issue"}'
 ISSUE=$(field '.id')
+SEQ=$(field '.sequence_id')
+IDENT=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "select identifier from projects where id='$PROJECT'")
+call GET "/api/workspaces/$SLUG/work-items/$IDENT-$SEQ/?expand=issue_reactions,issue_attachments,issue_link,parent"
+jq -e 'keys == (["id","name","state_id","sort_order","completed_at","estimate_point","priority","start_date","target_date","sequence_id","project_id","parent_id","cycle_id","module_ids","label_ids","assignee_ids","sub_issues_count","created_at","updated_at","created_by","updated_by","attachment_count","link_count","is_draft","archived_at","description_html","is_subscribed","is_intake","parent","issue_reactions","issue_link","issue_attachments"] | sort)' <<<"$body" >/dev/null
+call GET "/api/workspaces/$SLUG/work-items/$IDENT-$SEQ/"
+jq -e 'has("is_intake") and has("is_subscribed") and (has("parent")|not) and (has("issue_link")|not)' <<<"$body" >/dev/null
 # Exact body Plane's create modal sends (read-only project_id, empty state_id, null module_ids).
 call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/" '{"project_id":"'"$PROJECT"'","type_id":null,"name":"Modal issue","description_html":"<p></p>","estimate_point":null,"state_id":"","parent_id":null,"priority":"none","assignee_ids":[],"label_ids":[],"cycle_id":null,"module_ids":null,"start_date":null,"target_date":null}'
 [[ "$(field '.state_id')" != "null" && "$(field '.state_id')" != "" ]] || { echo "✖ modal create did not get default state" >&2; exit 1; }

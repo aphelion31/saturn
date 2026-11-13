@@ -53,7 +53,7 @@ impl ApiError {
     pub fn forbidden() -> Self {
         Self(
             StatusCode::FORBIDDEN,
-            json!({"error": "You don't have the required permissions."}),
+            json!({"detail": "You do not have permission to perform this action."}),
         )
     }
     pub fn bad(msg: impl Into<String>) -> Self {

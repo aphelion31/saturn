@@ -109,7 +109,7 @@ pub fn routes() -> Router<AppState> {
             axum::routing::delete(remove_favorite),
         )
         .route("/api/workspaces/{slug}/projects/", get(list_projects).post(create))
-        .route("/api/workspaces/{slug}/projects/details/", get(list_projects))
+        .route("/api/workspaces/{slug}/projects/details/", get(list_project_details))
         .route(
             "/api/workspaces/{slug}/projects/{project_id}/",
             get(retrieve).patch(update).delete(destroy),
@@ -1105,12 +1105,31 @@ async fn destroy(
 async fn list_projects(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>) -> ApiResult {
     let ws = require_workspace(&st.db, &user, &slug).await?;
     ws.require(&[ADMIN, MEMBER, GUEST])?;
+    json_rows(sqlx::query_scalar("SELECT jsonb_build_object(
+        'id', p.id, 'name', p.name, 'identifier', p.identifier, 'sort_order', pup.sort_order,
+        'logo_props', p.logo_props, 'member_role', pm.role, 'intake_count',
+        (SELECT count(*) FROM intake_issues ii WHERE ii.workspace_id=p.workspace_id AND ii.project_id=p.id AND ii.status=-2 AND ii.deleted_at IS NULL),
+        'archived_at', p.archived_at, 'workspace', p.workspace_id, 'cycle_view', p.cycle_view,
+        'issue_views_view', p.issue_views_view, 'module_view', p.module_view, 'page_view', p.page_view,
+        'inbox_view', p.intake_view, 'guest_view_all_features', p.guest_view_all_features,
+        'project_lead', p.project_lead_id, 'network', p.network, 'created_at', p.created_at,
+        'updated_at', p.updated_at, 'created_by', p.created_by_id, 'updated_by', p.updated_by_id)
+        FROM projects p LEFT JOIN project_members pm ON pm.project_id=p.id AND pm.workspace_id=p.workspace_id AND pm.member_id=$2 AND pm.is_active AND pm.deleted_at IS NULL
+        LEFT JOIN project_user_properties pup ON pup.project_id=p.id AND pup.workspace_id=p.workspace_id AND pup.user_id=$2 AND pup.deleted_at IS NULL
+        WHERE p.workspace_id=$1 AND p.deleted_at IS NULL AND (pm.id IS NOT NULL OR $3 = 20 OR ($3 = 15 AND p.network=2)) ORDER BY pup.sort_order, p.name")
+        .bind(ws.workspace_id).bind(user.id).bind(ws.role), &st.db).await
+}
+
+async fn list_project_details(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>) -> ApiResult {
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    ws.require(&[ADMIN, MEMBER, GUEST])?;
     json_rows(sqlx::query_scalar(
         "SELECT (to_jsonb(p) - 'workspace_id' - 'created_by_id' - 'updated_by_id' - 'default_assignee_id' - 'project_lead_id' - 'estimate_id' - 'default_state_id' - 'cover_image_asset_id') ||
          jsonb_build_object('workspace', p.workspace_id, 'created_by', p.created_by_id, 'updated_by', p.updated_by_id,
          'default_assignee', p.default_assignee_id, 'project_lead', p.project_lead_id, 'estimate', p.estimate_id,
          'default_state', p.default_state_id, 'cover_image_asset', p.cover_image_asset_id, 'inbox_view', p.intake_view,
-         'cover_image_url', p.cover_image, 'member_role', pm.role, 'is_member', pm.id IS NOT NULL,
+         'cover_image_url', p.cover_image, 'member_role', pm.role,
+         'anchor', (SELECT d.anchor FROM deploy_boards d WHERE d.workspace_id=p.workspace_id AND d.project_id=p.id AND d.entity_name='project' AND d.entity_identifier=p.id AND d.deleted_at IS NULL LIMIT 1),
          'sort_order', pup.sort_order,
          'members', COALESCE((SELECT jsonb_agg(m.member_id) FROM project_members m JOIN users u ON u.id=m.member_id
              WHERE m.project_id=p.id AND m.workspace_id=p.workspace_id AND m.deleted_at IS NULL AND m.is_active AND NOT u.is_bot), '[]'::jsonb),

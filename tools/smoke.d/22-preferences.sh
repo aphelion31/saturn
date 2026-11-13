@@ -22,9 +22,11 @@ call PATCH /api/users/me/ '{"first_name":"Admin"}'
 call PATCH /api/users/me/ '{"user_timezone":"America/New_York"}'
 [[ $(field '.user_timezone') == America/New_York ]]
 call GET /api/users/me/profile/
+# Plane's ProfileSerializer has no user_timezone; the timezone lives on the user.
+[[ $(field '.user_timezone') == null ]]
+call GET /api/users/me/
 [[ $(field '.user_timezone') == America/New_York ]]
 call PATCH /api/users/me/profile/ '{"user_timezone":"Asia/Tokyo"}'
-[[ $(field '.user_timezone') == Asia/Tokyo ]]
 call GET /api/users/me/
 [[ $(field '.user_timezone') == Asia/Tokyo ]]
 call GET "/api/workspaces/$SLUG/user-profile/$UID_SELF/"
