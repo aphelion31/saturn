@@ -107,32 +107,8 @@ async fn dispatch(
     Ok(())
 }
 
-pub fn start(st: &AppState) {
-    if std::env::var("SATURN_JOBS").ok().as_deref() == Some("0") {
-        return;
-    }
-    let st = st.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            if let Err(e) = stack_email_notification(&st).await {
-                tracing::error!(error=%e, "notification digest failed");
-            }
-        }
-    });
-}
-
-pub async fn stack_email_notification(st: &AppState) -> Result<(), sqlx::Error> {
-    let mut tx = st.db.begin().await?;
-    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
-        .bind(0x5341544e_i64)
-        .fetch_one(&mut *tx)
-        .await?;
-    if !locked {
-        return Ok(());
-    }
+pub async fn stack_email_notification(st: &AppState, tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(), sqlx::Error> {
+    let tx = &mut **tx;
     let groups: Vec<(Uuid, Uuid, String, Vec<Uuid>, Vec<Value>)> = sqlx::query_as("SELECT l.receiver_id,l.entity_identifier,u.email,array_agg(l.id ORDER BY l.created_at),array_agg(l.data ORDER BY l.created_at) FROM email_notification_logs l JOIN users u ON u.id=l.receiver_id WHERE l.processed_at IS NULL AND l.deleted_at IS NULL AND l.entity_name='issue' AND l.entity_identifier IS NOT NULL GROUP BY l.receiver_id,l.entity_identifier,u.email").fetch_all(&mut *tx).await?;
     let smtp = crate::outbound::smtp(st).await;
     for (_, _, email, ids, data) in groups {
@@ -170,7 +146,7 @@ pub async fn stack_email_notification(st: &AppState) -> Result<(), sqlx::Error> 
             sqlx::query("UPDATE email_notification_logs SET processed_at=now(),updated_at=now() WHERE id=ANY($1) AND processed_at IS NULL").bind(&ids).execute(&mut *tx).await?;
         }
     }
-    tx.commit().await
+    Ok(())
 }
 
 #[cfg(test)]
