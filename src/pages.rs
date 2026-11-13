@@ -534,6 +534,10 @@ async fn persist_live(
             .bind(workspace).bind(id).execute(&mut *tx).await?;
     }
     tx.commit().await?;
+    if previous != html {
+        // Plane: the live server PATCHes the page, which queues page_transaction (page_logs).
+        crate::side_effects::spawn_page_transaction(st.clone(), workspace, id, Some(html), Some(previous));
+    }
     room.dirty_since = None;
     Ok(())
 }
