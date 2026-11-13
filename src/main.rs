@@ -11,6 +11,7 @@ mod session;
 mod web;
 mod webhook_out;
 mod workitems;
+mod jobs;
 
 // API areas. Each module owns its routes (full paths, trailing slash, as Plane's apps call them).
 mod analytics;
@@ -152,8 +153,13 @@ async fn main() -> anyhow::Result<()> {
     match args.get(1).map(String::as_str) {
         Some("migrate") => return Ok(()),
         Some("seed") => return users::seed(&state, &args[2..]).await,
+        Some("jobs") if args.get(2).map(String::as_str) == Some("run") => {
+            return jobs::cli_run(&state, &args[3..]).await;
+        }
         _ => {}
     }
+
+    jobs::spawn(state.clone());
 
     let addr = env("BIND", "0.0.0.0:3000");
     tracing::info!("saturn listening on {addr}");
