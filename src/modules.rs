@@ -302,7 +302,7 @@ async fn create(
         .bind(id)
         .fetch_one(&st.db)
         .await?;
-    crate::webhook_out::emit(&st, p.workspace_id(), "module", "created", v.clone());
+    crate::webhook_out::emit(&st, p.workspace_id(), "module", "created", v.clone(), user.id);
     created(v)
 }
 
@@ -313,7 +313,16 @@ async fn retrieve(
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER])?;
-    crate::recent_visits::record(&st.db, crate::recent_visits::Visit { workspace_id: p.workspace_id(), user_id: user.id, entity_name: "module", entity_identifier: pk, project_id: Some(project_id) });
+    crate::recent_visits::record(
+        &st.db,
+        crate::recent_visits::Visit {
+            workspace_id: p.workspace_id(),
+            user_id: user.id,
+            entity_name: "module",
+            entity_identifier: pk,
+            project_id: Some(project_id),
+        },
+    );
     let mut v: Value = sqlx::query_scalar(&format!(
         "{} WHERE m.id = $2 AND m.project_id = $3 AND m.workspace_id = $4 AND m.archived_at IS NULL AND m.deleted_at IS NULL",
         module_select("$1")
@@ -358,6 +367,7 @@ async fn update(
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER])?;
+    let webhook_before = crate::webhook_out::model_data(&st.db, "module", pk, p.workspace_id()).await?;
     let (archived,): (bool,) = sqlx::query_as(
         "SELECT archived_at IS NOT NULL FROM modules WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL",
     )
@@ -427,7 +437,15 @@ async fn update(
         insert_members(&mut tx, pk, project_id, p.workspace_id(), &m, user.id).await?;
     }
     tx.commit().await?;
-    crate::webhook_out::emit(&st, p.workspace_id(), "module", "updated", json!({"id": pk}));
+    crate::webhook_out::emit_with_changes(
+        &st,
+        p.workspace_id(),
+        "module",
+        "updated",
+        json!({"id": pk}),
+        user.id,
+        crate::webhook_out::changes(&webhook_before, &b),
+    );
     json_row(
         sqlx::query_scalar(&format!("{} WHERE m.id = $2", module_select("$1")))
             .bind(user.id)
@@ -478,7 +496,7 @@ async fn destroy(
         sqlx::query(q).bind(pk).execute(&mut *tx).await?;
     }
     tx.commit().await?;
-    crate::webhook_out::emit(&st, p.workspace_id(), "module", "deleted", json!({"id": pk}));
+    crate::webhook_out::emit(&st, p.workspace_id(), "module", "deleted", json!({"id": pk}), user.id);
     no_content()
 }
 
@@ -626,9 +644,26 @@ async fn add_issue_modules(
         .execute(&mut *tx)
         .await?;
         if result.rows_affected() > 0 {
-            let name: String = sqlx::query_scalar("SELECT name FROM modules WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL")
-                .bind(m).bind(project_id).bind(p.workspace_id()).fetch_one(&mut *tx).await?;
-            crate::activity::grouping(&mut tx, issue_id, project_id, p.workspace_id(), user.id, "modules", m, &name, true).await?;
+            let name: String = sqlx::query_scalar(
+                "SELECT name FROM modules WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+            )
+            .bind(m)
+            .bind(project_id)
+            .bind(p.workspace_id())
+            .fetch_one(&mut *tx)
+            .await?;
+            crate::activity::grouping(
+                &mut tx,
+                issue_id,
+                project_id,
+                p.workspace_id(),
+                user.id,
+                "modules",
+                m,
+                &name,
+                true,
+            )
+            .await?;
         }
     }
     for m in body.removed_modules.unwrap_or_default() {
@@ -643,9 +678,25 @@ async fn add_issue_modules(
         .execute(&mut *tx)
         .await?;
         if result.rows_affected() > 0 {
-            let name: String = sqlx::query_scalar("SELECT name FROM modules WHERE id=$1 AND project_id=$2 AND workspace_id=$3")
-                .bind(m).bind(project_id).bind(p.workspace_id()).fetch_one(&mut *tx).await?;
-            crate::activity::grouping(&mut tx, issue_id, project_id, p.workspace_id(), user.id, "modules", m, &name, false).await?;
+            let name: String =
+                sqlx::query_scalar("SELECT name FROM modules WHERE id=$1 AND project_id=$2 AND workspace_id=$3")
+                    .bind(m)
+                    .bind(project_id)
+                    .bind(p.workspace_id())
+                    .fetch_one(&mut *tx)
+                    .await?;
+            crate::activity::grouping(
+                &mut tx,
+                issue_id,
+                project_id,
+                p.workspace_id(),
+                user.id,
+                "modules",
+                m,
+                &name,
+                false,
+            )
+            .await?;
         }
     }
     tx.commit().await?;

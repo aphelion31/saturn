@@ -1816,6 +1816,7 @@ async fn comment_create(
         "issue_comment",
         "created",
         serde_json::json!({"id": id}),
+        user.id,
     );
     let Json(value) = comment_detail(State(st), user, Path((slug, project, issue, id))).await?;
     created(value)
@@ -1828,6 +1829,7 @@ async fn comment_update(
     Json(body): Json<Value>,
 ) -> ApiResult {
     let p = visible_issue(&st, &user, &slug, project, issue).await?;
+    let webhook_before = crate::webhook_out::model_data(&st.db, "issue_comment", comment, p.workspace_id()).await?;
     let (html, json, access) = comment_fields(&body)?;
     let mut tx = st.db.begin().await?;
     let old: Option<String> = sqlx::query_scalar("SELECT comment_html FROM issue_comments WHERE id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND deleted_at IS NULL FOR UPDATE")
@@ -1859,12 +1861,14 @@ async fn comment_update(
     let activities = crate::notify::snapshots(&mut tx, issue, project, p.workspace_id()).await?;
     tx.commit().await?;
     crate::notify::after_activity(&st, issue, project, p.workspace_id(), user.id, activities);
-    crate::webhook_out::emit(
+    crate::webhook_out::emit_with_changes(
         &st,
         p.workspace_id(),
         "issue_comment",
         "updated",
         serde_json::json!({"id": comment}),
+        user.id,
+        crate::webhook_out::changes(&webhook_before, &body),
     );
     comment_detail(State(st), user, Path((slug, project, issue, comment))).await
 }
@@ -1899,6 +1903,7 @@ async fn comment_delete(
         "issue_comment",
         "deleted",
         serde_json::json!({"id": comment}),
+        user.id,
     );
     no_content()
 }
@@ -1943,6 +1948,8 @@ pub(crate) async fn update(
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER])?;
+    let webhook_before = crate::webhook_out::model_data(&st.db, "issue", issue_id, p.workspace_id()).await?;
+    let webhook_body = body.clone();
     let object = body.as_object().ok_or_else(|| ApiError::bad("Invalid request"))?;
     if object.keys().any(|k| {
         ![
@@ -2247,12 +2254,14 @@ pub(crate) async fn update(
     let activities = crate::notify::snapshots(&mut tx, issue_id, project_id, p.workspace_id()).await?;
     tx.commit().await?;
     crate::notify::after_activity(&st, issue_id, project_id, p.workspace_id(), user.id, activities);
-    crate::webhook_out::emit(
+    crate::webhook_out::emit_with_changes(
         &st,
         p.workspace_id(),
         "issue",
         "updated",
         serde_json::json!({"id": issue_id}),
+        user.id,
+        crate::webhook_out::changes(&webhook_before, &webhook_body),
     );
     detail(State(st), user, Path((slug, project_id, issue_id))).await
 }
@@ -2287,6 +2296,7 @@ async fn destroy(
         "issue",
         "deleted",
         serde_json::json!({"id": issue_id}),
+        user.id,
     );
     no_content()
 }
@@ -2305,7 +2315,7 @@ async fn create(
     let activities = crate::notify::snapshots(&mut tx, issue_id, project_id, p.workspace_id()).await?;
     tx.commit().await?;
     crate::notify::after_activity(&st, issue_id, project_id, p.workspace_id(), user.id, activities);
-    crate::webhook_out::emit(&st, p.workspace_id(), "issue", "created", result.clone());
+    crate::webhook_out::emit(&st, p.workspace_id(), "issue", "created", result.clone(), user.id);
     created(result)
 }
 
@@ -2322,7 +2332,16 @@ async fn create_issue(
     // empty `state_id` means "use the default state".
     let mut body = body.clone();
     if let Some(obj) = body.as_object_mut() {
-        for k in ["id", "project_id", "workspace_id", "tempId", "sequence_id", "sub_issues_count", "attachment_count", "link_count"] {
+        for k in [
+            "id",
+            "project_id",
+            "workspace_id",
+            "tempId",
+            "sequence_id",
+            "sub_issues_count",
+            "attachment_count",
+            "link_count",
+        ] {
             obj.remove(k);
         }
         if obj.get("state_id").and_then(Value::as_str) == Some("") {
@@ -2560,9 +2579,16 @@ async fn detail(
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER, GUEST])?;
-    crate::recent_visits::record(&st.db, crate::recent_visits::Visit {
-        workspace_id: p.workspace_id(), user_id: user.id, entity_name: "issue", entity_identifier: issue_id, project_id: Some(project_id),
-    });
+    crate::recent_visits::record(
+        &st.db,
+        crate::recent_visits::Visit {
+            workspace_id: p.workspace_id(),
+            user_id: user.id,
+            entity_name: "issue",
+            entity_identifier: issue_id,
+            project_id: Some(project_id),
+        },
+    );
     let sql = format!(
         "SELECT {} || jsonb_build_object('description_html', i.description_html,
           'is_subscribed', EXISTS (SELECT 1 FROM issue_subscribers sub WHERE sub.issue_id = i.id
@@ -2601,6 +2627,15 @@ async fn list(
     if p.restricted_guest() {
         base.and("i.created_by_id = {}", Arg::Uuid(user.id));
     }
-    crate::recent_visits::record(&st.db, crate::recent_visits::Visit { workspace_id: p.workspace_id(), user_id: user.id, entity_name: "project", entity_identifier: project_id, project_id: Some(project_id) });
+    crate::recent_visits::record(
+        &st.db,
+        crate::recent_visits::Visit {
+            workspace_id: p.workspace_id(),
+            user_id: user.id,
+            entity_name: "project",
+            entity_identifier: project_id,
+            project_id: Some(project_id),
+        },
+    );
     workitems::list(&st.db, base, &q, Scope::Project(project_id)).await
 }
