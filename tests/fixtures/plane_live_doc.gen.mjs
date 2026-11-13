@@ -1,5 +1,6 @@
-import * as s from "/Users/beyondb/Halim/Projects/CEG/prjtss/plane/packages/editor/dist/server.js";
+import * as s from process.env.PLANE_EDITOR_SERVER ?? "../../../plane/packages/editor/dist/server.js";
 import fs from "fs";
+import extra from "./extra.mjs";
 const cases = {
   basic: '<p>Hello <strong>world</strong> and <em>it</em> <u>u</u> <s>s</s> <code>c</code> <a href="https://x.dev">link</a></p>',
   headings: '<h1>One</h1><h2>Two</h2><h3>Three</h3><p></p>',
@@ -14,6 +15,7 @@ const cases = {
   align: '<p style="text-align: center">mid</p><h2 style="text-align: right">r</h2>',
   breaks: '<p>a<br>b</p>',
   escape: '<p>&lt;script&gt;alert(1)&lt;/script&gt; &amp; "q"</p>',
+  ...extra,
 };
 const out = {};
 for (const [k, html] of Object.entries(cases)) {
