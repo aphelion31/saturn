@@ -1,6 +1,6 @@
 [package]
 name = "saturn"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 description = "Saturn: lightweight Rust rewrite of the Plane backend, serving the Plane React Router apps"
 license = "AGPL-3.0-only"
@@ -19,6 +19,7 @@ hex = "0.4"
 html5ever = "0.40"
 hmac = "0.12"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "tokio1", "tokio1-rustls-tls", "hostname"] }
+argon2 = "0.5"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
@@ -37,6 +38,12 @@ chrono-tz = "0.10"
 zxcvbn = "3"
 rust_xlsxwriter = "0.104"
 pdf-writer = "0.15"
+
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
 
 [profile.release]
 strip = true

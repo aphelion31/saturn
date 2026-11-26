@@ -472,6 +472,7 @@ pub async fn create_user(
     last_name: &str,
 ) -> Result<Uuid, ApiError> {
     let display = email.split('@').next().unwrap_or("user").to_string();
+    let password_hash = session::hash_password_async(password.to_string()).await?;
     let mut tx = db.begin().await?;
     let (id,): (Uuid,) = sqlx::query_as(
         "INSERT INTO users (email, username, password, first_name, last_name, display_name, token, is_active,
@@ -480,7 +481,7 @@ pub async fn create_user(
     )
     .bind(email)
     .bind(Uuid::new_v4().simple().to_string())
-    .bind(session::hash_password(password))
+    .bind(password_hash)
     .bind(first_name)
     .bind(last_name)
     .bind(display)
@@ -857,9 +858,10 @@ async fn reset(
     if f.confirm_password.as_deref() != Some(password.as_str()) || !strong(&password) {
         return Ok(fail("PASSWORD_TOO_WEAK"));
     }
+    let password_hash = session::hash_password_async(password).await?;
     sqlx::query("UPDATE users SET password=$2, is_password_autoset=false, is_email_verified=true WHERE id=$1")
         .bind(id)
-        .bind(session::hash_password(&password))
+        .bind(password_hash)
         .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM saturn_magic_codes WHERE key=$1")
@@ -920,7 +922,7 @@ async fn update_password(
     };
     let err = if set && !autoset {
         Some("PASSWORD_ALREADY_SET")
-    } else if !set && !session::check_password(&b.old_password.unwrap_or_default(), &hash) {
+    } else if !set && !session::check_password_async(b.old_password.unwrap_or_default(), hash.clone()).await? {
         Some("INCORRECT_OLD_PASSWORD")
     } else if !strong(&password) {
         Some("PASSWORD_TOO_WEAK")
@@ -934,9 +936,10 @@ async fn update_password(
         )
             .into_response());
     }
+    let password_hash = session::hash_password_async(password).await?;
     let changed = sqlx::query("UPDATE users SET password=$2,is_password_autoset=false WHERE id=$1 AND password=$3")
         .bind(user.id)
-        .bind(session::hash_password(&password))
+        .bind(password_hash)
         .bind(hash)
         .execute(&st.db)
         .await?;
@@ -1041,6 +1044,7 @@ async fn sign_in(st: AppState, headers: HeaderMap, f: AuthForm, app: App) -> Res
     .fetch_optional(&st.db)
     .await?;
     let Some((id, hash, active, bot, logged_out_before)) = row else {
+        session::verify_dummy_async().await;
         return Ok(err_redirect(
             &st,
             app,
@@ -1049,7 +1053,13 @@ async fn sign_in(st: AppState, headers: HeaderMap, f: AuthForm, app: App) -> Res
             Some(&email),
         ));
     };
-    if bot || !session::check_password(&password, &hash) {
+    let valid_pw = if bot {
+        session::verify_dummy_async().await;
+        false
+    } else {
+        session::check_password_async(password.clone(), hash.clone()).await?
+    };
+    if !valid_pw {
         return Ok(err_redirect(
             &st,
             app,
@@ -1060,6 +1070,16 @@ async fn sign_in(st: AppState, headers: HeaderMap, f: AuthForm, app: App) -> Res
     }
     if !active && logged_out_before {
         return Ok(err_redirect(&st, app, &next, "USER_ACCOUNT_DEACTIVATED", Some(&email)));
+    }
+    if session::needs_rehash(&hash) {
+        let upgraded = session::hash_password_async(password).await?;
+        // Upgrade before `session::create` so `_auth_user_hash` binds to the Argon2id hash.
+        sqlx::query("UPDATE users SET password = $2, updated_at = now() WHERE id = $1 AND password = $3")
+            .bind(id)
+            .bind(upgraded)
+            .bind(&hash)
+            .execute(&st.db)
+            .await?;
     }
     sqlx::query("UPDATE users SET is_active = true, last_login_medium = 'email' WHERE id = $1")
         .bind(id)
@@ -1386,10 +1406,27 @@ async fn admin_sign_in(
             .fetch_optional(&st.db)
             .await?;
     let Some((id, hash, active)) = row else {
+        session::verify_dummy_async().await;
         return Ok(back("ADMIN_AUTHENTICATION_FAILED"));
     };
-    if !active || !session::check_password(&password, &hash) || !is_instance_admin(&st, id).await? {
+    let valid_pw = if !active {
+        session::verify_dummy_async().await;
+        false
+    } else {
+        session::check_password_async(password.clone(), hash.clone()).await?
+    };
+    if !valid_pw || !is_instance_admin(&st, id).await? {
         return Ok(back("ADMIN_AUTHENTICATION_FAILED"));
+    }
+    if session::needs_rehash(&hash) {
+        let upgraded = session::hash_password_async(password).await?;
+        // Upgrade before `session::create` so `_auth_user_hash` binds to the Argon2id hash.
+        sqlx::query("UPDATE users SET password = $2, updated_at = now() WHERE id = $1 AND password = $3")
+            .bind(id)
+            .bind(upgraded)
+            .bind(&hash)
+            .execute(&st.db)
+            .await?;
     }
     let uagent = headers
         .get(header::USER_AGENT)

@@ -226,4 +226,38 @@ DT_CNT=$(psql "$DB_PARITY_URL" -Atc "SELECT count(*) FROM issue_activities WHERE
 [[ "$DT_CNT" == "2" ]] || { echo "✖ expected 2 issue_activities from issue-dates, got $DT_CNT" >&2; exit 1; }
 call DELETE "/api/workspaces/$SLUG/projects/$PROJECT/issues/$DT_ISSUE/"
 
+# 11. Argon2id password storage & transparent legacy pbkdf2_sha256 upgrade on login
+SEEDED_PW=$(psql "$DB_PARITY_URL" -Atc "SELECT password FROM users WHERE email = '$EMAIL'")
+[[ "$SEEDED_PW" == argon2\$argon2id\$v=19\$m=19456,t=2,p=1\$* ]] \
+  || { echo "✖ seeded password is not Argon2id: $SEEDED_PW" >&2; exit 1; }
+
+miss_loc=$(curl -s -o /dev/null -w '%{redirect_url}' -d "email=missing-$RANDOM@example.com&password=WrongPassword99!" "$BASE/auth/sign-in/")
+[[ "$miss_loc" == *AUTHENTICATION_FAILED_SIGN_IN* ]] \
+  || { echo "✖ unknown-email sign-in mismatch: $miss_loc" >&2; exit 1; }
+
+A2_EMAIL="argon2-$RANDOM@example.com"
+a2_jar=$(mktemp)
+trap 'rm -f "$a2_jar"' RETURN
+a2_up=$(curl -s -o /dev/null -w '%{redirect_url}' -c "$a2_jar" -d "email=$A2_EMAIL&password=$PASSWORD" "$BASE/auth/sign-up/")
+[[ "$a2_up" != *error_code=* ]] || { echo "✖ argon2 sign-up failed: $a2_up" >&2; exit 1; }
+A2_HASH=$(psql "$DB_PARITY_URL" -Atc "SELECT password FROM users WHERE email = '$A2_EMAIL'")
+[[ "$A2_HASH" == argon2\$argon2id\$v=19\$m=19456,t=2,p=1\$* ]] \
+  || { echo "✖ signed-up password is not Argon2id: $A2_HASH" >&2; exit 1; }
+
+# Overwrite with Django 5.2 pbkdf2_sha256("hunter2", salt="abc", 1000) and log in to verify auto-upgrade
+LEGACY_PBKDF2='pbkdf2_sha256$1000$abc$d2O18KKBjiNyWKxf7lHXttSlasKRO44Zytmt9CqZ21c='
+psql "$DB_PARITY_URL" -Atc "UPDATE users SET password = '$LEGACY_PBKDF2' WHERE email = '$A2_EMAIL'" >/dev/null
+rm -f "$a2_jar"; a2_jar=$(mktemp)
+a2_in=$(curl -s -o /dev/null -w '%{redirect_url}' -c "$a2_jar" -d "email=$A2_EMAIL&password=hunter2" "$BASE/auth/sign-in/")
+[[ "$a2_in" != *error_code=* ]] || { echo "✖ legacy pbkdf2 sign-in failed: $a2_in" >&2; exit 1; }
+UPGRADED_HASH=$(psql "$DB_PARITY_URL" -Atc "SELECT password FROM users WHERE email = '$A2_EMAIL'")
+[[ "$UPGRADED_HASH" == argon2\$argon2id\$v=19\$m=19456,t=2,p=1\$* ]] \
+  || { echo "✖ legacy password did not upgrade to Argon2id: $UPGRADED_HASH" >&2; exit 1; }
+me_resp=$(curl -sf -b "$a2_jar" "$BASE/api/users/me/")
+[[ "$(jq -r '.email' <<<"$me_resp")" == "$A2_EMAIL" ]] \
+  || { echo "✖ session invalidated after transparent Argon2id rehash: $me_resp" >&2; exit 1; }
+psql "$DB_PARITY_URL" -Atc "DELETE FROM sessions WHERE user_id IN (SELECT id::text FROM users WHERE email = '$A2_EMAIL'); DELETE FROM profiles WHERE user_id IN (SELECT id FROM users WHERE email = '$A2_EMAIL'); DELETE FROM user_notification_preferences WHERE user_id IN (SELECT id FROM users WHERE email = '$A2_EMAIL'); DELETE FROM users WHERE email = '$A2_EMAIL'" >/dev/null
+rm -f "$a2_jar"
+trap - RETURN
+
 echo "✔ parity and live smoke checks passed"
