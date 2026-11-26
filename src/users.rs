@@ -116,12 +116,13 @@ async fn deactivate(State(st): State<AppState>, user: CurrentUser) -> Result<Res
     .bind(user.id)
     .execute(&mut *tx)
     .await?;
+    let random_hash = session::hash_password_async(Uuid::new_v4().simple().to_string()).await?;
     sqlx::query(
         "UPDATE users SET is_password_autoset = true, password = $2, is_active = false, last_logout_time = now(),
            updated_at = now() WHERE id = $1",
     )
     .bind(user.id)
-    .bind(session::hash_password(&Uuid::new_v4().simple().to_string()))
+    .bind(random_hash)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;

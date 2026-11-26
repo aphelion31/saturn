@@ -3,11 +3,16 @@
 //! Plane stores sessions in the `sessions` table (custom Django session model) and identifies the
 //! browser with a `session-id` cookie (`admin-session-id` for god-mode). `session_data` is
 //! `django.core.signing.dumps(dict, salt="django.contrib.sessions.SessionStore", compress=True)`.
-//! Passwords use Django's `pbkdf2_sha256$<iterations>$<salt>$<base64 hash>`.
-use axum::http::HeaderMap;
+//! Passwords default to Argon2id (`argon2$argon2id$v=19$m=19456,t=2,p=1$...`, OWASP) and
+//! still verify legacy Django `pbkdf2_sha256$<iterations>$<salt>$<base64 hash>` rows so existing
+//! Plane databases keep their logins and upgrade transparently on sign in.
+use argon2::{
+    Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version, password_hash::SaltString,
+};
+use axum::http::{HeaderMap, StatusCode};
 use base64::{Engine, engine::general_purpose::STANDARD as B64, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use hmac::{Hmac, Mac};
-use rand::Rng;
+use rand::{Rng, RngCore, rngs::OsRng};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
@@ -22,7 +27,12 @@ pub const ADMIN_AGE_SECS: i64 = 3_600; // ADMIN_SESSION_COOKIE_AGE
 const SALT: &str = "django.contrib.sessions.SessionStore";
 const KEY_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 const B62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-const PBKDF2_ITERATIONS: u32 = 1_000_000; // Django 5.2 default
+const ARGON2_M_COST: u32 = 19_456;
+const ARGON2_T_COST: u32 = 2;
+const ARGON2_P_COST: u32 = 1;
+const ARGON2_CURRENT_PREFIX: &str = "argon2$argon2id$v=19$m=19456,t=2,p=1$";
+const DUMMY_ARGON2_HASH: &str =
+    "argon2$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 /// Read one cookie value from the request headers.
 pub fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -199,20 +209,44 @@ fn constant_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Hash a password in Django's default `pbkdf2_sha256` format.
-pub fn hash_password(password: &str) -> String {
-    let salt: String = {
-        let mut r = rand::thread_rng();
-        (0..22).map(|_| B62[r.gen_range(0..62)] as char).collect()
-    };
-    let mut out = [0u8; 32];
-    pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), salt.as_bytes(), PBKDF2_ITERATIONS, &mut out);
-    format!("pbkdf2_sha256${PBKDF2_ITERATIONS}${salt}${}", B64.encode(out))
+fn argon2id() -> Argon2<'static> {
+    let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32)).expect("valid argon2id params");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
 }
 
-/// Check a password against a Django `pbkdf2_sha256` hash. Unusable (`!...`) and other
-/// hashers return false.
+/// Hash a password with Argon2id (OWASP parameters, prefixed `argon2$...` for Django compatibility
+/// and `users.password varchar(128)` storage).
+pub fn hash_password(password: &str) -> String {
+    let mut salt_bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut salt_bytes);
+    let salt = SaltString::encode_b64(&salt_bytes).expect("16-byte salt base64");
+    let phc = argon2id()
+        .hash_password(password.as_bytes(), &salt)
+        .expect("argon2id hash")
+        .to_string();
+    format!("argon2{phc}")
+}
+
+/// Check a password against Argon2id (`argon2$argon2id$...` or raw `$argon2id$...`) or legacy
+/// Django `pbkdf2_sha256` hashes. Unusable (`!...`) and unknown hashers return false.
 pub fn check_password(password: &str, encoded: &str) -> bool {
+    if let Some(phc) = encoded.strip_prefix("argon2").filter(|s| s.starts_with("$argon2")) {
+        return check_argon2id(password, phc);
+    }
+    if encoded.starts_with("$argon2") {
+        return check_argon2id(password, encoded);
+    }
+    check_pbkdf2_sha256(password, encoded)
+}
+
+fn check_argon2id(password: &str, phc: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(phc) else {
+        return false;
+    };
+    parsed.algorithm.as_str() == "argon2id" && argon2id().verify_password(password.as_bytes(), &parsed).is_ok()
+}
+
+fn check_pbkdf2_sha256(password: &str, encoded: &str) -> bool {
     let mut parts = encoded.splitn(4, '$');
     let (Some("pbkdf2_sha256"), Some(iter), Some(salt), Some(hash)) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -224,6 +258,45 @@ pub fn check_password(password: &str, encoded: &str) -> bool {
     let mut out = vec![0u8; want.len()];
     pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), salt.as_bytes(), iter, &mut out);
     constant_eq(&out, &want)
+}
+
+/// True when a stored hash is legacy (`pbkdf2_sha256`) or uses outdated Argon2id parameters and
+/// should be transparently upgraded to current Argon2id on login.
+pub fn needs_rehash(encoded: &str) -> bool {
+    !encoded.starts_with(ARGON2_CURRENT_PREFIX)
+}
+
+/// Hash a password off the Tokio async worker pool.
+pub async fn hash_password_async(password: String) -> Result<String, ApiError> {
+    tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .map_err(|e| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": format!("password hash task: {e}")}),
+            )
+        })
+}
+
+/// Verify a password off the Tokio async worker pool.
+pub async fn check_password_async(password: String, encoded: String) -> Result<bool, ApiError> {
+    tokio::task::spawn_blocking(move || check_password(&password, &encoded))
+        .await
+        .map_err(|e| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": format!("password verify task: {e}")}),
+            )
+        })
+}
+
+/// Perform constant-time Argon2id work when an account lookup misses, avoiding email enumeration
+/// timing side-channels without blocking the Tokio runtime.
+pub async fn verify_dummy_async() {
+    let _ = tokio::task::spawn_blocking(|| {
+        let _ = check_password("dummy-password", DUMMY_ARGON2_HASH);
+    })
+    .await;
 }
 
 #[cfg(test)]
@@ -256,6 +329,28 @@ mod tests {
         assert!(check_password("hunter2", h));
         assert!(!check_password("nope", h));
         assert!(!check_password("x", "!unusable"));
+        assert!(needs_rehash(h));
+    }
+
+    #[tokio::test]
+    async fn argon2id_password_roundtrip() {
+        let h = hash_password_async("hunter2".into()).await.expect("hash");
+        assert!(h.starts_with(ARGON2_CURRENT_PREFIX));
+        assert!(
+            h.len() <= 128,
+            "argon2id hash must fit users.password varchar(128): {}",
+            h.len()
+        );
+        assert!(!needs_rehash(&h));
+        assert!(check_password_async("hunter2".into(), h.clone()).await.expect("check"));
+        assert!(!check_password_async("nope".into(), h.clone()).await.expect("check"));
+        let raw_phc = h.strip_prefix("argon2").expect("argon2 prefix");
+        assert!(check_password("hunter2", raw_phc));
+        assert!(needs_rehash(raw_phc));
+        assert!(needs_rehash("argon2$argon2id$v=19$m=4096,t=1,p=1$abc$def"));
+        assert!(PasswordHash::new(DUMMY_ARGON2_HASH.strip_prefix("argon2").expect("prefix")).is_ok());
+        assert!(!check_password("any", DUMMY_ARGON2_HASH));
+        verify_dummy_async().await;
     }
 
     #[test]
