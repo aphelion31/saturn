@@ -549,7 +549,9 @@ async fn duplicate(
     Ok((StatusCode::CREATED, Json(v)))
 }
 
-// ponytail: one process owns collaboration rooms; cross-process sync requires a shared broker.
+/// Active collaborative page rooms, synchronized across multiple Saturn processes via PostgreSQL LISTEN/NOTIFY.
+const ROOM_SYNC_CHANNEL: &str = "saturn_live_room";
+const ROOM_NOTIFY_MAX_BYTES: usize = 7500;
 type Rooms = std::collections::HashMap<Uuid, std::sync::Arc<tokio::sync::Mutex<Room>>>;
 struct Room {
     state: Vec<u8>,
@@ -562,6 +564,162 @@ struct Room {
     restricted: bool,
 }
 static ROOMS: std::sync::OnceLock<tokio::sync::Mutex<Rooms>> = std::sync::OnceLock::new();
+static NODE_ID: std::sync::OnceLock<Uuid> = std::sync::OnceLock::new();
+
+fn node_id() -> Uuid {
+    *NODE_ID.get_or_init(Uuid::new_v4)
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct RoomSyncMsg {
+    node: Uuid,
+    page: Uuid,
+    kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    data: Option<String>,
+}
+
+fn encode_room_sync(page: Uuid, kind: &str, raw: &[u8]) -> Option<String> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let payload = serde_json::to_string(&RoomSyncMsg {
+        node: node_id(),
+        page,
+        kind: kind.to_string(),
+        data: Some(STANDARD.encode(raw)),
+    })
+    .ok()?;
+    (payload.len() <= ROOM_NOTIFY_MAX_BYTES).then_some(payload)
+}
+
+fn publish_room_notify(db: sqlx::PgPool, payload: String) {
+    if payload.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        if let Err(e) = sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(ROOM_SYNC_CHANNEL)
+            .bind(payload)
+            .execute(&db)
+            .await
+        {
+            tracing::warn!(error = %e, "failed to publish live room notification");
+        }
+    });
+}
+
+fn merge_yjs_state(current: &[u8], incoming: &[u8]) -> Option<Vec<u8>> {
+    use yrs::{Doc, ReadTxn, StateVector, Transact, Update, updates::decoder::Decode};
+    let doc = Doc::new();
+    if !current.is_empty() {
+        let update = Update::decode_v1(current).ok()?;
+        doc.transact_mut().apply_update(update).ok()?;
+    }
+    if !incoming.is_empty() {
+        let update = Update::decode_v1(incoming).ok()?;
+        doc.transact_mut().apply_update(update).ok()?;
+    }
+    Some(doc.transact().encode_state_as_update_v1(&StateVector::default()))
+}
+
+async fn apply_room_sync(st: &AppState, msg: RoomSyncMsg) {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    if msg.node == node_id() {
+        return;
+    }
+    let Some(rooms) = ROOMS.get() else {
+        return;
+    };
+    let room = {
+        let map = rooms.lock().await;
+        map.get(&msg.page).cloned()
+    };
+    let Some(room) = room else {
+        return;
+    };
+    match msg.kind.as_str() {
+        "awareness" => {
+            let Some(bytes) = msg.data.and_then(|d| STANDARD.decode(d).ok()) else {
+                return;
+            };
+            let _ = room.lock().await.events.send(bytes);
+        }
+        "sync" => {
+            let Some(bytes) = msg.data.and_then(|d| STANDARD.decode(d).ok()) else {
+                return;
+            };
+            let page_str = msg.page.to_string();
+            let mut pos = 0;
+            if get_buf(&bytes, &mut pos) != Some(page_str.as_bytes()) || get_var(&bytes, &mut pos) != Some(0) {
+                return;
+            }
+            let Some(sub) = get_var(&bytes, &mut pos) else {
+                return;
+            };
+            if sub != 1 && sub != 2 {
+                return;
+            }
+            let Some(payload) = get_buf(&bytes, &mut pos) else {
+                return;
+            };
+            let mut r = room.lock().await;
+            if let Some(merged) = merge_yjs_state(&r.state, payload) {
+                r.state = merged;
+                let _ = r.events.send(bytes);
+            }
+        }
+        "reload" => {
+            let binary: Option<Vec<u8>> =
+                match sqlx::query_scalar("SELECT description_binary FROM pages WHERE id = $1 AND deleted_at IS NULL")
+                    .bind(msg.page)
+                    .fetch_optional(&st.db)
+                    .await
+                {
+                    Ok(Some(v)) => v,
+                    _ => return,
+                };
+            let Some(bin) = binary.filter(|b| !b.is_empty()) else {
+                return;
+            };
+            let mut r = room.lock().await;
+            if let Some(merged) = merge_yjs_state(&r.state, &bin) {
+                r.state = merged.clone();
+                let sync_frame = frame(&msg.page.to_string(), 0, Some(2), &merged);
+                let _ = r.events.send(sync_frame);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Listen for cross-process collaborative room updates over PostgreSQL `LISTEN/NOTIFY`.
+pub fn spawn_room_sync(st: AppState) {
+    tokio::spawn(async move {
+        loop {
+            match sqlx::postgres::PgListener::connect_with(&st.db).await {
+                Ok(mut listener) => {
+                    if let Err(e) = listener.listen(ROOM_SYNC_CHANNEL).await {
+                        tracing::warn!(error = %e, "failed to subscribe to live room channel");
+                    } else {
+                        loop {
+                            match listener.recv().await {
+                                Ok(notif) => match serde_json::from_str::<RoomSyncMsg>(notif.payload()) {
+                                    Ok(msg) => apply_room_sync(&st, msg).await,
+                                    Err(e) => tracing::warn!(error = %e, "invalid live room sync notification"),
+                                },
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "live room listener disconnected; reconnecting");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "failed to connect live room listener"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
+}
 
 /// Flush all dirty collaborative page rooms on graceful shutdown.
 pub async fn flush_all_rooms(st: &AppState) {
@@ -690,7 +848,7 @@ async fn collaboration(
         require_workspace(&st.db, &user, &q.workspace_slug).await?;
     }
     if q.document_type.as_deref().is_some_and(|t| t != "project_page") {
-        // ponytail: only project page documents are supported.
+        // Plane Community apps/live only exposes TDocumentTypes = "project_page".
         return Err(ApiError::bad("Unsupported document type"));
     }
     Ok(ws
@@ -911,7 +1069,11 @@ async fn live_socket(mut socket: axum::extract::ws::WebSocket, st: AppState, use
                         let writable: bool = sqlx::query_scalar(&format!("SELECT EXISTS(SELECT 1 FROM pages p WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL)"))
                             .bind(workspace).bind(project_id).bind(user.id).bind(restricted).bind(id).fetch_one(&st.db).await.unwrap_or(false);
                         if writable {
-                            let _=room.lock().await.events.send(data.to_vec());
+                            let raw = data.to_vec();
+                            let _=room.lock().await.events.send(raw.clone());
+                            if let Some(payload) = encode_room_sync(id, "awareness", &raw) {
+                                publish_room_notify(st.db.clone(), payload);
+                            }
                         }
                     }
                     continue;
@@ -936,15 +1098,29 @@ async fn live_socket(mut socket: axum::extract::ws::WebSocket, st: AppState, use
                     if !writable {
                         continue;
                     }
-                    let Ok(update)=Update::decode_v1(payload) else { break };
-                    if doc.transact_mut().apply_update(update).is_err() { break; }
-                    let state=doc.transact().encode_state_as_update_v1(&StateVector::default());
-                    room.state=state;
+                    let Some(merged) = merge_yjs_state(&room.state, payload) else { break };
+                    room.state = merged;
                     let now = tokio::time::Instant::now();
                     room.dirty_since.get_or_insert(now);
                     room.last_change=now;
                     room.editor=user.id;
-                    let _=room.events.send(data.to_vec());
+                    let raw = data.to_vec();
+                    let _=room.events.send(raw.clone());
+                    if let Some(sync_payload) = encode_room_sync(id, "sync", &raw) {
+                        publish_room_notify(st.db.clone(), sync_payload);
+                    } else {
+                        if let Err(e) = persist_live(&st, project_id, workspace, restricted, id, &mut room).await {
+                            tracing::warn!(page = %id, error = %e, "failed to flush large live page update");
+                        }
+                        if let Ok(reload_payload) = serde_json::to_string(&RoomSyncMsg {
+                            node: node_id(),
+                            page: id,
+                            kind: "reload".to_string(),
+                            data: None,
+                        }) {
+                            publish_room_notify(st.db.clone(), reload_payload);
+                        }
+                    }
                 }
             },
             event=rx.recv()=> {
@@ -990,5 +1166,33 @@ async fn live_socket(mut socket: axum::extract::ws::WebSocket, st: AppState, use
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn room_sync_roundtrip_and_size_limit() {
+        let page = Uuid::new_v4();
+        let small = encode_room_sync(page, "sync", b"hello-yjs").expect("small frame fits");
+        let decoded: RoomSyncMsg = serde_json::from_str(&small).unwrap();
+        assert_eq!(decoded.node, node_id());
+        assert_eq!(decoded.page, page);
+        assert_eq!(decoded.kind, "sync");
+        assert!(decoded.data.is_some());
+
+        let oversized = vec![b'x'; ROOM_NOTIFY_MAX_BYTES];
+        assert!(encode_room_sync(page, "sync", &oversized).is_none());
+    }
+
+    #[test]
+    fn merge_yjs_state_combines_updates() {
+        let s1 = crate::live_doc::initialize("<p>Alpha</p>", "Doc").unwrap();
+        let s2 = crate::live_doc::initialize("<p>Beta</p>", "Doc").unwrap();
+        let merged = merge_yjs_state(&s1, &s2).expect("valid yjs states merge");
+        assert!(!merged.is_empty());
+        assert!(crate::live_doc::formats(&merged).is_ok());
     }
 }

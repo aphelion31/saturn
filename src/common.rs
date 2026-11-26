@@ -449,6 +449,15 @@ pub fn tz_day_start(day: chrono::NaiveDate, tz_name: Option<&str>) -> chrono::Da
     }
 }
 
+/// Convert an RFC3339 timestamp string into the project's IANA timezone (mirrors Plane's `user_timezone_converter`).
+pub fn format_in_tz(ts: &str, tz_name: Option<&str>) -> String {
+    let tz = parse_tz(tz_name);
+    match chrono::DateTime::parse_from_rfc3339(ts) {
+        Ok(dt) => dt.with_timezone(&tz).to_rfc3339(),
+        Err(_) => ts.to_string(),
+    }
+}
+
 /// Regex matching Plane's `NUMERIC_ESTIMATE_PATTERN` (`^ *([0-9]+\.?[0-9]*|\.[0-9]+) *$`).
 pub(crate) const NON_NUMERIC_ESTIMATE_ERROR: &str = "Value must be a number for a points estimate";
 
@@ -508,6 +517,22 @@ mod tests {
         assert!(
             out.contains(r#"<mention-component entity_identifier="u1" entity_name="user_mention">"#),
             "{out}"
+        );
+    }
+
+    #[test]
+    fn format_in_tz_converts_to_project_timezone() {
+        assert_eq!(
+            super::format_in_tz("2026-01-15T00:00:01+00:00", Some("Asia/Kolkata")),
+            "2026-01-15T05:30:01+05:30"
+        );
+        assert_eq!(
+            super::format_in_tz("2026-01-15T00:00:01Z", Some("America/New_York")),
+            "2026-01-14T19:00:01-05:00"
+        );
+        assert_eq!(
+            super::format_in_tz("2026-01-15T00:00:01Z", Some("Invalid/Zone")),
+            "2026-01-15T00:00:01+00:00"
         );
     }
 }
