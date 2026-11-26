@@ -516,6 +516,8 @@ async fn issue_dates(
         .and_then(Value::as_array)
         .ok_or_else(|| ApiError::bad("Invalid updates"))?;
     let mut tx = st.db.begin().await?;
+    let mut changed_ids: Vec<Uuid> = Vec::new();
+    let mut notify_batches = Vec::new();
     for update in updates {
         let id = optional_uuid(update, "id")?.ok_or_else(|| ApiError::bad("Invalid issue id"))?;
         let start = optional_date(update, "start_date")?;
@@ -532,10 +534,56 @@ async fn issue_dates(
                 ));
             }
             sqlx::query("UPDATE issues SET start_date=COALESCE($4,start_date),target_date=COALESCE($5,target_date),updated_at=now(),updated_by_id=$6 WHERE id=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL").bind(id).bind(project).bind(p.workspace_id()).bind(start).bind(target).bind(user.id).execute(&mut *tx).await?;
+            let mut changed = false;
+            if let Some(new_start) = start
+                && Some(new_start) != old_start
+            {
+                changed = true;
+                let old_s = old_start.map(|d| d.to_string());
+                let new_s = new_start.to_string();
+                let comment = format!("updated the start date to {new_s}");
+                let mut event =
+                    crate::activity::ActivityEvent::new(id, project, p.workspace_id(), user.id, "updated", &comment);
+                event.field = Some("start_date");
+                event.old_value = old_s.as_deref();
+                event.new_value = Some(&new_s);
+                crate::activity::record(&mut *tx, event).await?;
+            }
+            if let Some(new_target) = target
+                && Some(new_target) != old_target
+            {
+                changed = true;
+                let old_t = old_target.map(|d| d.to_string());
+                let new_t = new_target.to_string();
+                let comment = format!("updated the due date to {new_t}");
+                let mut event =
+                    crate::activity::ActivityEvent::new(id, project, p.workspace_id(), user.id, "updated", &comment);
+                event.field = Some("target_date");
+                event.old_value = old_t.as_deref();
+                event.new_value = Some(&new_t);
+                crate::activity::record(&mut *tx, event).await?;
+            }
+            if changed {
+                let activities = crate::notify::snapshots(&mut tx, id, project, p.workspace_id()).await?;
+                notify_batches.push((id, activities));
+                changed_ids.push(id);
+            }
         }
     }
-    // ponytail: asynchronous activity fan-out is omitted until a shared activity helper is available.
     tx.commit().await?;
+    for (issue_id, activities) in notify_batches {
+        crate::notify::after_activity(&st, issue_id, project, p.workspace_id(), user.id, activities);
+    }
+    for issue_id in changed_ids {
+        crate::webhook_out::emit(
+            &st,
+            p.workspace_id(),
+            "issue",
+            "updated",
+            serde_json::json!({"id": issue_id}),
+            user.id,
+        );
+    }
     Ok(Json(serde_json::json!({"message":"Issues updated successfully"})))
 }
 

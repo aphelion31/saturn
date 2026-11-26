@@ -565,7 +565,7 @@ async fn label(
         .bind(label_id).bind(project_id).bind(p.workspace_id()), &st.db).await
 }
 
-pub(crate) fn paginate(rows: Vec<Value>, q: &HashMap<String, String>) -> ApiResult {
+pub(crate) fn parse_cursor(q: &HashMap<String, String>) -> ApiResult<(usize, usize, usize)> {
     let limit = match q.get("per_page") {
         Some(v) => v
             .parse::<usize>()
@@ -596,11 +596,20 @@ pub(crate) fn paginate(rows: Vec<Value>, q: &HashMap<String, String>) -> ApiResu
     let start = page
         .checked_mul(limit)
         .ok_or_else(|| ApiError::bad("Invalid cursor parameter."))?;
-    let total = rows.len();
-    let results: Vec<_> = rows.into_iter().skip(start).take(limit).collect();
+    Ok((page, limit, start))
+}
+
+pub(crate) fn paginate_slice(results: Vec<Value>, total: usize, page: usize, limit: usize, start: usize) -> ApiResult {
     Ok(axum::Json(
         json!({"grouped_by": null, "sub_grouped_by": null, "total_count": total, "next_cursor": format!("{limit}:{}:0",page.saturating_add(1)), "prev_cursor": format!("{limit}:{}:1",page as i128 - 1), "next_page_results": start.saturating_add(limit) < total, "prev_page_results": page > 0, "count": results.len(), "total_pages": total.div_ceil(limit), "total_results": total, "extra_stats": null, "results": results}),
     ))
+}
+
+pub(crate) fn paginate(rows: Vec<Value>, q: &HashMap<String, String>) -> ApiResult {
+    let (page, limit, start) = parse_cursor(q)?;
+    let total = rows.len();
+    let results: Vec<_> = rows.into_iter().skip(start).take(limit).collect();
+    paginate_slice(results, total, page, limit, start)
 }
 
 async fn states(

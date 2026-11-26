@@ -646,12 +646,33 @@ async fn comment_create(
         Some(v) if v == "INTERNAL" || v == "EXTERNAL" => v,
         Some(_) => return Err(ApiError::bad_body(json!({"access": ["Invalid access"]}))),
     };
-    // ponytail: Plane also writes a `descriptions` row and `comment_json`; skipped, UI reads comment_html.
+    let comment_json = match b.get("comment_json") {
+        None | Some(Value::Null) => crate::live_doc::html_to_all_formats(&html, "document")
+            .map(|(j, _)| j)
+            .unwrap_or_else(|_| json!({})),
+        Some(v) if v.is_object() => v.clone(),
+        Some(_) => return Err(ApiError::bad_body(json!({"comment_json": ["Invalid JSON."]}))),
+    };
+    let stripped = strip_tags(&html);
     let mut tx = st.db.begin().await?;
+    let desc_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO descriptions (workspace_id, project_id, created_by_id, updated_by_id,
+            description_html, description_stripped, description_json)
+         VALUES ($1,$2,$3,$3,$4,$5,$6)
+         RETURNING id",
+    )
+    .bind(p.workspace_id())
+    .bind(project_id)
+    .bind(user.id)
+    .bind(&html)
+    .bind(&stripped)
+    .bind(&comment_json)
+    .fetch_one(&mut *tx)
+    .await?;
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO issue_comments (workspace_id, project_id, issue_id, actor_id, created_by_id, updated_by_id,
-            comment_html, comment_stripped, comment_json, access, attachments)
-         VALUES ($1,$2,$3,$4,$4,$4,$5,$6,'{}'::jsonb,$7,ARRAY[]::varchar[])
+            comment_html, comment_stripped, comment_json, access, attachments, description_id)
+         VALUES ($1,$2,$3,$4,$4,$4,$5,$6,$7,$8,ARRAY[]::varchar[],$9)
          RETURNING id",
     )
     .bind(p.workspace_id())
@@ -659,8 +680,10 @@ async fn comment_create(
     .bind(issue_id)
     .bind(user.id)
     .bind(&html)
-    .bind(strip_tags(&html))
+    .bind(&stripped)
+    .bind(&comment_json)
     .bind(access)
+    .bind(desc_id)
     .fetch_one(&mut *tx)
     .await?;
     let mut event = crate::activity::ActivityEvent::new(
@@ -711,12 +734,39 @@ async fn comment_update(
         Some(v) if v == "INTERNAL" || v == "EXTERNAL" => Some(v),
         Some(_) => return Err(ApiError::bad_body(json!({"access": ["Invalid access"]}))),
     };
+    let explicit_json = match b.get("comment_json") {
+        None | Some(Value::Null) => None,
+        Some(v) if v.is_object() => Some(v.clone()),
+        Some(_) => return Err(ApiError::bad_body(json!({"comment_json": ["Invalid JSON."]}))),
+    };
+    let comment_json = explicit_json.or_else(|| {
+        html.as_deref().map(|h| {
+            crate::live_doc::html_to_all_formats(h, "document")
+                .map(|(j, _)| j)
+                .unwrap_or_else(|_| json!({}))
+        })
+    });
     let mut tx = st.db.begin().await?;
-    let old: Option<String> = sqlx::query_scalar("SELECT comment_html FROM issue_comments WHERE id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND created_by_id=$5 AND deleted_at IS NULL FOR UPDATE")
-        .bind(pk).bind(issue_id).bind(project_id).bind(p.workspace_id()).bind(user.id).fetch_optional(&mut *tx).await?;
+    let old: Option<(String, Option<Uuid>)> = sqlx::query_as(
+        "SELECT comment_html, description_id FROM issue_comments
+         WHERE id=$1 AND issue_id=$2 AND project_id=$3 AND workspace_id=$4 AND created_by_id=$5 AND deleted_at IS NULL
+         FOR UPDATE",
+    )
+    .bind(pk)
+    .bind(issue_id)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .bind(user.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (old_html, old_desc_id) = match old {
+        Some((h, d)) => (Some(h), d),
+        None => (None, None),
+    };
     let r = sqlx::query(
         "UPDATE issue_comments SET comment_html = COALESCE($5, comment_html),
             comment_stripped = CASE WHEN $5::text IS NULL THEN comment_stripped ELSE $6 END,
+            comment_json = COALESCE($9, comment_json),
             access = COALESCE($7, access),
             edited_at = CASE WHEN $5::text IS NOT NULL AND comment_html IS DISTINCT FROM $5 THEN now() ELSE edited_at END,
             updated_at = now(), updated_by_id = $4
@@ -730,12 +780,58 @@ async fn comment_update(
     .bind(html.as_deref().map(strip_tags))
     .bind(access)
     .bind(p.workspace_id())
+    .bind(&comment_json)
     .execute(&mut *tx)
     .await?;
     if r.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
-    if html.is_some() && old != html {
+    if html.is_some() || comment_json.is_some() {
+        if let Some(desc_id) = old_desc_id {
+            sqlx::query(
+                "UPDATE descriptions d
+                 SET description_html = c.comment_html,
+                     description_stripped = c.comment_stripped,
+                     description_json = c.comment_json,
+                     updated_at = now(),
+                     updated_by_id = $5
+                 FROM issue_comments c
+                 WHERE c.id = $1 AND c.issue_id = $3 AND c.project_id = $4 AND c.workspace_id = $6
+                   AND d.id = $2 AND d.workspace_id = $6 AND d.deleted_at IS NULL",
+            )
+            .bind(pk)
+            .bind(desc_id)
+            .bind(issue_id)
+            .bind(project_id)
+            .bind(user.id)
+            .bind(p.workspace_id())
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            let new_desc_id: Uuid = sqlx::query_scalar(
+                "INSERT INTO descriptions (workspace_id, project_id, created_by_id, updated_by_id,
+                    description_html, description_stripped, description_json)
+                 SELECT c.workspace_id, c.project_id, $4, $4, c.comment_html, c.comment_stripped, c.comment_json
+                 FROM issue_comments c
+                 WHERE c.id = $1 AND c.issue_id = $2 AND c.project_id = $3 AND c.workspace_id = $5
+                 RETURNING id",
+            )
+            .bind(pk)
+            .bind(issue_id)
+            .bind(project_id)
+            .bind(user.id)
+            .bind(p.workspace_id())
+            .fetch_one(&mut *tx)
+            .await?;
+            sqlx::query("UPDATE issue_comments SET description_id = $2 WHERE id = $1 AND workspace_id = $3")
+                .bind(pk)
+                .bind(new_desc_id)
+                .bind(p.workspace_id())
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    if html.is_some() && old_html != html {
         let mut event = crate::activity::ActivityEvent::new(
             issue_id,
             project_id,
@@ -745,7 +841,7 @@ async fn comment_update(
             "updated a comment",
         );
         event.field = Some("comment");
-        event.old_value = old.as_deref();
+        event.old_value = old_html.as_deref();
         event.new_value = html.as_deref();
         event.old_identifier = Some(pk);
         event.new_identifier = Some(pk);

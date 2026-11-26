@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::api_v1::paginate;
+use crate::api_v1::{paginate_slice, parse_cursor};
 use crate::common::*;
 
 const INVITE_JSON: &str = "jsonb_build_object('id', i.id, 'email', i.email, 'role', i.role, 'accepted', i.accepted,
@@ -26,7 +26,8 @@ const INVITE_JSON: &str = "jsonb_build_object('id', i.id, 'email', i.email, 'rol
 const STICKY_JSON: &str = "jsonb_build_object(
     'id', s.id, 'created_at', s.created_at, 'updated_at', s.updated_at, 'deleted_at', s.deleted_at,
     'name', s.name, 'description', s.description, 'description_html', s.description_html,
-    'description_stripped', s.description_stripped, 'description_binary', s.description_binary,
+    'description_stripped', s.description_stripped,
+    'description_binary', CASE WHEN s.description_binary IS NULL THEN NULL ELSE replace(encode(s.description_binary, 'base64'), E'\\n', '') END,
     'logo_props', s.logo_props, 'color', s.color, 'background_color', s.background_color,
     'sort_order', s.sort_order, 'created_by', s.created_by_id, 'owner', s.owner_id,
     'updated_by', s.updated_by_id, 'workspace', s.workspace_id)";
@@ -136,6 +137,36 @@ fn opt_html(b: &Value) -> ApiResult<Option<(String, Option<String>)>> {
             Ok(Some((clean, stripped)))
         }
         Some(_) => Err(field_err("description_html", "Not a valid string.")),
+    }
+}
+
+/// Decode and validate base64 `description_binary` matching Plane's `validate_binary_data`.
+fn opt_binary(b: &Value, key: &str) -> ApiResult<Option<Option<Vec<u8>>>> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    const MAX_BINARY_SIZE: usize = 10 * 1024 * 1024;
+    const SUSPICIOUS: &[&str] = &["<html", "<!doctype", "<script", "javascript:", "data:", "<iframe"];
+    match b.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(raw)) if raw.is_empty() => Ok(Some(None)),
+        Some(Value::String(raw)) => {
+            let bytes = STANDARD
+                .decode(raw.trim())
+                .map_err(|_| field_err(key, "Invalid binary data"))?;
+            if bytes.len() > MAX_BINARY_SIZE || bytes.len() < 4 {
+                return Err(field_err(key, "Invalid binary data"));
+            }
+            let head: String = String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(200)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            if SUSPICIOUS.iter().any(|pat| head.contains(pat)) {
+                return Err(field_err(key, "Invalid binary data"));
+            }
+            Ok(Some(Some(bytes)))
+        }
+        Some(_) => Err(field_err(key, "Invalid binary data")),
     }
 }
 
@@ -323,20 +354,37 @@ async fn stickies_list(
     let pattern = q.get("query").filter(|v| !v.is_empty()).map(|v| like_pattern(v));
     // Plane's StickyViewSet paginates with default_per_page=20.
     q.entry("per_page".to_string()).or_insert_with(|| "20".to_string());
-    // ponytail: loads all of the caller's stickies, then paginates in memory (same as the archived lists).
-    // Add SQL LIMIT/OFFSET when a user has thousands of stickies.
-    let rows: Vec<Value> = sqlx::query_scalar(&format!(
-        "SELECT {STICKY_JSON} FROM stickies s
+    let (page, limit, start) = parse_cursor(&q)?;
+    let total: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM stickies s
          WHERE s.workspace_id = $1 AND s.owner_id = $2 AND s.deleted_at IS NULL
-           AND ($3::text IS NULL OR s.description_stripped ILIKE $3)
-         ORDER BY s.created_at DESC"
-    ))
+           AND ($3::text IS NULL OR s.description_stripped ILIKE $3)",
+    )
     .bind(ws.workspace_id)
     .bind(user.id)
-    .bind(pattern)
-    .fetch_all(&st.db)
+    .bind(&pattern)
+    .fetch_one(&st.db)
     .await?;
-    paginate(rows, &q)
+    let total_usize = total as usize;
+    let rows: Vec<Value> = if start >= total_usize {
+        Vec::new()
+    } else {
+        sqlx::query_scalar(&format!(
+            "SELECT {STICKY_JSON} FROM stickies s
+             WHERE s.workspace_id = $1 AND s.owner_id = $2 AND s.deleted_at IS NULL
+               AND ($3::text IS NULL OR s.description_stripped ILIKE $3)
+             ORDER BY s.created_at DESC, s.id
+             LIMIT $4 OFFSET $5"
+        ))
+        .bind(ws.workspace_id)
+        .bind(user.id)
+        .bind(&pattern)
+        .bind(limit as i64)
+        .bind(start as i64)
+        .fetch_all(&st.db)
+        .await?
+    };
+    paginate_slice(rows, total_usize, page, limit, start)
 }
 
 async fn sticky_get(
@@ -383,15 +431,15 @@ async fn sticky_create(
         Some(m) => m + 10000.0,
         None => opt_f64(&b, "sort_order")?.unwrap_or(65535.0),
     };
-    // ponytail: description_binary input is not accepted (the web UI never sends it).
+    let binary = opt_binary(&b, "description_binary")?.flatten();
     json_row(
         sqlx::query_scalar(&format!(
             "WITH i AS (
                 INSERT INTO stickies (
                     id, workspace_id, owner_id, created_by_id, updated_by_id,
-                    name, description, description_html, description_stripped,
+                    name, description, description_html, description_stripped, description_binary,
                     logo_props, color, background_color, sort_order, created_at, updated_at)
-                VALUES (gen_random_uuid(), $1, $2, $2, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), now())
+                VALUES (gen_random_uuid(), $1, $2, $2, $2, $3, $4, $5, $6, $11, $7, $8, $9, $10, now(), now())
                 RETURNING *)
              SELECT {STICKY_JSON} FROM i s"
         ))
@@ -404,7 +452,8 @@ async fn sticky_create(
         .bind(logo)
         .bind(color)
         .bind(background)
-        .bind(sort),
+        .bind(sort)
+        .bind(binary),
         &st.db,
     )
     .await
@@ -427,6 +476,7 @@ async fn sticky_patch(
     let logo = opt_json(&b, "logo_props")?;
     let sort = opt_f64(&b, "sort_order")?;
     let html = opt_html(&b)?;
+    let binary = opt_binary(&b, "description_binary")?;
 
     let (has_name, name) = (name.is_some(), name.flatten());
     let (has_color, color) = (color.is_some(), color.flatten());
@@ -438,6 +488,7 @@ async fn sticky_patch(
         Some((h, s)) => (true, h, s),
         None => (false, String::new(), None),
     };
+    let (has_binary, binary) = (binary.is_some(), binary.flatten());
     json_row(
         sqlx::query_scalar(&format!(
             "WITH u AS (
@@ -446,6 +497,7 @@ async fn sticky_patch(
                     description = CASE WHEN $6 THEN $7::jsonb ELSE description END,
                     description_html = CASE WHEN $8 THEN $9 ELSE description_html END,
                     description_stripped = CASE WHEN $8 THEN $10 ELSE description_stripped END,
+                    description_binary = CASE WHEN $20 THEN $21 ELSE description_binary END,
                     logo_props = CASE WHEN $11 THEN $12::jsonb ELSE logo_props END,
                     color = CASE WHEN $13 THEN $14 ELSE color END,
                     background_color = CASE WHEN $15 THEN $16 ELSE background_color END,
@@ -473,7 +525,9 @@ async fn sticky_patch(
         .bind(background)
         .bind(has_sort)
         .bind(sort)
-        .bind(user.id),
+        .bind(user.id)
+        .bind(has_binary)
+        .bind(binary),
         &st.db,
     )
     .await
@@ -513,5 +567,24 @@ mod tests {
         assert!(check_role(&json!(15)).is_ok());
         assert!(check_role(&json!(7)).is_err());
         assert_eq!(like_pattern("50%_x"), "%50\\%\\_x%");
+        assert!(matches!(opt_binary(&json!({}), "description_binary"), Ok(None)));
+        assert!(matches!(
+            opt_binary(&json!({"description_binary": null}), "description_binary"),
+            Ok(Some(None))
+        ));
+        assert!(matches!(
+            opt_binary(&json!({"description_binary": "AQIDBA=="}), "description_binary"),
+            Ok(Some(Some(ref b))) if b == &[1, 2, 3, 4]
+        ));
+        assert!(opt_binary(&json!({"description_binary": "!!!"}), "description_binary").is_err());
+        assert!(opt_binary(&json!({"description_binary": "AQI="}), "description_binary").is_err());
+        // "<script>x</script>" base64
+        assert!(
+            opt_binary(
+                &json!({"description_binary": "PHNjcmlwdD54PC9zY3JpcHQ+"}),
+                "description_binary"
+            )
+            .is_err()
+        );
     }
 }

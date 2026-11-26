@@ -694,7 +694,7 @@ const STICKY_JSON: &str = "jsonb_build_object(
     'description', s.description,
     'description_html', s.description_html,
     'description_stripped', s.description_stripped,
-    'description_binary', s.description_binary,
+    'description_binary', CASE WHEN s.description_binary IS NULL THEN NULL ELSE replace(encode(s.description_binary, 'base64'), E'\n', '') END,
     'logo_props', s.logo_props,
     'color', s.color,
     'background_color', s.background_color,
