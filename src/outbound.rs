@@ -97,7 +97,7 @@ pub async fn smtp(st: &AppState) -> Option<Smtp> {
         port,
         user: config(st, "EMAIL_HOST_USER", "").await,
         password: config(st, "EMAIL_HOST_PASSWORD", "").await,
-        from: config(st, "EMAIL_FROM", "Team Plane <team@mailer.plane.so>").await,
+        from: config(st, "EMAIL_FROM", "Team Saturn <team@saturn.dev>").await,
         tls: config(st, "EMAIL_USE_TLS", "1").await == "1",
         ssl: config(st, "EMAIL_USE_SSL", "0").await == "1",
     })
@@ -166,13 +166,13 @@ pub async fn activation_mail(st: &AppState, user_id: uuid::Uuid) {
     {
         Ok(Some((email, name))) => {
             let text = format!(
-                "Your account has been activated on Plane. {}/profile",
+                "Your account has been activated on Saturn. {}/profile",
                 st.cfg.web_url.trim_end_matches('/')
             );
             send_mail_bg(
                 st,
                 email,
-                format!("{name} has been activated on Plane"),
+                format!("{name} has been activated on Saturn"),
                 ammonia::clean(&text),
                 text,
             );
@@ -207,7 +207,7 @@ pub fn project_addition_mail(
         .replace("{{email}}", &esc(email))
         .replace("{{inviter_first_name}}", &esc(inviter))
         .replace("{{project_url}}", &esc(url));
-    let text = format!("{inviter} invited you to {project} in {workspace} on Plane. Open the project: {url}",);
+    let text = format!("{inviter} invited you to {project} in {workspace} on Saturn. Open the project: {url}",);
     (html, text)
 }
 

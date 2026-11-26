@@ -198,8 +198,8 @@ async fn email_check(State(st): State<AppState>, user: CurrentUser, Json(b): Jso
     let Some(smtp) = crate::outbound::smtp(&st).await else {
         return Err(ApiError::bad("Could not connect with the SMTP server."));
     };
-    let text = "This is a sample email notification sent from Plane application.";
-    match crate::outbound::send_mail(&smtp, to.trim(), "Email Notification from Plane", text, text).await {
+    let text = "This is a sample email notification sent from Saturn application.";
+    match crate::outbound::send_mail(&smtp, to.trim(), "Email Notification from Saturn", text, text).await {
         Ok(()) => Ok(Json(json!({"message": "Email successfully sent."}))),
         Err(e) => {
             let msg = if e.contains("535") || e.to_lowercase().contains("auth") {

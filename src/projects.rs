@@ -408,7 +408,7 @@ async fn add_members(
         crate::outbound::send_mail_bg(
             &st,
             email,
-            "You have been invited to a Plane project".into(),
+            "You have been invited to a Saturn project".into(),
             html,
             text,
         );
@@ -1475,11 +1475,11 @@ async fn invitations_create(
                     .append_pair("email", &email)
                     .append_pair("slug", &slug)
                     .append_pair("project_id", &project_id.to_string());
-                let text = format!("{inviter} invited you to join {project_name} on Plane. Visit {link}");
+                let text = format!("{inviter} invited you to join {project_name} on Saturn. Visit {link}");
                 crate::outbound::send_mail_bg(
                     &st,
                     email,
-                    format!("{inviter} invited you to join {project_name} on Plane"),
+                    format!("{inviter} invited you to join {project_name} on Saturn"),
                     ammonia::clean(&text),
                     text,
                 );

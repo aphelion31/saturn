@@ -252,7 +252,7 @@ async fn run_archive_and_close(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -
                     Some("archived_at"),
                     None,
                     Some("archive"),
-                    "Plane has archived the issue",
+                    "Saturn has archived the issue",
                     None,
                 )
                 .await?;
@@ -356,7 +356,7 @@ async fn run_archive_and_close(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -
                     Some("state"),
                     None,
                     Some(&target_state_name),
-                    "Plane updated the state to ",
+                    "Saturn updated the state to ",
                     Some(target_state_id),
                 )
                 .await?;

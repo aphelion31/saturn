@@ -1072,7 +1072,7 @@ async fn run_analytics_export_bg(
         }
     }
 
-    let subject = format!("Plane Analytics Export - {slug}");
+    let subject = format!("Saturn Analytics Export - {slug}");
     let text = format!("Attached is your analytics export for workspace {slug}.\n\nCSV Data:\n{csv}");
     let html = format!(
         "<p>Your analytics export for workspace <b>{}</b> is ready.</p><pre>{}</pre>",
