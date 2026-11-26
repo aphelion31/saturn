@@ -1,6 +1,6 @@
 [package]
 name = "saturn"
-version = "0.3.1"
+version = "1.0.0"
 edition = "2024"
 description = "Saturn: lightweight Rust rewrite of the Plane backend, serving the Plane React Router apps"
 license = "AGPL-3.0-only"
