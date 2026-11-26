@@ -66,9 +66,10 @@ Numbers depend on the machine; rerun `tools/bench.sh <plane-checkout>` to measur
 
 ## Layout
 
-```
+```text
 src/          Rust backend (axum + sqlx), one module per Plane API area
 web/          Saturn Bun workspace (bun.lock): apps/web, apps/admin (god-mode), apps/space (public boards), packages/*
+docker/       Container builds and reverse proxy config (`axum/Dockerfile`, `nginx/{Dockerfile,nginx.conf}`)
 migrations/   PostgreSQL schema dumped from Plane's Django migrations, plus database defaults
 tools/        schema regeneration, API smoke test, benchmark
 scripts/      git hook checks, branch helper, Bun frontend build
@@ -89,6 +90,14 @@ DATABASE_URL=postgres://localhost/saturn cargo run --release -- seed admin@examp
 
 # 4. Serve
 DATABASE_URL=postgres://localhost/saturn cargo run --release    # http://localhost:3000
+```
+
+Or run the containerized stack (`postgres` + `axum` + `nginx`):
+
+```bash
+cp .env.example .env
+docker compose up -d --build
+docker compose exec axum saturn seed admin@example.com 'Change-me-2026' Acme
 ```
 
 | Path         | App                                  |
