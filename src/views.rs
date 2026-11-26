@@ -338,7 +338,16 @@ async fn project_retrieve(
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER, GUEST])?;
-    crate::recent_visits::record(&st.db, crate::recent_visits::Visit { workspace_id: p.workspace_id(), user_id: user.id, entity_name: "view", entity_identifier: pk, project_id: Some(project_id) });
+    crate::recent_visits::record(
+        &st.db,
+        crate::recent_visits::Visit {
+            workspace_id: p.workspace_id(),
+            user_id: user.id,
+            entity_name: "view",
+            entity_identifier: pk,
+            project_id: Some(project_id),
+        },
+    );
     let row: Option<(Uuid, bool)> = sqlx::query_as(
         "SELECT owned_by_id, access = 1 FROM issue_views
          WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL AND archived_at IS NULL",
@@ -429,7 +438,16 @@ async fn ws_retrieve(
 ) -> ApiResult {
     let ws = require_workspace(&st.db, &user, &slug).await?;
     ws.require(&[ADMIN, MEMBER, GUEST])?;
-    crate::recent_visits::record(&st.db, crate::recent_visits::Visit { workspace_id: ws.workspace_id, user_id: user.id, entity_name: "view", entity_identifier: pk, project_id: None });
+    crate::recent_visits::record(
+        &st.db,
+        crate::recent_visits::Visit {
+            workspace_id: ws.workspace_id,
+            user_id: user.id,
+            entity_name: "view",
+            entity_identifier: pk,
+            project_id: None,
+        },
+    );
     let row: Option<(Uuid, bool)> = sqlx::query_as(
         "SELECT owned_by_id, access = 1 FROM issue_views
          WHERE id = $1 AND workspace_id = $2 AND project_id IS NULL AND deleted_at IS NULL AND archived_at IS NULL",
@@ -548,29 +566,25 @@ async fn ws_issues(
     let ws = require_workspace(&st.db, &user, &slug).await?;
     ws.require(&[ADMIN, MEMBER, GUEST])?;
     let mut q = q;
-    if let Some(view_id_str) = q.get("view_id").or_else(|| q.get("view")).cloned() {
-        if let Ok(view_id) = Uuid::parse_str(&view_id_str) {
-            if let Some(filters) = sqlx::query_scalar::<_, Value>(
-                "SELECT filters FROM issue_views WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
-            )
-            .bind(view_id)
-            .bind(ws.workspace_id)
-            .fetch_optional(&st.db)
-            .await?
-            {
-                if let Some(obj) = filters.as_object() {
-                    for (k, v) in obj {
-                        if !q.contains_key(k) {
-                            if let Some(s) = v.as_str() {
-                                q.insert(k.clone(), s.to_string());
-                            } else if let Some(arr) = v.as_array() {
-                                let items: Vec<String> =
-                                    arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
-                                if !items.is_empty() {
-                                    q.insert(k.clone(), items.join(","));
-                                }
-                            }
-                        }
+    if let Some(view_id_str) = q.get("view_id").or_else(|| q.get("view")).cloned()
+        && let Ok(view_id) = Uuid::parse_str(&view_id_str)
+        && let Some(filters) = sqlx::query_scalar::<_, Value>(
+            "SELECT filters FROM issue_views WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
+        )
+        .bind(view_id)
+        .bind(ws.workspace_id)
+        .fetch_optional(&st.db)
+        .await?
+        && let Some(obj) = filters.as_object()
+    {
+        for (k, v) in obj {
+            if !q.contains_key(k) {
+                if let Some(s) = v.as_str() {
+                    q.insert(k.clone(), s.to_string());
+                } else if let Some(arr) = v.as_array() {
+                    let items: Vec<String> = arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+                    if !items.is_empty() {
+                        q.insert(k.clone(), items.join(","));
                     }
                 }
             }
@@ -763,7 +777,6 @@ async fn ensure_default_intake(db: &PgPool, workspace_id: Uuid, project_id: Uuid
 }
 
 /// Plane `IntakeViewSet.list`: a single object, the project's first intake.
-// ponytail: Plane creates the default intake with the project. Here it is created on first read.
 async fn intake_list(
     State(st): State<AppState>,
     user: CurrentUser,
@@ -1043,7 +1056,57 @@ async fn intake_issues_create(
     .bind(user.id)
     .execute(&mut *tx)
     .await?;
-    // ponytail: labels, assignees, and activity rows from the create body are not written yet.
+    let assignee_ids: Vec<Uuid> = issue
+        .get("assignee_ids")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !assignee_ids.is_empty() {
+        sqlx::query(
+            "INSERT INTO issue_assignees (id, issue_id, assignee_id, project_id, workspace_id, created_by_id, updated_by_id, created_at, updated_at)
+             SELECT gen_random_uuid(), $1, pm.member_id, $2, $3, $4, $4, now(), now()
+             FROM project_members pm
+             WHERE pm.project_id = $2 AND pm.workspace_id = $3 AND pm.is_active AND pm.deleted_at IS NULL
+               AND pm.role >= 15 AND pm.member_id = ANY($5)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(issue_id)
+        .bind(project_id)
+        .bind(p.workspace_id())
+        .bind(user.id)
+        .bind(&assignee_ids)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let label_ids: Vec<Uuid> = issue
+        .get("label_ids")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !label_ids.is_empty() {
+        sqlx::query(
+            "INSERT INTO issue_labels (id, issue_id, label_id, project_id, workspace_id, created_by_id, updated_by_id, created_at, updated_at)
+             SELECT gen_random_uuid(), $1, l.id, $2, $3, $4, $4, now(), now()
+             FROM labels l
+             WHERE l.project_id = $2 AND l.workspace_id = $3 AND l.deleted_at IS NULL AND l.id = ANY($5)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(issue_id)
+        .bind(project_id)
+        .bind(p.workspace_id())
+        .bind(user.id)
+        .bind(&label_ids)
+        .execute(&mut *tx)
+        .await?;
+    }
     let ii_id: Uuid = sqlx::query_scalar(
         "INSERT INTO intake_issues (id, status, source, intake_id, issue_id, project_id, workspace_id, created_by_id,
              updated_by_id, created_at, updated_at)
@@ -1057,7 +1120,18 @@ async fn intake_issues_create(
     .bind(user.id)
     .fetch_one(&mut *tx)
     .await?;
-    crate::activity::record(&mut *tx, crate::activity::ActivityEvent::new(issue_id, project_id, p.workspace_id(), user.id, "created", "created the issue")).await?;
+    crate::activity::record(
+        &mut *tx,
+        crate::activity::ActivityEvent::new(
+            issue_id,
+            project_id,
+            p.workspace_id(),
+            user.id,
+            "created",
+            "created the issue",
+        ),
+    )
+    .await?;
     let activities = crate::notify::snapshots(&mut tx, issue_id, project_id, p.workspace_id()).await?;
     tx.commit().await?;
     crate::notify::after_activity(&st, issue_id, project_id, p.workspace_id(), user.id, activities);
@@ -1174,12 +1248,45 @@ async fn intake_issue_patch(
     }
     let snooze_set = can_triage && b.get("snoozed_till").is_some();
     let snoozed_till = if snooze_set {
-        s(&b, "snoozed_till").map(String::from)
+        match s(&b, "snoozed_till").map(str::trim) {
+            Some(raw) if raw.len() == 10 => {
+                if let Ok(day) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+                    let tz: Option<String> = sqlx::query_scalar("SELECT timezone FROM projects WHERE id = $1")
+                        .bind(project_id)
+                        .fetch_optional(&st.db)
+                        .await?;
+                    Some(tz_day_start(day, tz.as_deref()).to_rfc3339())
+                } else {
+                    Some(raw.to_string())
+                }
+            }
+            Some(raw) => Some(raw.to_string()),
+            None => None,
+        }
     } else {
         None
     };
-    // ponytail: Plane snaps snoozed_till to the start of the user's day (snooze_day_start). Stored as sent.
-    let duplicate_to = if can_triage { uuid_of(&b, "duplicate_to") } else { None };
+    let duplicate_to = if can_triage && b.get("duplicate_to").is_some_and(|v| !v.is_null()) {
+        let dup_id = uuid_of(&b, "duplicate_to").ok_or_else(|| {
+            ApiError::bad_body(json!({"duplicate_to": ["Work item must belong to the same project"]}))
+        })?;
+        let valid: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM issues WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL)",
+        )
+        .bind(dup_id)
+        .bind(project_id)
+        .bind(p.workspace_id())
+        .fetch_one(&st.db)
+        .await?;
+        if !valid {
+            return Err(ApiError::bad_body(
+                json!({"duplicate_to": ["Work item must belong to the same project"]}),
+            ));
+        }
+        Some(dup_id)
+    } else {
+        None
+    };
 
     let mut tx = st.db.begin().await?;
     if name.is_some() || priority.is_some() || description.is_some() {

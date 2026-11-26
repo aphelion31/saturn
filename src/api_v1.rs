@@ -16,6 +16,11 @@ const USER_JSON: &str = "jsonb_build_object('id', u.id, 'first_name', u.first_na
     CASE WHEN u.avatar_asset_id IS NOT NULL THEN '/api/assets/v2/static/' || u.avatar_asset_id || '/' ELSE NULLIF(u.avatar, '') END,
     'display_name', u.display_name)";
 
+const USER_NO_EMAIL_JSON: &str = "jsonb_build_object('id', u.id, 'first_name', u.first_name, 'last_name', u.last_name,
+    'avatar', u.avatar, 'avatar_url',
+    CASE WHEN u.avatar_asset_id IS NOT NULL THEN '/api/assets/v2/static/' || u.avatar_asset_id || '/' ELSE NULLIF(u.avatar, '') END,
+    'display_name', u.display_name)";
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/v1/users/me/", get(me))
@@ -346,13 +351,13 @@ async fn unarchive_project(
 
 const STATE_JSON: &str = "(to_jsonb(s) - 'workspace_id' - 'project_id' - 'created_by_id' - 'updated_by_id') || jsonb_build_object('workspace',s.workspace_id,'project',s.project_id,'created_by',s.created_by_id,'updated_by',s.updated_by_id)";
 const LABEL_JSON: &str = "(to_jsonb(l) - 'workspace_id' - 'project_id' - 'created_by_id' - 'updated_by_id' - 'parent_id') || jsonb_build_object('workspace',l.workspace_id,'project',l.project_id,'created_by',l.created_by_id,'updated_by',l.updated_by_id,'parent',l.parent_id)";
-const PROJECT_JSON: &str = "(to_jsonb(p) - 'workspace_id' - 'created_by_id' - 'updated_by_id' - 'default_assignee_id' - 'project_lead_id' - 'estimate_id' - 'default_state_id' - 'cover_image_asset_id') || jsonb_build_object('workspace',p.workspace_id,'created_by',p.created_by_id,'updated_by',p.updated_by_id,'default_assignee',p.default_assignee_id,'project_lead',p.project_lead_id,'estimate',p.estimate_id,'default_state',p.default_state_id,'cover_image_asset',p.cover_image_asset_id,'cover_image_url',p.cover_image,'is_member',pm.id IS NOT NULL,'member_role',pm.role,'sort_order',pup.sort_order,'total_members',(SELECT count(*) FROM project_members m WHERE m.workspace_id=p.workspace_id AND m.project_id=p.id AND m.is_active AND m.deleted_at IS NULL),'total_cycles',(SELECT count(*) FROM cycles c WHERE c.workspace_id=p.workspace_id AND c.project_id=p.id AND c.deleted_at IS NULL),'total_modules',(SELECT count(*) FROM modules m WHERE m.workspace_id=p.workspace_id AND m.project_id=p.id AND m.deleted_at IS NULL),'is_deployed',EXISTS(SELECT 1 FROM deploy_boards d WHERE d.workspace_id=p.workspace_id AND d.project_id=p.id AND d.deleted_at IS NULL))";
+const PROJECT_JSON: &str = "(to_jsonb(p) - 'workspace_id' - 'created_by_id' - 'updated_by_id' - 'default_assignee_id' - 'project_lead_id' - 'estimate_id' - 'default_state_id' - 'cover_image_asset_id') || jsonb_build_object('workspace',p.workspace_id,'created_by',p.created_by_id,'updated_by',p.updated_by_id,'default_assignee',p.default_assignee_id,'project_lead',p.project_lead_id,'estimate',p.estimate_id,'default_state',p.default_state_id,'cover_image_asset',p.cover_image_asset_id,'cover_image_url',p.cover_image,'is_member',pm.id IS NOT NULL,'member_role',pm.role,'sort_order',COALESCE(pup.sort_order,pm.sort_order),'total_members',(SELECT count(*) FROM project_members m WHERE m.workspace_id=p.workspace_id AND m.project_id=p.id AND m.is_active AND m.deleted_at IS NULL),'total_cycles',(SELECT count(*) FROM cycles c WHERE c.workspace_id=p.workspace_id AND c.project_id=p.id AND c.deleted_at IS NULL),'total_modules',(SELECT count(*) FROM modules m WHERE m.workspace_id=p.workspace_id AND m.project_id=p.id AND m.deleted_at IS NULL),'is_deployed',EXISTS(SELECT 1 FROM deploy_boards d WHERE d.workspace_id=p.workspace_id AND d.project_id=p.id AND d.deleted_at IS NULL))";
 
 fn check_state(b: &Value) -> ApiResult<()> {
-    if let Some(group) = b.get("group") {
-        if !["backlog", "unstarted", "started", "completed", "cancelled"].contains(&group.as_str().unwrap_or("")) {
-            return Err(ApiError::bad("Invalid state group"));
-        }
+    if let Some(group) = b.get("group")
+        && !["backlog", "unstarted", "started", "completed", "cancelled"].contains(&group.as_str().unwrap_or(""))
+    {
+        return Err(ApiError::bad("Invalid state group"));
     }
     for key in ["name", "color"] {
         if b.get(key)
@@ -520,8 +525,8 @@ async fn projects(
     Query(q): Query<HashMap<String, String>>,
 ) -> ApiResult {
     let ws = require_workspace(&st.db, &user, &slug).await?;
-    let rows: Vec<Value> = sqlx::query_scalar(&format!("SELECT {PROJECT_JSON} FROM projects p LEFT JOIN project_members pm ON pm.project_id=p.id AND pm.workspace_id=p.workspace_id AND pm.member_id=$2 AND pm.is_active AND pm.deleted_at IS NULL LEFT JOIN project_user_properties pup ON pup.project_id=p.id AND pup.workspace_id=p.workspace_id AND pup.user_id=$2 AND pup.deleted_at IS NULL WHERE p.workspace_id=$1 AND p.deleted_at IS NULL AND p.archived_at IS NULL AND (pm.id IS NOT NULL OR p.network=2) ORDER BY p.created_at DESC,p.id"))
-        .bind(ws.workspace_id).bind(user.id).fetch_all(&st.db).await?;
+    let rows: Vec<Value> = sqlx::query_scalar(&format!("SELECT {PROJECT_JSON} FROM projects p LEFT JOIN project_members pm ON pm.project_id=p.id AND pm.workspace_id=p.workspace_id AND pm.member_id=$2 AND pm.is_active AND pm.deleted_at IS NULL LEFT JOIN project_user_properties pup ON pup.project_id=p.id AND pup.workspace_id=p.workspace_id AND pup.user_id=$2 AND pup.deleted_at IS NULL WHERE p.workspace_id=$1 AND p.deleted_at IS NULL AND p.archived_at IS NULL AND (pm.id IS NOT NULL OR (p.network=2 AND $3 > 5)) ORDER BY p.created_at DESC,p.id"))
+        .bind(ws.workspace_id).bind(user.id).bind(ws.role).fetch_all(&st.db).await?;
     paginate(rows, &q)
 }
 
@@ -594,7 +599,7 @@ pub(crate) fn paginate(rows: Vec<Value>, q: &HashMap<String, String>) -> ApiResu
     let total = rows.len();
     let results: Vec<_> = rows.into_iter().skip(start).take(limit).collect();
     Ok(axum::Json(
-        json!({"next_cursor": format!("{limit}:{}:0",page.saturating_add(1)), "prev_cursor": format!("{limit}:{}:1",page as i128 - 1), "next_page_results": start.saturating_add(limit) < total, "prev_page_results": page > 0, "count": results.len(), "total_pages": total.div_ceil(limit), "total_results": total, "extra_stats": null, "results": results}),
+        json!({"grouped_by": null, "sub_grouped_by": null, "total_count": total, "next_cursor": format!("{limit}:{}:0",page.saturating_add(1)), "prev_cursor": format!("{limit}:{}:1",page as i128 - 1), "next_page_results": start.saturating_add(limit) < total, "prev_page_results": page > 0, "count": results.len(), "total_pages": total.div_ceil(limit), "total_results": total, "extra_stats": null, "results": results}),
     ))
 }
 
@@ -793,10 +798,10 @@ async fn v1_create_cycle(
             "Both start date and end date are either required or are to be null",
         ));
     }
-    if let (Some(s), Some(e)) = (&start, &end) {
-        if s > e {
-            return Err(ApiError::bad("Start date cannot exceed end date"));
-        }
+    if let (Some(s), Some(e)) = (&start, &end)
+        && s > e
+    {
+        return Err(ApiError::bad("Start date cannot exceed end date"));
     }
 
     if let (Some(ext_id), Some(ext_src)) = (s(&b, "external_id"), s(&b, "external_source")) {
@@ -862,12 +867,13 @@ async fn v1_update_cycle(
     let p = require_project(&st.db, &user, &slug, pid).await?;
     p.require(&[ADMIN, MEMBER])?;
 
-    let cur: (
+    type CycleUpdateRow = (
         Option<DateTime<Utc>>,
         Option<DateTime<Utc>>,
         Option<String>,
         Option<String>,
-    ) = sqlx::query_as(
+    );
+    let cur: CycleUpdateRow = sqlx::query_as(
         "SELECT c.archived_at, c.end_date, c.external_id, c.external_source FROM cycles c
          WHERE c.id = $1 AND c.project_id = $2 AND c.workspace_id = $3 AND c.deleted_at IS NULL",
     )
@@ -889,22 +895,22 @@ async fn v1_update_cycle(
         ));
     }
 
-    if let Some(n) = b.get("name") {
-        if n.as_str().is_none_or(|s| s.trim().is_empty() || s.len() > 255) {
-            return Err(ApiError::bad("Invalid name"));
-        }
+    if let Some(n) = b.get("name")
+        && n.as_str().is_none_or(|s| s.trim().is_empty() || s.len() > 255)
+    {
+        return Err(ApiError::bad("Invalid name"));
     }
 
     let has_start = b.get("start_date").is_some();
     let has_end = b.get("end_date").is_some();
     let start = parse_day(&b, "start_date")?;
     let end = parse_day(&b, "end_date")?;
-    if has_start && has_end {
-        if let (Some(s), Some(e)) = (&start, &end) {
-            if s > e {
-                return Err(ApiError::bad("Start date cannot exceed end date"));
-            }
-        }
+    if has_start
+        && has_end
+        && let (Some(s), Some(e)) = (&start, &end)
+        && s > e
+    {
+        return Err(ApiError::bad("Start date cannot exceed end date"));
     }
 
     if let Some(ext_id) = s(&b, "external_id") {
@@ -1492,10 +1498,10 @@ async fn v1_create_module(
 
     let start = parse_day(&b, "start_date")?;
     let target = parse_day(&b, "target_date")?;
-    if let (Some(s), Some(e)) = (&start, &target) {
-        if s > e {
-            return Err(ApiError::bad("Start date cannot exceed target date"));
-        }
+    if let (Some(s), Some(e)) = (&start, &target)
+        && s > e
+    {
+        return Err(ApiError::bad("Start date cannot exceed target date"));
     }
 
     let lead_id = b
@@ -1611,12 +1617,12 @@ async fn v1_update_module(
     let has_target = b.get("target_date").is_some();
     let start = parse_day(&b, "start_date")?;
     let target = parse_day(&b, "target_date")?;
-    if has_start && has_target {
-        if let (Some(s), Some(e)) = (&start, &target) {
-            if s > e {
-                return Err(ApiError::bad("Start date cannot exceed target date"));
-            }
-        }
+    if has_start
+        && has_target
+        && let (Some(s), Some(e)) = (&start, &target)
+        && s > e
+    {
+        return Err(ApiError::bad("Start date cannot exceed target date"));
     }
 
     let has_lead = b.get("lead").is_some();
@@ -1933,6 +1939,8 @@ async fn v1_delete_module_issue(
 
 const MEMBER_LITE_JSON: &str = "jsonb_build_object('id',u.id,'first_name',u.first_name,'last_name',u.last_name,'email',u.email,'avatar',u.avatar,'avatar_url',CASE WHEN u.avatar_asset_id IS NOT NULL THEN '/api/assets/v2/static/' || u.avatar_asset_id || '/' ELSE NULLIF(u.avatar, '') END,'display_name',u.display_name,'role',m.role,'is_active',m.is_active,'is_bot',u.is_bot)";
 
+const MEMBER_LITE_NO_EMAIL_JSON: &str = "jsonb_build_object('id',u.id,'first_name',u.first_name,'last_name',u.last_name,'avatar',u.avatar,'avatar_url',CASE WHEN u.avatar_asset_id IS NOT NULL THEN '/api/assets/v2/static/' || u.avatar_asset_id || '/' ELSE NULLIF(u.avatar, '') END,'display_name',u.display_name,'role',m.role,'is_active',m.is_active,'is_bot',u.is_bot)";
+
 const PROJECT_LITE_JSON: &str = "jsonb_build_object('id',p.id,'identifier',p.identifier,'name',p.name,'cover_image',p.cover_image,'icon_prop',p.icon_prop,'emoji',p.emoji,'description',p.description,'cover_image_url',p.cover_image,'archived_at',p.archived_at)";
 
 async fn v1_workspace_members_lite(
@@ -1972,11 +1980,12 @@ async fn v1_projects_lite(
     let rows: Vec<Value> = sqlx::query_scalar(&format!(
         "SELECT {PROJECT_LITE_JSON} FROM projects p
          LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.workspace_id = p.workspace_id AND pm.member_id = $2 AND pm.is_active AND pm.deleted_at IS NULL
-         WHERE p.workspace_id = $1 AND p.deleted_at IS NULL AND (pm.id IS NOT NULL OR p.network = 2) {cond}
+         WHERE p.workspace_id = $1 AND p.deleted_at IS NULL AND (pm.id IS NOT NULL OR (p.network = 2 AND $3 > 5)) {cond}
          ORDER BY p.created_at DESC, p.id"
     ))
     .bind(ws.workspace_id)
     .bind(user.id)
+    .bind(ws.role)
     .fetch_all(&st.db)
     .await?;
     paginate(rows, &q)
@@ -2011,8 +2020,13 @@ async fn v1_project_members(
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, pid).await?;
     p.require(&[ADMIN, MEMBER, GUEST])?;
+    let cols = if p.ws.role > GUEST {
+        USER_JSON
+    } else {
+        USER_NO_EMAIL_JSON
+    };
     let rows: Vec<Value> = sqlx::query_scalar(&format!(
-        "SELECT {USER_JSON} FROM project_members pm
+        "SELECT {cols} FROM project_members pm
          JOIN users u ON u.id = pm.member_id
          WHERE pm.project_id = $1 AND pm.workspace_id = $2 AND pm.is_active AND pm.deleted_at IS NULL
          ORDER BY pm.created_at, pm.id"
@@ -2088,8 +2102,13 @@ async fn v1_project_members_lite(
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, pid).await?;
     p.require(&[ADMIN, MEMBER, GUEST])?;
+    let cols = if p.ws.role > GUEST {
+        MEMBER_LITE_JSON
+    } else {
+        MEMBER_LITE_NO_EMAIL_JSON
+    };
     let rows: Vec<Value> = sqlx::query_scalar(&format!(
-        "SELECT {MEMBER_LITE_JSON} FROM project_members m
+        "SELECT {cols} FROM project_members m
          JOIN users u ON u.id = m.member_id
          WHERE m.project_id = $1 AND m.workspace_id = $2 AND m.deleted_at IS NULL
          ORDER BY m.created_at, m.id"
@@ -2108,9 +2127,14 @@ async fn v1_project_member(
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, pid).await?;
     p.require(&[ADMIN, MEMBER, GUEST])?;
+    let cols = if p.ws.role > GUEST {
+        USER_JSON
+    } else {
+        USER_NO_EMAIL_JSON
+    };
     json_row(
         sqlx::query_scalar(&format!(
-            "SELECT {USER_JSON} FROM project_members pm
+            "SELECT {cols} FROM project_members pm
              JOIN users u ON u.id = pm.member_id
              WHERE (pm.id = $1 OR pm.member_id = $1) AND pm.project_id = $2 AND pm.workspace_id = $3 AND pm.deleted_at IS NULL"
         ))
@@ -2209,17 +2233,20 @@ async fn v1_project_summary(
     Path((slug, pid)): Path<(String, Uuid)>,
     Query(q): Query<HashMap<String, String>>,
 ) -> ApiResult {
-    let p = require_project(&st.db, &user, &slug, pid).await?;
-    p.require(&[ADMIN, MEMBER, GUEST])?;
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    let is_member = require_project(&st.db, &user, &slug, pid).await.is_ok();
+    if !is_member && !ws.is_admin() {
+        return Err(ApiError(StatusCode::NOT_FOUND, json!({"error": "Project not found"})));
+    }
 
     let proj: (String, String) = sqlx::query_as(
         "SELECT name, identifier FROM projects WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
     )
     .bind(pid)
-    .bind(p.workspace_id())
+    .bind(ws.workspace_id)
     .fetch_optional(&st.db)
     .await?
-    .ok_or_else(ApiError::not_found)?;
+    .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, json!({"error": "Project not found"})))?;
 
     let allowed = [
         "members", "states", "labels", "cycles", "modules", "issues", "intakes", "pages",
@@ -2247,7 +2274,7 @@ async fn v1_project_summary(
         )"
     )
     .bind(pid)
-    .bind(p.workspace_id())
+    .bind(ws.workspace_id)
     .fetch_one(&st.db)
     .await?;
 
@@ -2451,7 +2478,11 @@ async fn v1_create_intake_issue(
     .fetch_one(&mut *tx)
     .await?;
 
-    crate::activity::record(&mut *tx, crate::activity::ActivityEvent::new(issue_id, pid, p.workspace_id(), user.id, "created", "created the issue")).await?;
+    crate::activity::record(
+        &mut *tx,
+        crate::activity::ActivityEvent::new(issue_id, pid, p.workspace_id(), user.id, "created", "created the issue"),
+    )
+    .await?;
     tx.commit().await?;
 
     let val: Value = sqlx::query_scalar(&format!(
@@ -2496,11 +2527,14 @@ async fn v1_update_intake_issue(
     Json(b): Json<Value>,
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, pid).await?;
-    p.require(&[ADMIN, MEMBER])?;
+    p.require(&[ADMIN, MEMBER, GUEST])?;
 
-    let cur: Option<(Uuid, Uuid, i32)> = sqlx::query_as(
-        "SELECT ii.id, ii.issue_id, ii.status FROM intake_issues ii
-         WHERE (ii.issue_id = $1 OR ii.id = $1) AND ii.project_id = $2 AND ii.workspace_id = $3 AND ii.deleted_at IS NULL"
+    type IntakeUpdateRow = (Uuid, Uuid, i32, Option<Uuid>, Option<Uuid>);
+    let cur: Option<IntakeUpdateRow> = sqlx::query_as(
+        "SELECT ii.id, ii.issue_id, ii.status, ii.created_by_id, i.created_by_id
+         FROM intake_issues ii
+         JOIN issues i ON i.id = ii.issue_id AND i.deleted_at IS NULL
+         WHERE (ii.issue_id = $1 OR ii.id = $1) AND ii.project_id = $2 AND ii.workspace_id = $3 AND ii.deleted_at IS NULL",
     )
     .bind(iid)
     .bind(pid)
@@ -2508,36 +2542,79 @@ async fn v1_update_intake_issue(
     .fetch_optional(&st.db)
     .await?;
 
-    let (ii_id, issue_id, old_status) = cur.ok_or_else(ApiError::not_found)?;
+    let (ii_id, issue_id, old_status, ii_creator, issue_creator) = cur.ok_or_else(ApiError::not_found)?;
+    if p.role <= GUEST && ii_creator != Some(user.id) {
+        return Err(ApiError::bad("You cannot edit intake work items"));
+    }
+    if !(p.role == ADMIN || p.ws.is_admin() || issue_creator == Some(user.id)) {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            json!({"error": "Only admin or creator can update the work item"}),
+        ));
+    }
+    let duplicate_to = if p.role > MEMBER && b.get("duplicate_to").is_some_and(|v| !v.is_null()) {
+        let dup_id = uuid_of(&b, "duplicate_to").ok_or_else(|| {
+            ApiError::bad_body(json!({"duplicate_to": ["Work item must belong to the same project"]}))
+        })?;
+        let valid: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM issues WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL)",
+        )
+        .bind(dup_id)
+        .bind(pid)
+        .bind(p.workspace_id())
+        .fetch_one(&st.db)
+        .await?;
+        if !valid {
+            return Err(ApiError::bad_body(
+                json!({"duplicate_to": ["Work item must belong to the same project"]}),
+            ));
+        }
+        Some(dup_id)
+    } else {
+        None
+    };
+
     let mut tx = st.db.begin().await?;
-
-    if let Some(status) = b.get("status").and_then(Value::as_i64).map(|v| v as i32) {
-        if status == 1 && old_status != 1 {
-            let def_state: Option<Uuid> = sqlx::query_scalar(
-                "SELECT id FROM states WHERE project_id = $1 AND workspace_id = $2 AND \"default\" AND deleted_at IS NULL LIMIT 1"
-            )
-            .bind(pid)
-            .bind(p.workspace_id())
-            .fetch_optional(&mut *tx)
-            .await?;
-
-            let def_state = def_state
-                .ok_or_else(|| ApiError::bad("Cannot accept intake issue: No default state found for the project"))?;
-            sqlx::query("UPDATE issues SET state_id = $1, updated_at = now(), updated_by_id = $2 WHERE id = $3 AND project_id = $4 AND workspace_id = $5")
-                .bind(def_state)
-                .bind(user.id)
-                .bind(issue_id)
+    if p.role > MEMBER {
+        if let Some(status) = b.get("status").and_then(Value::as_i64).map(|v| v as i32) {
+            if status == 1 && old_status != 1 {
+                let def_state: Option<Uuid> = sqlx::query_scalar(
+                    "SELECT id FROM states WHERE project_id = $1 AND workspace_id = $2 AND \"default\" AND deleted_at IS NULL LIMIT 1",
+                )
                 .bind(pid)
                 .bind(p.workspace_id())
+                .fetch_optional(&mut *tx)
+                .await?;
+
+                let def_state = def_state.ok_or_else(|| {
+                    ApiError::bad("Cannot accept intake issue: No default state found for the project")
+                })?;
+                sqlx::query("UPDATE issues SET state_id = $1, updated_at = now(), updated_by_id = $2 WHERE id = $3 AND project_id = $4 AND workspace_id = $5")
+                    .bind(def_state)
+                    .bind(user.id)
+                    .bind(issue_id)
+                    .bind(pid)
+                    .bind(p.workspace_id())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            sqlx::query("UPDATE intake_issues SET status = $1, duplicate_to_id = COALESCE($4, duplicate_to_id), updated_at = now(), updated_by_id = $2 WHERE id = $3")
+                .bind(status)
+                .bind(user.id)
+                .bind(ii_id)
+                .bind(duplicate_to)
                 .execute(&mut *tx)
                 .await?;
-        }
-        sqlx::query("UPDATE intake_issues SET status = $1, updated_at = now(), updated_by_id = $2 WHERE id = $3")
-            .bind(status)
+        } else if duplicate_to.is_some() {
+            sqlx::query(
+                "UPDATE intake_issues SET duplicate_to_id = $1, updated_at = now(), updated_by_id = $2 WHERE id = $3",
+            )
+            .bind(duplicate_to)
             .bind(user.id)
             .bind(ii_id)
             .execute(&mut *tx)
             .await?;
+        }
     }
 
     if let Some(issue_b) = b.get("issue").and_then(Value::as_object) {
@@ -2551,17 +2628,31 @@ async fn v1_update_intake_issue(
                 .execute(&mut *tx)
                 .await?;
         }
-        if let Some(pr) = issue_b.get("priority").and_then(Value::as_str) {
-            if ["low", "medium", "high", "urgent", "none"].contains(&pr) {
-                sqlx::query("UPDATE issues SET priority = $1, updated_at = now(), updated_by_id = $2 WHERE id = $3 AND project_id = $4 AND workspace_id = $5")
-                    .bind(pr)
-                    .bind(user.id)
-                    .bind(issue_id)
-                    .bind(pid)
-                    .bind(p.workspace_id())
-                    .execute(&mut *tx)
-                    .await?;
-            }
+        if let Some(html) = issue_b.get("description_html").and_then(Value::as_str) {
+            let safe_html = sanitize_html(html)?;
+            let stripped = strip_tags(&safe_html);
+            sqlx::query("UPDATE issues SET description_html = $1, description_stripped = $2, updated_at = now(), updated_by_id = $3 WHERE id = $4 AND project_id = $5 AND workspace_id = $6")
+                .bind(&safe_html)
+                .bind(&stripped)
+                .bind(user.id)
+                .bind(issue_id)
+                .bind(pid)
+                .bind(p.workspace_id())
+                .execute(&mut *tx)
+                .await?;
+        }
+        if p.role > GUEST
+            && let Some(pr) = issue_b.get("priority").and_then(Value::as_str)
+            && ["low", "medium", "high", "urgent", "none"].contains(&pr)
+        {
+            sqlx::query("UPDATE issues SET priority = $1, updated_at = now(), updated_by_id = $2 WHERE id = $3 AND project_id = $4 AND workspace_id = $5")
+                .bind(pr)
+                .bind(user.id)
+                .bind(issue_id)
+                .bind(pid)
+                .bind(p.workspace_id())
+                .execute(&mut *tx)
+                .await?;
         }
     }
     tx.commit().await?;
@@ -2820,18 +2911,18 @@ async fn v1_create_estimate_points(
     let p = require_project(&st.db, &user, &slug, pid).await?;
     p.require(&[ADMIN, MEMBER])?;
 
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM estimates WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL)"
+    let est_type: Option<String> = sqlx::query_scalar(
+        "SELECT type FROM estimates WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL",
     )
     .bind(eid)
     .bind(pid)
     .bind(p.workspace_id())
-    .fetch_one(&st.db)
+    .fetch_optional(&st.db)
     .await?;
 
-    if !exists {
+    let Some(est_type) = est_type else {
         return Err(ApiError(StatusCode::NOT_FOUND, json!({"error": "Estimate not found"})));
-    }
+    };
 
     let points: Vec<Value> = if let Some(arr) = b.as_array() {
         arr.clone()
@@ -2843,6 +2934,18 @@ async fn v1_create_estimate_points(
 
     if points.is_empty() {
         return Err(ApiError::bad("Estimate points are required"));
+    }
+    for pt in &points {
+        if let Some(val) = s(pt, "value") {
+            if val.chars().count() > 20 {
+                return Err(ApiError::bad("Value can't be more than 20 characters"));
+            }
+            if est_type == "points" && !is_numeric_estimate(val) {
+                return Err(ApiError::bad(NON_NUMERIC_ESTIMATE_ERROR));
+            }
+        } else if est_type == "points" {
+            return Err(ApiError::bad(NON_NUMERIC_ESTIMATE_ERROR));
+        }
     }
 
     let mut tx = st.db.begin().await?;
@@ -2889,6 +2992,22 @@ async fn v1_update_estimate_point(
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, pid).await?;
     p.require(&[ADMIN, MEMBER])?;
+    if let Some(val) = s(&b, "value") {
+        if val.chars().count() > 20 {
+            return Err(ApiError::bad("Value can't be more than 20 characters"));
+        }
+        let est_type: Option<String> = sqlx::query_scalar(
+            "SELECT type FROM estimates WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL",
+        )
+        .bind(eid)
+        .bind(pid)
+        .bind(p.workspace_id())
+        .fetch_optional(&st.db)
+        .await?;
+        if est_type.as_deref() == Some("points") && !is_numeric_estimate(val) {
+            return Err(ApiError::bad(NON_NUMERIC_ESTIMATE_ERROR));
+        }
+    }
 
     let res = sqlx::query(
         "UPDATE estimate_points SET

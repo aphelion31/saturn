@@ -13,7 +13,7 @@
 //! Note on telemetry `push_instance_metrics`: deliberately not ported (no phoning home in Saturn).
 
 use chrono::{DateTime, NaiveTime, Timelike, Utc};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -135,6 +135,7 @@ pub async fn run_job_locked(st: &AppState, job_name: &str) -> anyhow::Result<boo
 }
 
 /// Helper for issue activity rows in jobs.rs (avoids cross-worker collisions with src/activity.rs).
+#[expect(clippy::too_many_arguments)]
 async fn insert_issue_activity(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     issue_id: Uuid,
@@ -167,9 +168,10 @@ async fn insert_issue_activity(
     Ok(())
 }
 
-/// 1. archive_and_close_old_issues
-/// Projects with archive_in > 0: archive completed/cancelled issues older than archive_in * 30 days.
-/// Projects with close_in > 0: close backlog/unstarted/started issues older than close_in * 30 days to default_state (or cancelled state).
+/// 1. `archive_and_close_old_issues`
+///
+///    Projects with `archive_in > 0`: archive completed/cancelled issues older than `archive_in * 30` days.
+///    Projects with `close_in > 0`: close backlog/unstarted/started issues older than `close_in * 30` days to `default_state` (or cancelled state).
 async fn run_archive_and_close(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> anyhow::Result<()> {
     // --- 1a. Archive ---
     #[derive(sqlx::FromRow)]
@@ -365,8 +367,9 @@ async fn run_archive_and_close(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -
     Ok(())
 }
 
-/// 2. unsnooze_expired_intake_issues
-/// Set intake_issues.status = -2 (PENDING), snoozed_till = NULL where status = 0 (SNOOZED) and snoozed_till <= now.
+/// 2. `unsnooze_expired_intake_issues`
+///
+///    Set `intake_issues.status = -2` (PENDING), `snoozed_till = NULL` where `status = 0` (SNOOZED) and `snoozed_till <= now`.
 async fn run_unsnooze_intake(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> anyhow::Result<()> {
     let count = sqlx::query(
         "UPDATE intake_issues
@@ -498,9 +501,10 @@ async fn hard_delete_table(
     Ok(())
 }
 
-/// 3. hard_delete
-/// Deletes rows whose deleted_at < now() - HARD_DELETE_AFTER_DAYS.
-/// Plane default: 60 days (read HARD_DELETE_AFTER_DAYS env).
+/// 3. `hard_delete`
+///
+///    Deletes rows whose `deleted_at < now() - HARD_DELETE_AFTER_DAYS`.
+///    Plane default: 60 days (read `HARD_DELETE_AFTER_DAYS` env).
 async fn run_hard_delete(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> anyhow::Result<()> {
     let days: i64 = std::env::var("HARD_DELETE_AFTER_DAYS")
         .ok()
@@ -557,9 +561,10 @@ async fn run_hard_delete(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> anyh
     Ok(())
 }
 
-/// 4. delete_unuploaded_file_asset
-/// Deletes file_assets with is_uploaded = false and created_at < now() - UNUPLOADED_ASSET_DELETE_DAYS (Plane default: 7).
-/// Also cleans up the disk file under STORAGE_DIR if present, safely preventing traversal.
+/// 4. `delete_unuploaded_file_asset`
+///
+///    Deletes `file_assets` with `is_uploaded = false` and `created_at < now() - UNUPLOADED_ASSET_DELETE_DAYS` (Plane default: 7).
+///    Also cleans up the disk file under `STORAGE_DIR` if present, safely preventing traversal.
 async fn run_delete_unuploaded_assets(
     st: &AppState,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -601,10 +606,10 @@ async fn remove_stored_file(st: &AppState, key: &str) {
         return;
     }
     let path = st.cfg.storage_dir.join(key);
-    if let (Ok(real), Ok(root)) = (path.canonicalize(), st.cfg.storage_dir.canonicalize()) {
-        if real.starts_with(&root) {
-            let _ = tokio::fs::remove_file(&real).await;
-        }
+    if let (Ok(real), Ok(root)) = (path.canonicalize(), st.cfg.storage_dir.canonicalize())
+        && real.starts_with(&root)
+    {
+        let _ = tokio::fs::remove_file(&real).await;
     }
 }
 
@@ -690,10 +695,11 @@ async fn run_delete_webhook_logs(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>)
     Ok(())
 }
 
-/// 6. delete_old_s3_link
-/// Plane's exporter_expired_task expires exporter files older than 8 days: deletes object and sets url=NULL.
-/// Saturn stores exports under STORAGE_DIR/exports/<token>/<filename> with key = "exports/<token>/<filename>".
-/// We delete the on-disk file and clear url (url=NULL).
+/// 6. `delete_old_s3_link`
+///
+///    Plane's `exporter_expired_task` expires exporter files older than 8 days: deletes object and sets `url=NULL`.
+///    Saturn stores exports under `STORAGE_DIR/exports/<token>/<filename>` with `key = "exports/<token>/<filename>"`.
+///    We delete the on-disk file and clear `url` (`url=NULL`).
 async fn run_delete_old_s3_link(st: &AppState, tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> anyhow::Result<()> {
     let cutoff = Utc::now() - chrono::Duration::days(8);
 
@@ -758,7 +764,7 @@ pub fn spawn(st: AppState) {
 
 /// CLI runner for `saturn jobs run <name>`.
 pub async fn cli_run(st: &AppState, args: &[String]) -> anyhow::Result<()> {
-    let job_name = args.get(0).map(String::as_str).unwrap_or("");
+    let job_name = args.first().map(String::as_str).unwrap_or("");
     if job_name.is_empty() {
         eprintln!("Usage: saturn jobs run <job_name>");
         eprintln!("Available jobs:");
@@ -784,6 +790,103 @@ pub async fn cli_run(st: &AppState, args: &[String]) -> anyhow::Result<()> {
         println!("job {job_name} skipped (lock held)");
     }
     Ok(())
+}
+
+struct SoftDeleteSchema {
+    soft_tables: HashSet<String>,
+    nullable_cols: HashSet<(String, String)>,
+}
+
+async fn soft_delete_schema(db: &sqlx::PgPool) -> Result<&'static SoftDeleteSchema, sqlx::Error> {
+    static SCHEMA: tokio::sync::OnceCell<SoftDeleteSchema> = tokio::sync::OnceCell::const_new();
+    SCHEMA
+        .get_or_try_init(|| async {
+            let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+                "SELECT c.table_name, c.column_name, c.data_type, c.is_nullable
+                 FROM information_schema.columns c
+                 JOIN information_schema.tables t
+                   ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+                 WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE'",
+            )
+            .fetch_all(db)
+            .await?;
+            let mut uuid_ids = HashSet::new();
+            let mut has_deleted_at = HashSet::new();
+            let mut nullable_cols = HashSet::new();
+            for (tbl, col, dtype, nullable) in rows {
+                if col == "id" && dtype == "uuid" {
+                    uuid_ids.insert(tbl.clone());
+                }
+                if col == "deleted_at" {
+                    has_deleted_at.insert(tbl.clone());
+                }
+                if nullable == "YES" {
+                    nullable_cols.insert((tbl, col));
+                }
+            }
+            let soft_tables = uuid_ids.intersection(&has_deleted_at).cloned().collect();
+            Ok(SoftDeleteSchema {
+                soft_tables,
+                nullable_cols,
+            })
+        })
+        .await
+}
+
+/// Port of Plane's `soft_delete_related_objects`: walks `PLANE_FKS` from `(table, id)` and
+/// propagates `deleted_at = now()` (CASCADE) or `NULL` (SET_NULL), cycling safely once per node.
+pub async fn soft_delete_cascade(db: &sqlx::PgPool, table: &'static str, id: Uuid) -> anyhow::Result<u64> {
+    let schema = soft_delete_schema(db).await?;
+    let mut visited: HashSet<(&'static str, Uuid)> = HashSet::new();
+    let mut queue: VecDeque<(&'static str, Uuid)> = VecDeque::new();
+    visited.insert((table, id));
+    queue.push_back((table, id));
+    let mut updated = 0u64;
+
+    while let Some((cur_table, cur_id)) = queue.pop_front() {
+        for &(child_table, child_col, parent_table, on_delete) in PLANE_FKS {
+            if parent_table != cur_table {
+                continue;
+            }
+            match on_delete {
+                OnDelete::DoNothing => continue,
+                OnDelete::SetNull => {
+                    if !schema
+                        .nullable_cols
+                        .contains(&(child_table.to_string(), child_col.to_string()))
+                    {
+                        continue;
+                    }
+                    let q = format!("UPDATE \"{child_table}\" SET \"{child_col}\" = NULL WHERE \"{child_col}\" = $1");
+                    sqlx::query(&q).bind(cur_id).execute(db).await?;
+                }
+                OnDelete::Cascade => {
+                    if !schema.soft_tables.contains(child_table) {
+                        continue;
+                    }
+                    let q = format!(
+                        "UPDATE \"{child_table}\" SET deleted_at = now() WHERE \"{child_col}\" = $1 AND deleted_at IS NULL RETURNING id"
+                    );
+                    let child_ids: Vec<Uuid> = sqlx::query_scalar(&q).bind(cur_id).fetch_all(db).await?;
+                    updated += child_ids.len() as u64;
+                    for cid in child_ids {
+                        if visited.insert((child_table, cid)) {
+                            queue.push_back((child_table, cid));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(updated)
+}
+
+pub fn spawn_soft_delete_cascade(st: AppState, table: &'static str, id: Uuid) {
+    tokio::spawn(async move {
+        if let Err(e) = soft_delete_cascade(&st.db, table, id).await {
+            tracing::warn!(table, %id, error = %e, "soft_delete_cascade failed");
+        }
+    });
 }
 
 #[cfg(test)]

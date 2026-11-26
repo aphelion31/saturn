@@ -117,6 +117,10 @@ pub fn routes() -> Router<AppState> {
 
 /// Anchor deploy board context.
 #[derive(Clone, Debug, sqlx::FromRow)]
+#[expect(
+    dead_code,
+    reason = "full deploy_boards projection kept for future public board checks"
+)]
 pub struct BoardCtx {
     pub id: Uuid,
     pub anchor: String,
@@ -474,7 +478,9 @@ async fn comments_list(
     Path((anchor, issue_id)): Path<(String, Uuid)>,
 ) -> ApiResult {
     // Plane returns an empty list (not 404) when the deploy board does not exist.
-    let Some(b) = anchor_or_none(&st.db, &anchor).await? else { return Ok(Json(json!([]))) };
+    let Some(b) = anchor_or_none(&st.db, &anchor).await? else {
+        return Ok(Json(json!([])));
+    };
     if !b.is_comments_enabled {
         return Ok(Json(json!([])));
     }
@@ -869,7 +875,9 @@ async fn issue_reactions_list(
     _user: MaybeUser,
     Path((anchor, issue_id)): Path<(String, Uuid)>,
 ) -> ApiResult {
-    let Some(b) = anchor_or_none(&st.db, &anchor).await? else { return Ok(Json(json!([]))) };
+    let Some(b) = anchor_or_none(&st.db, &anchor).await? else {
+        return Ok(Json(json!([])));
+    };
     if !b.is_reactions_enabled {
         return Ok(Json(json!([])));
     }
@@ -1031,7 +1039,9 @@ async fn comment_reactions_list(
     _user: MaybeUser,
     Path((anchor, comment_id)): Path<(String, Uuid)>,
 ) -> ApiResult {
-    let Some(b) = anchor_or_none(&st.db, &anchor).await? else { return Ok(Json(json!([]))) };
+    let Some(b) = anchor_or_none(&st.db, &anchor).await? else {
+        return Ok(Json(json!([])));
+    };
     if !b.is_reactions_enabled {
         return Ok(Json(json!([])));
     }
@@ -1196,7 +1206,9 @@ async fn issue_votes_list(
     _user: MaybeUser,
     Path((anchor, issue_id)): Path<(String, Uuid)>,
 ) -> ApiResult {
-    let Some(b) = anchor_or_none(&st.db, &anchor).await? else { return Ok(Json(json!([]))) };
+    let Some(b) = anchor_or_none(&st.db, &anchor).await? else {
+        return Ok(Json(json!([])));
+    };
     if !b.is_votes_enabled {
         return Ok(Json(json!([])));
     }
@@ -1526,7 +1538,18 @@ async fn intake_issue_create(
     .execute(&mut *tx)
     .await?;
 
-    crate::activity::record(&mut *tx, crate::activity::ActivityEvent::new(issue_id, b.project_id, b.workspace_id, user.id, "created", "created the issue")).await?;
+    crate::activity::record(
+        &mut *tx,
+        crate::activity::ActivityEvent::new(
+            issue_id,
+            b.project_id,
+            b.workspace_id,
+            user.id,
+            "created",
+            "created the issue",
+        ),
+    )
+    .await?;
     let activities = crate::notify::snapshots(&mut tx, issue_id, b.project_id, b.workspace_id).await?;
     tx.commit().await?;
     crate::notify::after_activity(&st, issue_id, b.project_id, b.workspace_id, user.id, activities);
@@ -1836,7 +1859,7 @@ async fn public_bulk_assets(
                 .filter_map(|v| {
                     v.as_str().and_then(|s| {
                         let clean = s.split('?').next().unwrap_or(s).trim_end_matches('/');
-                        let last = clean.split('/').last().unwrap_or(clean);
+                        let last = clean.split('/').next_back().unwrap_or(clean);
                         Uuid::parse_str(last).ok()
                     })
                 })
@@ -1979,10 +2002,10 @@ async fn public_intake_issue_patch(
         }
     }
     let priority = s(issue_obj, "priority");
-    if let Some(p) = priority {
-        if !["low", "medium", "high", "urgent", "none"].contains(&p) {
-            return Err(ApiError::bad("Invalid priority"));
-        }
+    if let Some(p) = priority
+        && !["low", "medium", "high", "urgent", "none"].contains(&p)
+    {
+        return Err(ApiError::bad("Invalid priority"));
     }
     let desc_html = if let Some(raw_html) = s(issue_obj, "description_html") {
         Some(sanitize_html(raw_html)?)

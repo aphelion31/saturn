@@ -253,6 +253,7 @@ async fn destroy(State(st): State<AppState>, user: CurrentUser, Path(slug): Path
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    crate::jobs::spawn_soft_delete_cascade(st.clone(), "workspaces", ws.workspace_id);
     no_content()
 }
 
@@ -267,21 +268,30 @@ const MEMBER_JSON: &str =
     'default_props', m.default_props, 'issue_props', m.issue_props, 'company_role', m.company_role,
     'created_by', m.created_by_id, 'updated_by', m.updated_by_id, 'deleted_at', m.deleted_at,
     'explored_features', m.explored_features, 'getting_started_checklist', m.getting_started_checklist, 'tips', m.tips)";
+const MEMBER_ADMIN_JSON: &str = "jsonb_build_object('id', m.id, 'member', {USER}, 'role', m.role,
+    'is_active', m.is_active, 'created_at', m.created_at)";
+const MEMBER_GUEST_JSON: &str = "jsonb_build_object('id', m.id, 'member', {USER}, 'role', m.role)";
 
 async fn members_list(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>) -> ApiResult {
     let ws = require_workspace(&st.db, &user, &slug).await?;
     ws.require(&[ADMIN, MEMBER, GUEST])?;
+    let template = if ws.role > GUEST {
+        MEMBER_ADMIN_JSON
+    } else {
+        MEMBER_GUEST_JSON
+    };
+    let user_sql = if ws.role > GUEST {
+        format!("{USER_LITE_JSON} || jsonb_build_object('email', u.email)")
+    } else {
+        USER_LITE_JSON.to_string()
+    };
     json_rows(
         sqlx::query_scalar(&format!(
             "SELECT {} FROM workspace_members m JOIN users u ON u.id = m.member_id
              WHERE m.workspace_id = $1 AND m.is_active AND m.deleted_at IS NULL AND NOT u.is_bot ORDER BY m.created_at",
-            MEMBER_JSON.replace(
-                "{USER}",
-                &format!("{USER_LITE_JSON} || jsonb_build_object('email', CASE WHEN $2 THEN u.email END)")
-            )
+            template.replace("{USER}", &user_sql)
         ))
-        .bind(ws.workspace_id)
-        .bind(ws.is_admin()),
+        .bind(ws.workspace_id),
         &st.db,
     )
     .await
@@ -294,18 +304,24 @@ async fn member_retrieve(
 ) -> ApiResult {
     let ws = require_workspace(&st.db, &user, &slug).await?;
     ws.require(&[ADMIN, MEMBER, GUEST])?;
+    let template = if ws.role > GUEST {
+        MEMBER_ADMIN_JSON
+    } else {
+        MEMBER_GUEST_JSON
+    };
+    let user_sql = if ws.role > GUEST {
+        format!("{USER_LITE_JSON} || jsonb_build_object('email', u.email)")
+    } else {
+        USER_LITE_JSON.to_string()
+    };
     json_row(
         sqlx::query_scalar(&format!(
             "SELECT {} FROM workspace_members m JOIN users u ON u.id = m.member_id
              WHERE m.id = $1 AND m.workspace_id = $2 AND m.is_active AND m.deleted_at IS NULL",
-            MEMBER_JSON.replace(
-                "{USER}",
-                &format!("{USER_LITE_JSON} || jsonb_build_object('email', CASE WHEN $3 THEN u.email END)")
-            )
+            template.replace("{USER}", &user_sql)
         ))
         .bind(pk)
-        .bind(ws.workspace_id)
-        .bind(ws.is_admin()),
+        .bind(ws.workspace_id),
         &st.db,
     )
     .await
@@ -956,6 +972,9 @@ async fn add_or_reactivate_member(
 
 /// Plane: pending invites addressed to the caller's email.
 async fn my_invites_list(State(st): State<AppState>, user: CurrentUser) -> ApiResult {
+    if !crate::auth::can_claim_invites_by_email(&st, user.id).await? {
+        return Ok(Json(json!([])));
+    }
     json_rows(
         sqlx::query_scalar(&format!(
             "SELECT {INVITE_JSON} FROM workspace_member_invites i JOIN workspaces w ON w.id = i.workspace_id
@@ -973,6 +992,12 @@ async fn my_invites_accept(
     user: CurrentUser,
     Json(b): Json<Value>,
 ) -> ApiResult<StatusCode> {
+    if !crate::auth::can_claim_invites_by_email(&st, user.id).await? {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            json!({"error": "Verify your email to accept workspace invitations"}),
+        ));
+    }
     let ids: Vec<Uuid> = b
         .get("invitations")
         .and_then(Value::as_array)
@@ -1311,33 +1336,172 @@ async fn user_profile(
     Path((slug, target)): Path<(String, Uuid)>,
 ) -> ApiResult {
     let ws = require_workspace(&st.db, &user, &slug).await?;
+    let hide_email = ws.role <= GUEST && target != user.id;
     let row: Option<Value> = sqlx::query_scalar(
-        "SELECT jsonb_build_object('email', u.email, 'first_name', u.first_name, 'last_name', u.last_name,
-            'avatar_url', NULLIF(u.avatar, ''), 'cover_image_url', u.cover_image, 'date_joined', u.date_joined,
-            'user_timezone', u.user_timezone)
+        "SELECT CASE WHEN $3 THEN jsonb_build_object('first_name', u.first_name, 'last_name', u.last_name,
+            'avatar_url', CASE WHEN u.avatar_asset_id IS NOT NULL THEN '/api/assets/v2/static/' || u.avatar_asset_id || '/'
+                ELSE NULLIF(u.avatar, '') END,
+            'cover_image_url', u.cover_image, 'date_joined', u.date_joined,
+            'user_timezone', u.user_timezone, 'display_name', u.display_name)
+         ELSE jsonb_build_object('email', u.email, 'first_name', u.first_name, 'last_name', u.last_name,
+            'avatar_url', CASE WHEN u.avatar_asset_id IS NOT NULL THEN '/api/assets/v2/static/' || u.avatar_asset_id || '/'
+                ELSE NULLIF(u.avatar, '') END,
+            'cover_image_url', u.cover_image, 'date_joined', u.date_joined,
+            'user_timezone', u.user_timezone, 'display_name', u.display_name) END
          FROM workspace_members m JOIN users u ON u.id = m.member_id
          WHERE m.workspace_id = $1 AND m.member_id = $2 AND m.is_active AND m.deleted_at IS NULL",
     )
     .bind(ws.workspace_id)
     .bind(target)
+    .bind(hide_email)
     .fetch_optional(&st.db)
     .await?;
     let Some(user_data) = row else {
         return Err(ApiError::not_found());
     };
-    Ok(Json(json!({"project_data": [], "user_data": user_data})))
+    let project_data: Vec<Value> = if ws.role >= MEMBER {
+        sqlx::query_scalar(
+            "SELECT jsonb_build_object(
+                'id', p.id,
+                'logo_props', p.logo_props,
+                'created_issues', COALESCE((
+                    SELECT count(*) FROM issues i
+                    WHERE i.project_id = p.id AND i.workspace_id = $1
+                      AND i.deleted_at IS NULL AND i.archived_at IS NULL AND NOT i.is_draft
+                      AND i.created_by_id = $3
+                      AND (pm.role > 5 OR p.guest_view_all_features OR i.created_by_id = $2)
+                ), 0),
+                'assigned_issues', COALESCE((
+                    SELECT count(*) FROM issues i
+                    WHERE i.project_id = p.id AND i.workspace_id = $1
+                      AND i.deleted_at IS NULL AND i.archived_at IS NULL AND NOT i.is_draft
+                      AND EXISTS (SELECT 1 FROM issue_assignees a WHERE a.issue_id = i.id AND a.assignee_id = $3 AND a.deleted_at IS NULL)
+                      AND (pm.role > 5 OR p.guest_view_all_features OR i.created_by_id = $2)
+                ), 0),
+                'completed_issues', COALESCE((
+                    SELECT count(*) FROM issues i
+                    WHERE i.project_id = p.id AND i.workspace_id = $1
+                      AND i.deleted_at IS NULL AND i.archived_at IS NULL AND NOT i.is_draft
+                      AND i.completed_at IS NOT NULL
+                      AND EXISTS (SELECT 1 FROM issue_assignees a WHERE a.issue_id = i.id AND a.assignee_id = $3 AND a.deleted_at IS NULL)
+                      AND (pm.role > 5 OR p.guest_view_all_features OR i.created_by_id = $2)
+                ), 0),
+                'pending_issues', COALESCE((
+                    SELECT count(*) FROM issues i JOIN states s ON s.id = i.state_id
+                    WHERE i.project_id = p.id AND i.workspace_id = $1
+                      AND i.deleted_at IS NULL AND i.archived_at IS NULL AND NOT i.is_draft
+                      AND s.\"group\" IN ('backlog', 'unstarted', 'started')
+                      AND EXISTS (SELECT 1 FROM issue_assignees a WHERE a.issue_id = i.id AND a.assignee_id = $3 AND a.deleted_at IS NULL)
+                      AND (pm.role > 5 OR p.guest_view_all_features OR i.created_by_id = $2)
+                ), 0)
+            )
+            FROM projects p
+            JOIN project_members pm ON pm.project_id = p.id AND pm.member_id = $2 AND pm.is_active AND pm.deleted_at IS NULL
+            WHERE p.workspace_id = $1 AND p.deleted_at IS NULL AND p.archived_at IS NULL
+            ORDER BY p.created_at",
+        )
+        .bind(ws.workspace_id)
+        .bind(user.id)
+        .bind(target)
+        .fetch_all(&st.db)
+        .await?
+    } else {
+        Vec::new()
+    };
+    Ok(Json(json!({"project_data": project_data, "user_data": user_data})))
 }
 
-/// Plane: activity feed. Returned empty until the activity writer lands.
-// ponytail: issue_activities is not read here yet. Empty page is valid for the UI.
+/// Plane: activity feed for a workspace member (`WorkspaceUserActivityEndpoint`), paginated and
+/// filtered by caller's project-level issue visibility.
 async fn user_activity(
     State(st): State<AppState>,
     user: CurrentUser,
-    Path((slug, _target)): Path<(String, Uuid)>,
+    Path((slug, target)): Path<(String, Uuid)>,
+    Query(pairs): Query<Vec<(String, String)>>,
 ) -> ApiResult {
     let ws = require_workspace(&st.db, &user, &slug).await?;
     ws.require(&[ADMIN, MEMBER, GUEST])?;
-    Ok(Json(json!({"results": [], "count": 0, "next": null, "previous": null})))
+    let mut project_ids: Vec<Uuid> = Vec::new();
+    let mut per_page: i64 = 100;
+    let mut page: i64 = 0;
+    let mut order_by = String::from("-created_at");
+    for (k, v) in pairs {
+        match k.as_str() {
+            "project" => {
+                for part in v.split(',') {
+                    if let Ok(id) = Uuid::parse_str(part.trim()) {
+                        project_ids.push(id);
+                    }
+                }
+            }
+            "per_page" => {
+                if let Ok(n) = v.parse::<i64>() {
+                    per_page = n.clamp(1, 1000);
+                }
+            }
+            "cursor" => {
+                if let Some(p) = v.split(':').nth(1).and_then(|s| s.parse::<i64>().ok()) {
+                    page = p.max(0);
+                }
+            }
+            "order_by" => order_by = v,
+            _ => {}
+        }
+    }
+    let order = match order_by.as_str() {
+        "created_at" => "a.created_at ASC",
+        "updated_at" => "a.updated_at ASC",
+        "-updated_at" => "a.updated_at DESC",
+        _ => "a.created_at DESC",
+    };
+    let where_sql = "a.workspace_id = $1 AND a.actor_id = $2 AND a.deleted_at IS NULL
+        AND (a.field IS NULL OR a.field NOT IN ('comment', 'vote', 'reaction', 'draft'))
+        AND p.deleted_at IS NULL AND p.archived_at IS NULL
+        AND ($4::uuid[] = '{}'::uuid[] OR a.project_id = ANY($4))
+        AND EXISTS (SELECT 1 FROM project_members pm
+            WHERE pm.project_id = a.project_id AND pm.member_id = $3 AND pm.is_active AND pm.deleted_at IS NULL
+              AND (pm.role > 5 OR p.guest_view_all_features OR (i.id IS NOT NULL AND i.created_by_id = $3)))";
+    let total: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM issue_activities a
+         JOIN projects p ON p.id = a.project_id
+         LEFT JOIN issues i ON i.id = a.issue_id AND i.deleted_at IS NULL
+         WHERE {where_sql}"
+    ))
+    .bind(ws.workspace_id)
+    .bind(target)
+    .bind(user.id)
+    .bind(&project_ids)
+    .fetch_one(&st.db)
+    .await?;
+    let mut rows: Vec<Value> = sqlx::query_scalar(&format!(
+        "SELECT {} FROM issue_activities a
+         JOIN projects p ON p.id = a.project_id
+         LEFT JOIN issues i ON i.id = a.issue_id AND i.deleted_at IS NULL
+         WHERE {where_sql}
+         ORDER BY {order} LIMIT $5 OFFSET $6",
+        crate::user_dash::activity_json()
+    ))
+    .bind(ws.workspace_id)
+    .bind(target)
+    .bind(user.id)
+    .bind(&project_ids)
+    .bind(per_page + 1)
+    .bind(page * per_page)
+    .fetch_all(&st.db)
+    .await?;
+    let has_next = rows.len() as i64 > per_page;
+    rows.truncate(per_page as usize);
+    Ok(Json(json!({
+        "next_cursor": format!("{per_page}:{}:0", page + 1),
+        "prev_cursor": format!("{per_page}:{}:1", (page - 1).max(0)),
+        "next_page_results": has_next,
+        "prev_page_results": page > 0,
+        "count": rows.len(),
+        "total_pages": (total + per_page - 1) / per_page,
+        "total_results": total,
+        "extra_stats": null,
+        "results": rows,
+    })))
 }
 
 // --- sidebar and home preferences (WorkspaceUserPreference, WorkspaceHomePreference) ---
@@ -1745,7 +1909,6 @@ async fn webhook_logs(
 ) -> ApiResult {
     let ws = require_workspace(&st.db, &user, &slug).await?;
     ws.require(&[ADMIN])?;
-    // ponytail: delivery not ported, so this table stays empty until webhook delivery exists.
     json_rows(
         sqlx::query_scalar(
             "SELECT jsonb_build_object('id', l.id, 'created_at', l.created_at, 'updated_at', l.updated_at,
@@ -1772,7 +1935,7 @@ const THEME_JSON: &str = "jsonb_build_object('id', t.id, 'name', t.name, 'colors
 /// Plane's `name` is varchar(300) and required.
 fn theme_name(b: &Value, required: bool) -> Result<Option<&str>, ApiError> {
     match s(b, "name").map(str::trim) {
-        Some(n) if n.is_empty() => Err(ApiError::bad_body(json!({"name": ["This field may not be blank."]}))),
+        Some("") => Err(ApiError::bad_body(json!({"name": ["This field may not be blank."]}))),
         Some(n) if n.chars().count() > 300 => Err(ApiError::bad_body(
             json!({"name": ["Ensure this field has no more than 300 characters."]}),
         )),

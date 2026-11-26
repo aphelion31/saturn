@@ -98,7 +98,10 @@ async fn dispatch(
                 // Plane create_mention_notification: comment mentions name the actor, description ones do not.
                 Some(if field == "comment" {
                     let actor_name: String = sqlx::query_scalar("SELECT display_name FROM users WHERE id=$1")
-                        .bind(actor).fetch_optional(&mut *tx).await?.unwrap_or_default();
+                        .bind(actor)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                        .unwrap_or_default();
                     format!("{actor_name} has mentioned you in a comment in issue {issue_name}")
                 } else {
                     format!("You have been mentioned in the issue {issue_name}")
@@ -136,9 +139,13 @@ async fn dispatch(
     Ok(())
 }
 
-pub async fn stack_email_notification(st: &AppState, tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(), sqlx::Error> {
+pub async fn stack_email_notification(
+    st: &AppState,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), sqlx::Error> {
     let tx = &mut **tx;
-    let groups: Vec<(Uuid, Uuid, String, Vec<Uuid>, Vec<Value>)> = sqlx::query_as("SELECT l.receiver_id,l.entity_identifier,u.email,array_agg(l.id ORDER BY l.created_at),array_agg(l.data ORDER BY l.created_at) FROM email_notification_logs l JOIN users u ON u.id=l.receiver_id WHERE l.processed_at IS NULL AND l.deleted_at IS NULL AND l.entity_name='issue' AND l.entity_identifier IS NOT NULL GROUP BY l.receiver_id,l.entity_identifier,u.email").fetch_all(&mut *tx).await?;
+    type EmailLogGroup = (Uuid, Uuid, String, Vec<Uuid>, Vec<Value>);
+    let groups: Vec<EmailLogGroup> = sqlx::query_as("SELECT l.receiver_id,l.entity_identifier,u.email,array_agg(l.id ORDER BY l.created_at),array_agg(l.data ORDER BY l.created_at) FROM email_notification_logs l JOIN users u ON u.id=l.receiver_id WHERE l.processed_at IS NULL AND l.deleted_at IS NULL AND l.entity_name='issue' AND l.entity_identifier IS NOT NULL GROUP BY l.receiver_id,l.entity_identifier,u.email").fetch_all(&mut *tx).await?;
     let smtp = crate::outbound::smtp(st).await;
     for (_, _, email, ids, data) in groups {
         if let Some(smtp) = &smtp {

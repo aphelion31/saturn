@@ -201,7 +201,35 @@ pub(crate) fn base(st: &AppState, app: App) -> String {
     }
 }
 
-/// Same rules as Plane's `validate_next_path`: relative path only, no `//`, no `..`.
+fn percent_unquote_path(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(hi), Some(lo)) = (hex_val(b[i + 1]), hex_val(b[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Same rules as Plane's `validate_next_path`: relative path only, no `//`, no `..`, and safe after up to 3 percent-decode rounds.
 pub(crate) fn safe_next(p: Option<&str>) -> String {
     let Some(p) = p else { return String::new() };
     if p.len() > 500 {
@@ -213,6 +241,39 @@ pub(crate) fn safe_next(p: Option<&str>) -> String {
         Err(_) => p,
     };
     if !p.starts_with('/') || p.starts_with("//") || p.contains("..") {
+        return String::new();
+    }
+    let lower = p.to_ascii_lowercase();
+    for bad in [
+        "javascript:",
+        "data:",
+        "vbscript:",
+        "file:",
+        "ftp:",
+        "%2e%2e",
+        "%2f%2f",
+        "%5c%5c",
+        "<script",
+        "<iframe",
+        "<object",
+        "<embed",
+        "<form",
+        "onload=",
+        "onerror=",
+        "onclick=",
+    ] {
+        if lower.contains(bad) {
+            return String::new();
+        }
+    }
+    let mut decoded = p.clone();
+    for _ in 0..3 {
+        decoded = percent_unquote_path(&decoded);
+    }
+    if percent_unquote_path(&decoded) != decoded {
+        return String::new();
+    }
+    if decoded != p && safe_next(Some(&decoded)) != decoded {
         return String::new();
     }
     p
@@ -263,20 +324,27 @@ pub(crate) fn valid_email(e: &str) -> bool {
     !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.') && !e.contains(' ')
 }
 
-/// ponytail: Plane uses zxcvbn score >= 3. Saturn checks length and character variety instead.
 fn parse_bool(s: Option<&str>) -> bool {
     s.map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "on" | "yes"))
         .unwrap_or(false)
 }
 
+/// Plane `is_password_strong`: `zxcvbn` score >= 3 on either prefix or suffix window.
+/// Bounded to 100 chars to match `zxcvbn` v3's internal `chars().take(100)` DoS cap so tail entropy is never truncated.
 fn strong(p: &str) -> bool {
-    let classes = [
-        p.chars().any(|c| c.is_ascii_lowercase()),
-        p.chars().any(|c| c.is_ascii_uppercase()),
-        p.chars().any(|c| c.is_ascii_digit()),
-        p.chars().any(|c| !c.is_ascii_alphanumeric()),
-    ];
-    p.chars().count() >= 8 && classes.iter().filter(|x| **x).count() >= 3
+    if p.is_empty() {
+        return false;
+    }
+    const MAX_LEN: usize = 100;
+    let prefix: String = p.chars().take(MAX_LEN).collect();
+    let total = p.chars().count();
+    let suffix: String = if total > MAX_LEN {
+        p.chars().skip(total - MAX_LEN).collect()
+    } else {
+        prefix.clone()
+    };
+    let check = |w: &str| zxcvbn::zxcvbn(w, &[]).score() >= zxcvbn::Score::Three;
+    check(&prefix) || (suffix != prefix && check(&suffix))
 }
 
 async fn config_value(st: &AppState, key: &str, default: &str) -> String {
@@ -347,8 +415,24 @@ pub(crate) async fn landing(st: &AppState, user_id: Uuid, email: &str) -> Result
     })
 }
 
+/// Mirrors Plane's `can_claim_invites_by_email`: user email is verified or instance has no SMTP host configured.
+pub(crate) async fn can_claim_invites_by_email(st: &AppState, user_id: Uuid) -> Result<bool, ApiError> {
+    let verified: bool = sqlx::query_scalar("SELECT is_email_verified FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(&st.db)
+        .await?
+        .unwrap_or(false);
+    if verified {
+        return Ok(true);
+    }
+    Ok(crate::outbound::config(st, "EMAIL_HOST", "").await.trim().is_empty())
+}
+
 /// Join workspaces and projects whose invites this email already accepted (`process_workspace_project_invitations`).
 pub(crate) async fn join_accepted_invites(st: &AppState, user_id: Uuid, email: &str) -> Result<(), ApiError> {
+    if !can_claim_invites_by_email(st, user_id).await? {
+        return Ok(());
+    }
     sqlx::query(
         "INSERT INTO workspace_members (workspace_id, member_id, role)
          SELECT workspace_id, $1, role FROM workspace_member_invites WHERE email = $2 AND accepted AND deleted_at IS NULL
@@ -466,7 +550,7 @@ async fn magic_generate(
     }
     let key = format!("magic_{email}");
     let issue_key = format!("issued:{email}");
-    let token = format!("{:06}", rand::thread_rng().gen_range(100000..1000000));
+    let token = format!("{:08}", rand::thread_rng().gen_range(10_000_000..100_000_000));
     let mut tx = st.db.begin().await?;
     let issued: (i32,) = sqlx::query_as("INSERT INTO saturn_magic_codes (key, token, attempts, expires_at) VALUES ($1, '', 1, now() + interval '10 minutes') ON CONFLICT (key) DO UPDATE SET attempts = CASE WHEN saturn_magic_codes.expires_at <= now() THEN 1 ELSE saturn_magic_codes.attempts + 1 END, expires_at = CASE WHEN saturn_magic_codes.expires_at <= now() THEN now() + interval '10 minutes' ELSE saturn_magic_codes.expires_at END RETURNING attempts").bind(issue_key).fetch_one(&mut *tx).await?;
     if issued.0 > 4 {
@@ -547,10 +631,10 @@ async fn magic_auth(
     if !signup && row.is_none() {
         return Ok(fail("USER_DOES_NOT_EXIST"));
     }
-    if let Some((_, active, bot, logged_out)) = row {
-        if bot || (!active && logged_out) {
-            return Ok(fail("USER_ACCOUNT_DEACTIVATED"));
-        }
+    if let Some((_, active, bot, logged_out)) = row
+        && (bot || (!active && logged_out))
+    {
+        return Ok(fail("USER_ACCOUNT_DEACTIVATED"));
     }
     if signup && config_value(&st, "ENABLE_SIGNUP", "0").await != "1" {
         return Ok(fail("SIGNUP_DISABLED"));
@@ -603,7 +687,7 @@ async fn magic_auth(
             .await?;
         id
     };
-    sqlx::query("UPDATE users SET is_active=true, last_login_medium='email' WHERE id=$1")
+    sqlx::query("UPDATE users SET is_active=true, is_email_verified=true, last_login_medium='email' WHERE id=$1")
         .bind(id)
         .execute(&st.db)
         .await?;
@@ -773,7 +857,7 @@ async fn reset(
     if f.confirm_password.as_deref() != Some(password.as_str()) || !strong(&password) {
         return Ok(fail("PASSWORD_TOO_WEAK"));
     }
-    sqlx::query("UPDATE users SET password=$2,is_password_autoset=false WHERE id=$1")
+    sqlx::query("UPDATE users SET password=$2, is_password_autoset=false, is_email_verified=true WHERE id=$1")
         .bind(id)
         .bind(session::hash_password(&password))
         .execute(&mut *tx)
@@ -981,7 +1065,9 @@ async fn sign_in(st: AppState, headers: HeaderMap, f: AuthForm, app: App) -> Res
         .bind(id)
         .execute(&st.db)
         .await?;
-    if !active { crate::outbound::activation_mail(&st, id).await; }
+    if !active {
+        crate::outbound::activation_mail(&st, id).await;
+    }
     join_accepted_invites(&st, id, &email).await?;
     let uagent = headers
         .get(header::USER_AGENT)
@@ -1159,8 +1245,11 @@ pub async fn ensure_instance(db: &sqlx::PgPool) -> anyhow::Result<()> {
 
 async fn instance_info(State(st): State<AppState>) -> ApiResult {
     let instance: Option<Value> = sqlx::query_scalar(
-        "SELECT to_jsonb(i) || jsonb_build_object('workspaces_exist', EXISTS (SELECT 1 FROM workspaces WHERE deleted_at IS NULL))
-         FROM instances i ORDER BY created_at LIMIT 1",
+        "SELECT (to_jsonb(i) - 'created_by_id' - 'updated_by_id') || jsonb_build_object(
+            'created_by', i.created_by_id,
+            'updated_by', i.updated_by_id,
+            'workspaces_exist', EXISTS (SELECT 1 FROM workspaces WHERE deleted_at IS NULL)
+         ) FROM instances i ORDER BY created_at LIMIT 1",
     )
     .fetch_optional(&st.db)
     .await?;
@@ -1168,6 +1257,12 @@ async fn instance_info(State(st): State<AppState>) -> ApiResult {
         return Ok(Json(json!({"is_activated": false, "is_setup_done": false})));
     };
     let on = |v: String| v == "1";
+    let env_opt = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
     let cfg = json!({
         "enable_signup": on(config_value(&st, "ENABLE_SIGNUP", "0").await),
         "is_workspace_creation_disabled": on(config_value(&st, "DISABLE_WORKSPACE_CREATION", "0").await),
@@ -1183,9 +1278,9 @@ async fn instance_info(State(st): State<AppState>) -> ApiResult {
         "has_llm_configured": !crate::outbound::config(&st, "LLM_API_KEY", "").await.is_empty(),
         "file_size_limit": st.cfg.file_size_limit as f64,
         "is_smtp_configured": crate::outbound::smtp(&st).await.is_some(),
-        "admin_base_url": "",
-        "space_base_url": "",
-        "app_base_url": "",
+        "admin_base_url": env_opt("ADMIN_BASE_URL"),
+        "space_base_url": env_opt("SPACE_BASE_URL"),
+        "app_base_url": env_opt("APP_BASE_URL"),
         "instance_changelog_url": "",
         "is_self_managed": true,
     });
@@ -1371,6 +1466,9 @@ mod tests {
         assert_eq!(safe_next(Some("/\t/evil.com")), "");
         assert_eq!(safe_next(Some("https://evil.com/x")), "/x");
         assert_eq!(safe_next(Some("/a/../b")), "");
+        assert_eq!(safe_next(Some("/%2f/evil.com")), "");
+        assert_eq!(safe_next(Some("/a/%2e%2e/b")), "");
+        assert_eq!(safe_next(Some("%2525252f")), "");
         assert_eq!(safe_next(Some("relative")), "");
     }
 
@@ -1425,7 +1523,16 @@ mod tests {
     #[test]
     fn password_rule() {
         assert!(strong("Saturn-rocks-2026"));
+        assert!(strong("Change-me-2026"));
+        assert!(strong("correct-horse-battery-staple"));
+        let long_tail = format!("{}k9$Vm!pQ2zR#8wL4xT", "a".repeat(200));
+        assert!(strong(&long_tail));
+        let boundary_tail = format!("{}k9$Vm!pQ2zR#8wL4xT", "a".repeat(97));
+        assert!(strong(&boundary_tail));
+        assert!(!strong(""));
         assert!(!strong("password"));
+        assert!(!strong("password123"));
+        assert!(!strong("12345678"));
         assert!(!strong("Ab1!"));
     }
 }

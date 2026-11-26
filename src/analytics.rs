@@ -532,7 +532,8 @@ async fn project_advance_charts(
     match chart_type {
         "work-items" => {
             if let Some(c) = cycle_id {
-                let dates: Option<(Option<chrono::DateTime<Utc>>, Option<chrono::DateTime<Utc>>)> =
+                type CycleDatePair = (Option<chrono::DateTime<Utc>>, Option<chrono::DateTime<Utc>>);
+                let dates: Option<CycleDatePair> =
                     sqlx::query_as("SELECT start_date, end_date FROM cycles WHERE id = $1 AND workspace_id = $2 AND project_id = $3 AND deleted_at IS NULL")
                         .bind(c)
                         .bind(ws.workspace_id)
@@ -1198,12 +1199,12 @@ async fn run_graph_plot(
             "error": "x-axis and y-axis dimensions are required and the values should be valid"
         })));
     }
-    if let Some(seg) = segment {
-        if !VALID_ANALYTICS_FIELDS.contains(&seg) || seg == x_axis {
-            return Err(ApiError::bad_body(json!({
-                "error": "Both segment and x axis cannot be same and segment should be valid"
-            })));
-        }
+    if let Some(seg) = segment
+        && (!VALID_ANALYTICS_FIELDS.contains(&seg) || seg == x_axis)
+    {
+        return Err(ApiError::bad_body(json!({
+            "error": "Both segment and x axis cannot be same and segment should be valid"
+        })));
     }
 
     let x_def = get_plot_field(x_axis, "x").ok_or_else(|| ApiError::bad("Invalid x_axis dimension"))?;
@@ -1245,7 +1246,7 @@ async fn run_graph_plot(
         } else {
             let sql = format!(
                 "SELECT {} AS dimension, {} AS segment,
-                        COALESCE(sum(CASE WHEN ep_est.value ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN ep_est.value::float8 ELSE 0 END), 0)::float8 AS estimate
+                        COALESCE(sum(CASE WHEN ep_est.value ~ '^ *([0-9]+\\.?[0-9]*|\\.[0-9]+) *$' THEN ep_est.value::float8 ELSE 0 END), 0)::float8 AS estimate
                  FROM issues i
                  {}
                  {}
@@ -1304,7 +1305,7 @@ async fn run_graph_plot(
     } else {
         let sql = format!(
             "SELECT {} AS dimension,
-                    COALESCE(sum(CASE WHEN ep_est.value ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN ep_est.value::float8 ELSE 0 END), 0)::float8 AS estimate
+                    COALESCE(sum(CASE WHEN ep_est.value ~ '^ *([0-9]+\\.?[0-9]*|\\.[0-9]+) *$' THEN ep_est.value::float8 ELSE 0 END), 0)::float8 AS estimate
              FROM issues i
              {}
              LEFT JOIN estimate_points ep_est ON ep_est.id = i.estimate_point_id

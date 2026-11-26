@@ -37,6 +37,42 @@ pub(crate) async fn pinned_client(raw: &str, timeout: Duration) -> Result<reqwes
         .map_err(|e| e.to_string())
 }
 
+pub(crate) async fn read_capped_body(
+    resp: &mut reqwest::Response,
+    max_bytes: usize,
+    max_duration: Duration,
+) -> (Vec<u8>, bool) {
+    let deadline = tokio::time::Instant::now() + max_duration;
+    let mut out = Vec::new();
+    let mut truncated = false;
+    loop {
+        let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if rem.is_zero() {
+            truncated = true;
+            break;
+        }
+        match tokio::time::timeout(rem, resp.chunk()).await {
+            Ok(Ok(Some(chunk))) => {
+                if max_bytes == 0 || out.len() + chunk.len() > max_bytes {
+                    let take = max_bytes.saturating_sub(out.len());
+                    out.extend_from_slice(&chunk[..take]);
+                    truncated = true;
+                    break;
+                }
+                out.extend_from_slice(&chunk);
+            }
+            Ok(Ok(None)) => break,
+            Ok(Err(_)) | Err(_) => {
+                if !out.is_empty() {
+                    truncated = true;
+                }
+                break;
+            }
+        }
+    }
+    (out, truncated)
+}
+
 pub(crate) async fn model_data(
     db: &sqlx::PgPool,
     event: &str,
@@ -181,10 +217,15 @@ pub fn emit_with_changes(
                     };
                     let failed = result.is_err();
                     let (status, response_headers, response_body) = match result {
-                        Ok(r) => {
+                        Ok(mut r) => {
                             let status = r.status().as_u16().to_string();
                             let headers = format!("{:?}", r.headers());
-                            (status, headers, r.text().await.unwrap_or_default())
+                            let (bytes, truncated) = read_capped_body(&mut r, 10 * 1024, Duration::from_secs(30)).await;
+                            let mut text = String::from_utf8_lossy(&bytes).into_owned();
+                            if truncated {
+                                text.push_str("... [truncated]");
+                            }
+                            (status, headers, text)
                         }
                         Err(e) => (if rejected { "400" } else { "500" }.to_string(), String::new(), e),
                     };

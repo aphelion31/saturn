@@ -172,7 +172,12 @@ async fn seed(st: &AppState, ws: Uuid) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
 
     // Project: one per projects.json entry, named after the workspace.
-    let identifier: String = name.chars().filter(|c| c.is_alphanumeric()).take(5).collect::<String>().to_uppercase();
+    let identifier: String = name
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .take(5)
+        .collect::<String>()
+        .to_uppercase();
     let mut projects: HashMap<i64, Uuid> = HashMap::new();
     for seed in parse::<ProjectSeed>(PROJECTS)? {
         let pid: Uuid = sqlx::query_scalar(
@@ -231,7 +236,12 @@ async fn seed(st: &AppState, ws: Uuid) -> Result<(), String> {
         }
         projects.insert(seed.id, pid);
     }
-    let project_of = |id: i64| projects.get(&id).copied().ok_or_else(|| format!("unknown project seed {id}"));
+    let project_of = |id: i64| {
+        projects
+            .get(&id)
+            .copied()
+            .ok_or_else(|| format!("unknown project seed {id}"))
+    };
     // Seed IDs are only used inside this function; each row resolves through these maps.
 
     // States.
@@ -289,7 +299,9 @@ async fn seed(st: &AppState, ws: Uuid) -> Result<(), String> {
             .await
             .map_err(|e| e.to_string())?
             .flatten();
-            let start = last.map(|d| d + chrono::Duration::days(1)).unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::days(14));
+            let start = last
+                .map(|d| d + chrono::Duration::days(1))
+                .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::days(14));
             (start, start + chrono::Duration::days(14))
         } else {
             let start = chrono::Utc::now();
@@ -443,7 +455,11 @@ async fn seed(st: &AppState, ws: Uuid) -> Result<(), String> {
              VALUES ($1, $2, $3, $4, $5, false, $6, $6, $6) RETURNING id",
         )
         .bind(&p.name)
-        .bind(if p.description_html.is_empty() { "<p></p>" } else { &p.description_html })
+        .bind(if p.description_html.is_empty() {
+            "<p></p>"
+        } else {
+            &p.description_html
+        })
         .bind(&p.description_stripped)
         .bind(p.access)
         .bind(ws)

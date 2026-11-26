@@ -130,10 +130,10 @@ async fn list_notifications(
     if let Some(cursor_str) = q.cursor.as_deref() {
         let parts: Vec<&str> = cursor_str.split(':').collect();
         if parts.len() == 3 {
-            if let Ok(c_limit) = parts[0].parse::<i64>() {
-                if q.per_page.is_none() {
-                    limit = c_limit;
-                }
+            if let Ok(c_limit) = parts[0].parse::<i64>()
+                && q.per_page.is_none()
+            {
+                limit = c_limit;
             }
             if let Ok(c_page) = parts[1].parse::<i64>() {
                 page = c_page;
@@ -726,10 +726,10 @@ async fn list_stickies(
     if let Some(cursor_str) = q.cursor.as_deref() {
         let parts: Vec<&str> = cursor_str.split(':').collect();
         if parts.len() == 3 {
-            if let Ok(c_limit) = parts[0].parse::<i64>() {
-                if q.per_page.is_none() {
-                    limit = c_limit;
-                }
+            if let Ok(c_limit) = parts[0].parse::<i64>()
+                && q.per_page.is_none()
+            {
+                limit = c_limit;
             }
             if let Ok(c_page) = parts[1].parse::<i64>() {
                 page = c_page;
@@ -1218,8 +1218,11 @@ async fn list_recent_visits(
                             'project_identifier', p.identifier
                         )
                         FROM issues i
-                        JOIN projects p ON p.id = i.project_id AND p.deleted_at IS NULL
-                        WHERE i.id = rv.entity_identifier AND i.deleted_at IS NULL
+                        JOIN projects p ON p.id = i.project_id AND p.workspace_id = i.workspace_id AND p.deleted_at IS NULL AND p.archived_at IS NULL
+                        JOIN project_members pm ON pm.project_id = i.project_id AND pm.workspace_id = i.workspace_id
+                             AND pm.member_id = $2 AND pm.is_active AND pm.deleted_at IS NULL
+                        WHERE i.id = rv.entity_identifier AND i.workspace_id = $1 AND i.deleted_at IS NULL
+                          AND (pm.role > 5 OR p.guest_view_all_features OR i.created_by_id = $2)
                     )
                     WHEN rv.entity_name = 'project' THEN (
                         SELECT jsonb_build_object(
@@ -1230,7 +1233,12 @@ async fn list_recent_visits(
                             'project_members', COALESCE((SELECT jsonb_agg(pm.member_id) FROM project_members pm JOIN users u ON u.id = pm.member_id WHERE pm.project_id = p.id AND NOT u.is_bot AND pm.is_active AND pm.deleted_at IS NULL), '[]'::jsonb)
                         )
                         FROM projects p
-                        WHERE p.id = rv.entity_identifier AND p.deleted_at IS NULL
+                        WHERE p.id = rv.entity_identifier AND p.workspace_id = $1 AND p.deleted_at IS NULL AND p.archived_at IS NULL
+                          AND EXISTS (
+                              SELECT 1 FROM project_members pm
+                              WHERE pm.project_id = p.id AND pm.workspace_id = $1
+                                AND pm.member_id = $2 AND pm.is_active AND pm.deleted_at IS NULL
+                          )
                     )
                     WHEN rv.entity_name = 'page' THEN (
                         SELECT jsonb_build_object(
@@ -1242,9 +1250,12 @@ async fn list_recent_visits(
                             'project_identifier', p.identifier
                         )
                         FROM pages pg
-                        LEFT JOIN project_pages pp ON pp.page_id = pg.id AND pp.deleted_at IS NULL
-                        LEFT JOIN projects p ON p.id = pp.project_id AND p.deleted_at IS NULL
-                        WHERE pg.id = rv.entity_identifier AND pg.deleted_at IS NULL
+                        JOIN project_pages pp ON pp.page_id = pg.id AND pp.workspace_id = pg.workspace_id AND pp.deleted_at IS NULL
+                        JOIN projects p ON p.id = pp.project_id AND p.workspace_id = pg.workspace_id AND p.deleted_at IS NULL AND p.archived_at IS NULL
+                        JOIN project_members pm ON pm.project_id = p.id AND pm.workspace_id = pg.workspace_id
+                             AND pm.member_id = $2 AND pm.is_active AND pm.deleted_at IS NULL
+                        WHERE pg.id = rv.entity_identifier AND pg.workspace_id = $1 AND pg.deleted_at IS NULL
+                          AND (pg.owned_by_id = $2 OR (pg.access = 0 AND (pm.role > 5 OR p.guest_view_all_features)))
                         LIMIT 1
                     )
                     ELSE NULL

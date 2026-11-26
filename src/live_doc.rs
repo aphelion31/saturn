@@ -383,7 +383,7 @@ impl html5ever::tokenizer::TokenSink for HtmlSink {
                 }
             }
             TagToken(t) if t.kind == EndTag => {
-                if let Some(pos) = stack.iter().rposition(|n| n.tag == t.name.as_ref()) {
+                if let Some(pos) = stack.iter().rposition(|n| n.tag == *t.name) {
                     while stack.len() > pos && stack.len() > 1 {
                         let n = stack.pop().unwrap();
                         stack.last_mut().unwrap().children.push(n);
@@ -430,6 +430,7 @@ fn insert_nodes<P: XmlFragment>(
     txn: &mut yrs::TransactionMut,
     children: &[HtmlNode],
     marks: &yrs::types::Attrs,
+    lenient: bool,
 ) -> anyhow::Result<()> {
     for child in children {
         if child.tag.is_empty() {
@@ -507,11 +508,20 @@ fn insert_nodes<P: XmlFragment>(
                     }
                 }
                 m.insert(mark.into(), yrs::Any::from_json(&Value::Object(attrs).to_string())?);
-                insert_nodes(parent, txn, &child.children, &m)?;
+                insert_nodes(parent, txn, &child.children, &m, lenient)?;
                 continue;
             }
             "tbody" | "thead" | "tfoot" => {
-                insert_nodes(parent, txn, &child.children, marks)?;
+                insert_nodes(parent, txn, &child.children, marks, lenient)?;
+                continue;
+            }
+            "div" | "section" | "article" | "main" | "header" | "footer" if lenient => {
+                insert_nodes(parent, txn, &child.children, marks, lenient)?;
+                continue;
+            }
+            tag if lenient => {
+                insert_nodes(parent, txn, &child.children, marks, lenient)?;
+                let _ = tag;
                 continue;
             }
             tag => bail!("unsupported HTML element: {tag}"),
@@ -521,19 +531,19 @@ fn insert_nodes<P: XmlFragment>(
             let level = child.tag[1..].parse::<i64>()?;
             el.insert_attribute(txn, "level", level);
         }
-        if matches!(kind, "paragraph" | "heading") {
-            if let Some(style) = child.attrs.get("style") {
-                for declaration in style.split(';') {
-                    if let Some(("text-align", value)) = declaration.trim().split_once(':') {
-                        el.insert_attribute(txn, "textAlign", value.trim().to_string());
-                    }
+        if matches!(kind, "paragraph" | "heading")
+            && let Some(style) = child.attrs.get("style")
+        {
+            for declaration in style.split(';') {
+                if let Some(("text-align", value)) = declaration.trim().split_once(':') {
+                    el.insert_attribute(txn, "textAlign", value.trim().to_string());
                 }
             }
         }
-        if kind == "orderedList" {
-            if let Some(start) = child.attrs.get("start").and_then(|v| v.parse::<i64>().ok()) {
-                el.insert_attribute(txn, "start", start);
-            }
+        if kind == "orderedList"
+            && let Some(start) = child.attrs.get("start").and_then(|v| v.parse::<i64>().ok())
+        {
+            el.insert_attribute(txn, "start", start);
         }
         if kind == "taskItem" {
             el.insert_attribute(
@@ -542,20 +552,19 @@ fn insert_nodes<P: XmlFragment>(
                 child.attrs.get("data-checked").is_some_and(|v| v == "true"),
             );
         }
-        if kind == "codeBlock" {
-            if let Some(language) = child
+        if kind == "codeBlock"
+            && let Some(language) = child
                 .children
                 .first()
                 .and_then(|c| c.attrs.get("class"))
                 .and_then(|s| s.split_whitespace().find_map(|s| s.strip_prefix("language-")))
-            {
-                el.insert_attribute(txn, "language", language.to_string());
-            }
+        {
+            el.insert_attribute(txn, "language", language.to_string());
         }
-        if kind == "imageComponent" {
-            if let Some(v) = child.attrs.get("aspectratio").and_then(|v| v.parse::<f64>().ok()) {
-                el.insert_attribute(txn, "aspectRatio", v);
-            }
+        if kind == "imageComponent"
+            && let Some(v) = child.attrs.get("aspectratio").and_then(|v| v.parse::<f64>().ok())
+        {
+            el.insert_attribute(txn, "aspectRatio", v);
         }
         if matches!(kind, "calloutComponent" | "issue-embed-component") {
             for (k, v) in &child.attrs {
@@ -587,9 +596,9 @@ fn insert_nodes<P: XmlFragment>(
             }
         }
         if kind == "codeBlock" && child.children.len() == 1 && child.children[0].tag == "code" {
-            insert_nodes(&el, txn, &child.children[0].children, marks)?;
+            insert_nodes(&el, txn, &child.children[0].children, marks, lenient)?;
         } else {
-            insert_nodes(&el, txn, &child.children, marks)?;
+            insert_nodes(&el, txn, &child.children, marks, lenient)?;
         }
     }
     Ok(())
@@ -601,7 +610,7 @@ pub fn initialize(html: &str, title: &str) -> anyhow::Result<Vec<u8>> {
     let title_root = doc.get_or_insert_xml_fragment("title");
     {
         let mut txn = doc.transact_mut();
-        insert_nodes(&root, &mut txn, &tree.children, &Default::default())?;
+        insert_nodes(&root, &mut txn, &tree.children, &Default::default(), false)?;
         if root.len(&txn) == 0 {
             root.insert(&mut txn, 0, XmlElementPrelim::empty("paragraph"));
         }
@@ -613,6 +622,23 @@ pub fn initialize(html: &str, title: &str) -> anyhow::Result<Vec<u8>> {
     }
     let state = doc.transact().encode_state_as_update_v1(&StateVector::default());
     Ok(state)
+}
+
+/// Convert HTML into `(description_json, description_binary)` matching Plane's `convertHTMLDocumentToAllFormats`.
+pub fn html_to_all_formats(html: &str, _variant: &str) -> anyhow::Result<(Value, Vec<u8>)> {
+    let tree = html_tree(html);
+    let doc = Doc::new();
+    let root = doc.get_or_insert_xml_fragment("default");
+    {
+        let mut txn = doc.transact_mut();
+        insert_nodes(&root, &mut txn, &tree.children, &Default::default(), true)?;
+        if root.len(&txn) == 0 {
+            root.insert(&mut txn, 0, XmlElementPrelim::empty("paragraph"));
+        }
+    }
+    let state = doc.transact().encode_state_as_update_v1(&StateVector::default());
+    let (_, json, _) = formats(&state)?;
+    Ok((json, state))
 }
 #[cfg(test)]
 mod tests {
@@ -642,6 +668,16 @@ mod tests {
             assert_eq!(a, b);
             assert_eq!(title.as_deref(), Some("Title"));
         }
+    }
+
+    #[test]
+    fn html_to_all_formats_roundtrip() {
+        let (json, bin) = html_to_all_formats("<p>Hello <strong>live</strong></p>", "document").unwrap();
+        assert_eq!(json["type"], "doc");
+        let (decoded_html, decoded_json, decoded_title) = formats(&bin).unwrap();
+        assert!(decoded_html.contains("Hello <strong>live</strong>"));
+        assert_eq!(decoded_json, json);
+        assert_eq!(decoded_title, None);
     }
 }
 

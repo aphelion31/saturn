@@ -47,11 +47,12 @@ async fn upsert(db: &PgPool, v: &Visit<'_>) -> Result<(), sqlx::Error> {
     .await?;
 
     if updated.rows_affected() == 0 {
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM user_recent_visits WHERE user_id = $1 AND workspace_id = $2")
-            .bind(v.user_id)
-            .bind(v.workspace_id)
-            .fetch_one(&mut *tx)
-            .await?;
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM user_recent_visits WHERE user_id = $1 AND workspace_id = $2")
+                .bind(v.user_id)
+                .bind(v.workspace_id)
+                .fetch_one(&mut *tx)
+                .await?;
         if count >= CAP {
             sqlx::query(
                 "DELETE FROM user_recent_visits WHERE id = (

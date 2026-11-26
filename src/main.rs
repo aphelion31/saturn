@@ -25,6 +25,7 @@ mod cycles;
 mod external;
 mod issues;
 mod live_doc;
+mod live_http;
 mod modules;
 mod notifications;
 mod pages;
@@ -39,11 +40,77 @@ mod workspace_seed;
 mod workspaces;
 
 use axum::{
-    Router, middleware,
+    Router,
+    http::{HeaderName, HeaderValue, Method, header},
+    middleware,
     routing::{any, get},
 };
 use common::{AppState, Config};
 use std::sync::Arc;
+use tower_http::cors::{Any, CorsLayer};
+
+fn plane_cors_origins() -> Vec<String> {
+    let explicit: Vec<String> = std::env::var("CORS_ALLOWED_ORIGINS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if !explicit.is_empty() {
+        return explicit;
+    }
+    let mut origins = Vec::new();
+    for var in [
+        "WEB_URL",
+        "APP_BASE_URL",
+        "ADMIN_BASE_URL",
+        "SPACE_BASE_URL",
+        "LIVE_BASE_URL",
+    ] {
+        let Ok(raw) = std::env::var(var) else { continue };
+        let trimmed = raw.trim();
+        let Ok(url) = url::Url::parse(trimmed) else { continue };
+        if let Some(host) = url.host_str() {
+            let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+            let origin = format!("{}://{host}{port}", url.scheme()).to_ascii_lowercase();
+            if !origins.contains(&origin) {
+                origins.push(origin);
+            }
+        }
+    }
+    origins
+}
+
+fn cors_layer() -> CorsLayer {
+    let origins = plane_cors_origins();
+    let methods = [
+        Method::GET,
+        Method::POST,
+        Method::PUT,
+        Method::PATCH,
+        Method::DELETE,
+        Method::OPTIONS,
+    ];
+    let headers = [
+        header::ACCEPT,
+        header::ACCEPT_ENCODING,
+        header::AUTHORIZATION,
+        header::CONTENT_TYPE,
+        header::ORIGIN,
+        header::USER_AGENT,
+        HeaderName::from_static("x-api-key"),
+        HeaderName::from_static("x-csrftoken"),
+        HeaderName::from_static("x-requested-with"),
+    ];
+    let base = CorsLayer::new().allow_methods(methods).allow_headers(headers);
+    let parsed: Vec<HeaderValue> = origins.iter().filter_map(|o| HeaderValue::from_str(o).ok()).collect();
+    if !parsed.is_empty() {
+        base.allow_origin(parsed).allow_credentials(true)
+    } else {
+        base.allow_origin(Any)
+    }
+}
 
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_schema", include_str!("../migrations/0001_schema.sql")),
@@ -79,14 +146,18 @@ pub fn app(state: AppState) -> Router {
         .merge(analytics::routes())
         .merge(user_dash::routes())
         .merge(external::routes())
+        .merge(live_http::routes())
         .route("/api/{*rest}", any(web::api_not_found))
         .route("/auth/{*rest}", any(web::not_implemented))
         .layer(middleware::from_fn_with_state(state.clone(), web::origin_check));
     Router::new()
         .route("/health", get(web::health))
+        .route("/ready", get(web::ready))
+        .route("/robots.txt", get(web::robots_txt))
         .merge(api)
         .merge(web::spa_routes(&state))
         .layer(middleware::from_fn(web::security_headers))
+        .layer(cors_layer())
         .layer(middleware::from_fn(web::peer_header))
         .layer(tower_http::trace::TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
             tracing::info_span!("http", method = %request.method(), path = %request.uri().path())
@@ -172,6 +243,7 @@ async fn main() -> anyhow::Result<()> {
 
     jobs::spawn(state.clone());
 
+    let shutdown_state = state.clone();
     let addr = env("BIND", "0.0.0.0:3000");
     tracing::info!("saturn listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -179,6 +251,32 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await?;
+    pages::flush_all_rooms(&shutdown_state).await;
+    shutdown_state.db.close().await;
+    tracing::info!("saturn shutdown complete");
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            sig.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("shutdown signal received, draining connections");
 }

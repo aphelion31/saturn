@@ -157,14 +157,58 @@ pub fn send_mail_bg(st: &AppState, to: String, subject: String, html: String, te
 }
 
 pub async fn activation_mail(st: &AppState, user_id: uuid::Uuid) {
-    match sqlx::query_as::<_, (String, String)>("SELECT email, COALESCE(NULLIF(first_name,''), NULLIF(display_name,''), email) FROM users WHERE id=$1")
-        .bind(user_id).fetch_optional(&st.db).await {
+    match sqlx::query_as::<_, (String, String)>(
+        "SELECT email, COALESCE(NULLIF(first_name,''), NULLIF(display_name,''), email) FROM users WHERE id=$1",
+    )
+    .bind(user_id)
+    .fetch_optional(&st.db)
+    .await
+    {
         Ok(Some((email, name))) => {
-            let text = format!("Your account has been activated on Plane. {}/profile", st.cfg.web_url.trim_end_matches('/'));
-            send_mail_bg(st, email, format!("{name} has been activated on Plane"), ammonia::clean(&text), text);
+            let text = format!(
+                "Your account has been activated on Plane. {}/profile",
+                st.cfg.web_url.trim_end_matches('/')
+            );
+            send_mail_bg(
+                st,
+                email,
+                format!("{name} has been activated on Plane"),
+                ammonia::clean(&text),
+                text,
+            );
         }
-        Ok(None) => (), Err(e) => tracing::warn!(error=%e, "activation email lookup failed"),
+        Ok(None) => (),
+        Err(e) => tracing::warn!(error=%e, "activation email lookup failed"),
     }
+}
+
+const PROJECT_ADDITION_HTML: &str = include_str!("../assets/email/project_addition.html");
+
+fn esc(v: &str) -> String {
+    v.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
+/// Plane `project_add_user_email` body: `emails/notifications/project_addition.html` plus a plain-text part.
+/// Returns (html, text). Values are HTML-escaped before substitution.
+pub fn project_addition_mail(
+    project: &str,
+    workspace: &str,
+    email: &str,
+    inviter: &str,
+    url: &str,
+) -> (String, String) {
+    let html = PROJECT_ADDITION_HTML
+        .replace("{{project_name}}", &esc(project))
+        .replace("{{workspace_name}}", &esc(workspace))
+        .replace("{{email}}", &esc(email))
+        .replace("{{inviter_first_name}}", &esc(inviter))
+        .replace("{{project_url}}", &esc(url));
+    let text = format!("{inviter} invited you to {project} in {workspace} on Plane. Open the project: {url}",);
+    (html, text)
 }
 
 #[cfg(test)]
@@ -187,25 +231,4 @@ mod tests {
         let t = include_str!("../tools/fixtures/plane_fernet_token.txt").trim();
         assert_eq!(decrypt("plane-secret", t), "plane-value");
     }
-}
-
-const PROJECT_ADDITION_HTML: &str = include_str!("../assets/email/project_addition.html");
-
-fn esc(v: &str) -> String {
-    v.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#x27;")
-}
-
-/// Plane `project_add_user_email` body: `emails/notifications/project_addition.html` plus a plain-text part.
-/// Returns (html, text). Values are HTML-escaped before substitution.
-pub fn project_addition_mail(project: &str, workspace: &str, email: &str, inviter: &str, url: &str) -> (String, String) {
-    let html = PROJECT_ADDITION_HTML
-        .replace("{{project_name}}", &esc(project))
-        .replace("{{workspace_name}}", &esc(workspace))
-        .replace("{{email}}", &esc(email))
-        .replace("{{inviter_first_name}}", &esc(inviter))
-        .replace("{{project_url}}", &esc(url));
-    let text = format!(
-        "{inviter} invited you to {project} in {workspace} on Plane. Open the project: {url}",
-    );
-    (html, text)
 }

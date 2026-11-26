@@ -453,6 +453,7 @@ async fn destroy(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    crate::jobs::spawn_soft_delete_cascade(st.clone(), "cycles", pk);
     crate::webhook_out::emit(&st, p.workspace_id(), "cycle", "deleted", json!({"id": pk}), user.id);
     no_content()
 }
@@ -760,7 +761,7 @@ async fn progress(
          FROM cycle_issues ci
          JOIN issues i ON i.id = ci.issue_id AND i.project_id = $2 AND i.workspace_id = $3 AND i.deleted_at IS NULL AND i.archived_at IS NULL AND NOT i.is_draft
          LEFT JOIN states s ON s.id = i.state_id AND s.project_id = $2 AND s.workspace_id = $3 AND s.deleted_at IS NULL
-         LEFT JOIN LATERAL (SELECT CASE WHEN e.type = 'points' THEN NULLIF(ep.value, '')::float8 END AS v
+         LEFT JOIN LATERAL (SELECT CASE WHEN e.type = 'points' AND ep.value ~ '^ *([0-9]+\\.?[0-9]*|\\.[0-9]+) *$' THEN ep.value::float8 END AS v
             FROM estimate_points ep JOIN estimates e ON e.id = ep.estimate_id
             WHERE ep.id = i.estimate_point_id AND ep.project_id = $2 AND ep.workspace_id = $3 AND ep.deleted_at IS NULL AND e.project_id = $2 AND e.workspace_id = $3 AND e.deleted_at IS NULL) pt ON true
          WHERE ci.cycle_id = $1 AND ci.project_id = $2 AND ci.workspace_id = $3 AND ci.deleted_at IS NULL",
@@ -773,21 +774,279 @@ async fn progress(
     Ok(Json(v))
 }
 
-/// Cycle analytics. ponytail: returns the live distribution with empty charts. Plane's burndown
-/// (`burndown_plot`) and the per-assignee and per-label breakdowns are not ported yet.
+async fn compute_cycle_distribution(
+    conn: &mut sqlx::PgConnection,
+    ws: Uuid,
+    project_id: Uuid,
+    cycle_id: Uuid,
+    start_date: Option<DateTime<Utc>>,
+    end_date: Option<DateTime<Utc>>,
+    analytic_type: &str,
+) -> ApiResult<Value> {
+    let estimate_points: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM projects p JOIN estimates e ON e.id = p.estimate_id
+         WHERE p.id = $1 AND p.workspace_id = $2 AND p.deleted_at IS NULL AND e.deleted_at IS NULL AND e.type = 'points')",
+    )
+    .bind(project_id)
+    .bind(ws)
+    .fetch_one(&mut *conn)
+    .await?;
+
+    let use_points = analytic_type == "points";
+    if use_points && !estimate_points {
+        return Ok(json!({
+            "labels": [],
+            "assignees": [],
+            "completion_chart": {},
+        }));
+    }
+
+    let assignees: Value = if use_points {
+        sqlx::query_scalar(&format!(
+            "SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                'display_name', display_name, 'assignee_id', assignee_id, 'avatar_url', avatar_url,
+                'total_estimates', total_estimates, 'completed_estimates', completed_estimates,
+                'pending_estimates', pending_estimates) ORDER BY display_name NULLS LAST), '[]'::jsonb)
+             FROM (
+                SELECT u.display_name AS display_name, u.id AS assignee_id,
+                    CASE WHEN u.avatar_asset_id IS NOT NULL THEN '/api/assets/v2/static/' || u.avatar_asset_id || '/'
+                         ELSE NULLIF(u.avatar, '') END AS avatar_url,
+                    SUM(CASE WHEN ep.value ~ '^ *([0-9]+\\.?[0-9]*|\\.[0-9]+) *$' THEN ep.value::float8 END) AS total_estimates,
+                    SUM(CASE WHEN ep.value ~ '^ *([0-9]+\\.?[0-9]*|\\.[0-9]+) *$' THEN ep.value::float8 END) FILTER (WHERE i.completed_at IS NOT NULL) AS completed_estimates,
+                    SUM(CASE WHEN ep.value ~ '^ *([0-9]+\\.?[0-9]*|\\.[0-9]+) *$' THEN ep.value::float8 END) FILTER (WHERE i.completed_at IS NULL) AS pending_estimates
+                FROM cycle_issues ci
+                JOIN issues i ON i.id = ci.issue_id AND {ACTIVE}
+                LEFT JOIN estimate_points ep ON ep.id = i.estimate_point_id AND ep.deleted_at IS NULL
+                LEFT JOIN issue_assignees ia ON ia.issue_id = i.id AND ia.deleted_at IS NULL
+                LEFT JOIN users u ON u.id = ia.assignee_id
+                WHERE ci.cycle_id = $1 AND ci.project_id = $2 AND ci.workspace_id = $3 AND ci.deleted_at IS NULL
+                GROUP BY u.display_name, u.id, u.avatar_asset_id, u.avatar
+             ) sub"
+        ))
+        .bind(cycle_id)
+        .bind(project_id)
+        .bind(ws)
+        .fetch_one(&mut *conn)
+        .await?
+    } else {
+        sqlx::query_scalar(&format!(
+            "SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                'display_name', display_name, 'assignee_id', assignee_id, 'avatar_url', avatar_url,
+                'total_issues', total_issues, 'completed_issues', completed_issues,
+                'pending_issues', pending_issues) ORDER BY display_name NULLS LAST), '[]'::jsonb)
+             FROM (
+                SELECT u.display_name AS display_name, u.id AS assignee_id,
+                    CASE WHEN u.avatar_asset_id IS NOT NULL THEN '/api/assets/v2/static/' || u.avatar_asset_id || '/'
+                         ELSE NULLIF(u.avatar, '') END AS avatar_url,
+                    COUNT(ia.assignee_id) AS total_issues,
+                    COUNT(ia.assignee_id) FILTER (WHERE i.completed_at IS NOT NULL) AS completed_issues,
+                    COUNT(ia.assignee_id) FILTER (WHERE i.completed_at IS NULL) AS pending_issues
+                FROM cycle_issues ci
+                JOIN issues i ON i.id = ci.issue_id AND {ACTIVE}
+                LEFT JOIN issue_assignees ia ON ia.issue_id = i.id AND ia.deleted_at IS NULL
+                LEFT JOIN users u ON u.id = ia.assignee_id
+                WHERE ci.cycle_id = $1 AND ci.project_id = $2 AND ci.workspace_id = $3 AND ci.deleted_at IS NULL
+                GROUP BY u.display_name, u.id, u.avatar_asset_id, u.avatar
+             ) sub"
+        ))
+        .bind(cycle_id)
+        .bind(project_id)
+        .bind(ws)
+        .fetch_one(&mut *conn)
+        .await?
+    };
+
+    let labels: Value = if use_points {
+        sqlx::query_scalar(&format!(
+            "SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                'label_name', label_name, 'color', color, 'label_id', label_id,
+                'total_estimates', total_estimates, 'completed_estimates', completed_estimates,
+                'pending_estimates', pending_estimates) ORDER BY label_name NULLS LAST), '[]'::jsonb)
+             FROM (
+                SELECT l.name AS label_name, l.color AS color, l.id AS label_id,
+                    SUM(CASE WHEN ep.value ~ '^ *([0-9]+\\.?[0-9]*|\\.[0-9]+) *$' THEN ep.value::float8 END) AS total_estimates,
+                    SUM(CASE WHEN ep.value ~ '^ *([0-9]+\\.?[0-9]*|\\.[0-9]+) *$' THEN ep.value::float8 END) FILTER (WHERE i.completed_at IS NOT NULL) AS completed_estimates,
+                    SUM(CASE WHEN ep.value ~ '^ *([0-9]+\\.?[0-9]*|\\.[0-9]+) *$' THEN ep.value::float8 END) FILTER (WHERE i.completed_at IS NULL) AS pending_estimates
+                FROM cycle_issues ci
+                JOIN issues i ON i.id = ci.issue_id AND {ACTIVE}
+                LEFT JOIN estimate_points ep ON ep.id = i.estimate_point_id AND ep.deleted_at IS NULL
+                LEFT JOIN issue_labels il ON il.issue_id = i.id AND il.deleted_at IS NULL
+                LEFT JOIN labels l ON l.id = il.label_id AND l.deleted_at IS NULL
+                WHERE ci.cycle_id = $1 AND ci.project_id = $2 AND ci.workspace_id = $3 AND ci.deleted_at IS NULL
+                GROUP BY l.name, l.color, l.id
+             ) sub"
+        ))
+        .bind(cycle_id)
+        .bind(project_id)
+        .bind(ws)
+        .fetch_one(&mut *conn)
+        .await?
+    } else {
+        sqlx::query_scalar(&format!(
+            "SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                'label_name', label_name, 'color', color, 'label_id', label_id,
+                'total_issues', total_issues, 'completed_issues', completed_issues,
+                'pending_issues', pending_issues) ORDER BY label_name NULLS LAST), '[]'::jsonb)
+             FROM (
+                SELECT l.name AS label_name, l.color AS color, l.id AS label_id,
+                    COUNT(il.label_id) AS total_issues,
+                    COUNT(il.label_id) FILTER (WHERE i.completed_at IS NOT NULL) AS completed_issues,
+                    COUNT(il.label_id) FILTER (WHERE i.completed_at IS NULL) AS pending_issues
+                FROM cycle_issues ci
+                JOIN issues i ON i.id = ci.issue_id AND {ACTIVE}
+                LEFT JOIN issue_labels il ON il.issue_id = i.id AND il.deleted_at IS NULL
+                LEFT JOIN labels l ON l.id = il.label_id AND l.deleted_at IS NULL
+                WHERE ci.cycle_id = $1 AND ci.project_id = $2 AND ci.workspace_id = $3 AND ci.deleted_at IS NULL
+                GROUP BY l.name, l.color, l.id
+             ) sub"
+        ))
+        .bind(cycle_id)
+        .bind(project_id)
+        .bind(ws)
+        .fetch_one(&mut *conn)
+        .await?
+    };
+
+    let mut completion_chart = serde_json::Map::new();
+    if let (Some(sd), Some(ed)) = (start_date, end_date) {
+        let start_d = sd.date_naive();
+        let end_d = ed.date_naive();
+        let today = Utc::now().date_naive();
+        let total_days = (end_d - start_d).num_days().clamp(-1, 3660);
+
+        if use_points {
+            let total_pts: f64 = sqlx::query_scalar(&format!(
+                "SELECT COALESCE(SUM(CASE WHEN ep.value ~ '^ *([0-9]+\\.?[0-9]*|\\.[0-9]+) *$' THEN ep.value::float8 END), 0)::float8
+                 FROM cycle_issues ci
+                 JOIN issues i ON i.id = ci.issue_id AND {ACTIVE}
+                 JOIN estimate_points ep ON ep.id = i.estimate_point_id AND ep.deleted_at IS NULL
+                 WHERE ci.cycle_id = $1 AND ci.project_id = $2 AND ci.workspace_id = $3 AND ci.deleted_at IS NULL"
+            ))
+            .bind(cycle_id)
+            .bind(project_id)
+            .bind(ws)
+            .fetch_one(&mut *conn)
+            .await?;
+
+            let completed: Vec<(NaiveDate, f64)> = sqlx::query_as(&format!(
+                "SELECT (i.completed_at AT TIME ZONE 'UTC')::date AS d, COALESCE(SUM(CASE WHEN ep.value ~ '^ *([0-9]+\\.?[0-9]*|\\.[0-9]+) *$' THEN ep.value::float8 END), 0)::float8
+                 FROM cycle_issues ci
+                 JOIN issues i ON i.id = ci.issue_id AND {ACTIVE}
+                 JOIN estimate_points ep ON ep.id = i.estimate_point_id AND ep.deleted_at IS NULL
+                 WHERE ci.cycle_id = $1 AND ci.project_id = $2 AND ci.workspace_id = $3 AND ci.deleted_at IS NULL
+                   AND i.completed_at IS NOT NULL
+                 GROUP BY 1 ORDER BY 1"
+            ))
+            .bind(cycle_id)
+            .bind(project_id)
+            .bind(ws)
+            .fetch_all(&mut *conn)
+            .await?;
+
+            for offset in 0..=total_days {
+                let d = start_d + chrono::Duration::days(offset);
+                let val = if d > today {
+                    Value::Null
+                } else {
+                    let done: f64 = completed.iter().filter(|(cd, _)| *cd <= d).map(|(_, v)| *v).sum();
+                    json!(total_pts - done)
+                };
+                completion_chart.insert(d.to_string(), val);
+            }
+        } else {
+            let total_issues: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM cycle_issues ci
+                 JOIN issues i ON i.id = ci.issue_id AND {ACTIVE}
+                 WHERE ci.cycle_id = $1 AND ci.project_id = $2 AND ci.workspace_id = $3 AND ci.deleted_at IS NULL"
+            ))
+            .bind(cycle_id)
+            .bind(project_id)
+            .bind(ws)
+            .fetch_one(&mut *conn)
+            .await?;
+
+            let completed: Vec<(NaiveDate, i64)> = sqlx::query_as(&format!(
+                "SELECT (i.completed_at AT TIME ZONE 'UTC')::date AS d, COUNT(*)
+                 FROM cycle_issues ci
+                 JOIN issues i ON i.id = ci.issue_id AND {ACTIVE}
+                 WHERE ci.cycle_id = $1 AND ci.project_id = $2 AND ci.workspace_id = $3 AND ci.deleted_at IS NULL
+                   AND i.completed_at IS NOT NULL
+                 GROUP BY 1 ORDER BY 1"
+            ))
+            .bind(cycle_id)
+            .bind(project_id)
+            .bind(ws)
+            .fetch_all(&mut *conn)
+            .await?;
+
+            for offset in 0..=total_days {
+                let d = start_d + chrono::Duration::days(offset);
+                let val = if d > today {
+                    Value::Null
+                } else {
+                    let done: i64 = completed.iter().filter(|(cd, _)| *cd <= d).map(|(_, v)| *v).sum();
+                    json!(total_issues - done)
+                };
+                completion_chart.insert(d.to_string(), val);
+            }
+        }
+    }
+
+    Ok(json!({
+        "assignees": assignees,
+        "labels": labels,
+        "completion_chart": Value::Object(completion_chart),
+    }))
+}
+
+type CycleWindowRow = (Option<DateTime<Utc>>, Option<DateTime<Utc>>, Value);
+type CycleDatesRow = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+
+/// Cycle analytics (`GET .../cycles/{pk}/analytics/?type=issues|points`): returns `progress_snapshot`
+/// distribution when present (transferred cycles) or live assignee/label distributions and burndown chart.
 async fn analytics(
     State(st): State<AppState>,
     user: CurrentUser,
     Path((slug, project_id, pk)): Path<(String, Uuid, Uuid)>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER, GUEST])?;
-    cycle_end(&st.db, p.workspace_id(), project_id, pk).await?;
-    Ok(Json(json!({
-        "labels": [],
-        "assignees": [],
-        "completion_chart": {},
-    })))
+    let row: Option<CycleWindowRow> = sqlx::query_as(
+        "SELECT c.start_date, c.end_date, COALESCE(c.progress_snapshot, '{}'::jsonb)
+         FROM cycles c
+         WHERE c.id = $1 AND c.project_id = $2 AND c.workspace_id = $3 AND c.deleted_at IS NULL",
+    )
+    .bind(pk)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?;
+    let (start_date, end_date, snapshot) = row.ok_or_else(cycle_not_found)?;
+    if start_date.is_none() || end_date.is_none() {
+        return Err(ApiError::bad("Cycle has no start or end date"));
+    }
+    if snapshot.as_object().is_some_and(|m| !m.is_empty()) {
+        let dist = snapshot.get("distribution").cloned().unwrap_or_else(|| json!({}));
+        return Ok(Json(json!({
+            "labels": dist.get("labels").cloned().unwrap_or_else(|| json!([])),
+            "assignees": dist.get("assignees").cloned().unwrap_or_else(|| json!([])),
+            "completion_chart": dist.get("completion_chart").cloned().unwrap_or_else(|| json!({})),
+        })));
+    }
+    let analytic_type = q.get("type").map(String::as_str).unwrap_or("issues");
+    let mut conn = st.db.acquire().await?;
+    let dist = compute_cycle_distribution(
+        &mut conn,
+        p.workspace_id(),
+        project_id,
+        pk,
+        start_date,
+        end_date,
+        analytic_type,
+    )
+    .await?;
+    Ok(Json(dist))
 }
 
 /// Cycle must exist, not be deleted, in this project. Returns its end date.
@@ -988,9 +1247,7 @@ async fn ci_destroy(
 }
 
 /// Move incomplete work items (backlog, unstarted, started) to another cycle.
-/// Stores the source cycle counts in `progress_snapshot` first, like Plane.
-/// ponytail: `distribution` (assignee, label and completion chart data) is not written; the analytics
-/// endpoint returns empty charts for transferred cycles. Add when the analytics UI needs it.
+/// Stores the source cycle counts and distribution in `progress_snapshot` first, like Plane.
 async fn transfer(
     State(st): State<AppState>,
     user: CurrentUser,
@@ -1010,9 +1267,17 @@ async fn transfer(
             "The cycle where the issues are transferred is already completed",
         ));
     }
-    if cycle_end(&st.db, p.workspace_id(), project_id, cycle_id).await.is_err() {
+    let src_dates: Option<CycleDatesRow> = sqlx::query_as(
+        "SELECT start_date, end_date FROM cycles WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL",
+    )
+    .bind(cycle_id)
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .fetch_optional(&st.db)
+    .await?;
+    let Some((src_start, src_end)) = src_dates else {
         return Err(ApiError::bad("Source cycle not found"));
-    }
+    };
     let mut tx = st.db.begin().await?;
     // (total, completed, cancelled, started, unstarted, backlog)
     let c: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(&format!(
@@ -1028,21 +1293,53 @@ async fn transfer(
     .bind(p.workspace_id())
     .fetch_one(&mut *tx)
     .await?;
-    sqlx::query(
-        "UPDATE cycles SET progress_snapshot = jsonb_build_object('total_issues', $2::bigint,
-            'completed_issues', $3::bigint, 'cancelled_issues', $4::bigint, 'started_issues', $5::bigint,
-            'unstarted_issues', $6::bigint, 'backlog_issues', $7::bigint)
-         WHERE id = $1",
+    let distribution = compute_cycle_distribution(
+        &mut tx,
+        p.workspace_id(),
+        project_id,
+        cycle_id,
+        src_start,
+        src_end,
+        "issues",
     )
-    .bind(cycle_id)
-    .bind(c.0)
-    .bind(c.1)
-    .bind(c.2)
-    .bind(c.3)
-    .bind(c.4)
-    .bind(c.5)
-    .execute(&mut *tx)
     .await?;
+    let has_points: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM projects p JOIN estimates e ON e.id = p.estimate_id
+         WHERE p.id = $1 AND p.workspace_id = $2 AND p.deleted_at IS NULL AND e.deleted_at IS NULL AND e.type = 'points')",
+    )
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .fetch_one(&mut *tx)
+    .await?;
+    let estimate_distribution = if has_points {
+        compute_cycle_distribution(
+            &mut tx,
+            p.workspace_id(),
+            project_id,
+            cycle_id,
+            src_start,
+            src_end,
+            "points",
+        )
+        .await?
+    } else {
+        json!({})
+    };
+    let snapshot = json!({
+        "total_issues": c.0,
+        "completed_issues": c.1,
+        "cancelled_issues": c.2,
+        "started_issues": c.3,
+        "unstarted_issues": c.4,
+        "backlog_issues": c.5,
+        "distribution": distribution,
+        "estimate_distribution": estimate_distribution,
+    });
+    sqlx::query("UPDATE cycles SET progress_snapshot = $2 WHERE id = $1")
+        .bind(cycle_id)
+        .bind(snapshot)
+        .execute(&mut *tx)
+        .await?;
     let moved: Vec<Uuid> = sqlx::query_scalar(&format!(
         "UPDATE cycle_issues ci SET cycle_id = $1, updated_by_id = $2, updated_at = now()
          WHERE ci.cycle_id = $3 AND ci.project_id = $4 AND ci.workspace_id = $5 AND ci.deleted_at IS NULL

@@ -14,15 +14,16 @@ use uuid::Uuid;
 const DEFAULT_FAVICON: &str = "PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJsdWNpZGUgbHVjaWRlLWxpbmstaWNvbiBsdWNpZGUtbGluayI+PHBhdGggZD0iTTEwIDEzYTUgNSAwIDAgMCA3LjU0LjU0bDMtM2E1IDUgMCAwIDAtNy4wNy03LjA3bC0xLjcyIDEuNzEiLz48cGF0aCBkPSJNMTQgMTFhNSA1IDAgMCAwLTcuNTQtLjU0bC0zIDNhNSA1IDAgMCAwIDcuMDcgNy4wN2wxLjcxLTEuNzEiLz48L3N2Zz4=";
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36";
 const MAX_REDIRECTS: usize = 5;
-const MAX_HTML_BYTES: usize = 2 * 1024 * 1024;
-const MAX_FAVICON_BYTES: usize = 512 * 1024;
+const MAX_HTML_BYTES: usize = 1024 * 1024;
+const MAX_FAVICON_BYTES: usize = 100 * 1024;
 const CRAWL_TIMEOUT: Duration = Duration::from_secs(5);
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn pinned_request(
     method: reqwest::Method,
     raw_url: &str,
     max_bytes: usize,
-) -> Result<(u16, Option<String>, Vec<u8>, String), String> {
+) -> Result<(u16, Option<String>, Vec<u8>, bool, String), String> {
     let mut current = raw_url.to_string();
     for _ in 0..=MAX_REDIRECTS {
         let client = crate::webhook_out::pinned_client(&current, CRAWL_TIMEOUT).await?;
@@ -34,7 +35,11 @@ async fn pinned_request(
             .map_err(|e| e.to_string())?;
         let status = resp.status();
         if status.is_redirection() {
-            let Some(loc) = resp.headers().get(reqwest::header::LOCATION).and_then(|v| v.to_str().ok()) else {
+            let Some(loc) = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+            else {
                 return Err("redirect missing location".into());
             };
             let base = url::Url::parse(&current).map_err(|e| e.to_string())?;
@@ -47,15 +52,12 @@ async fn pinned_request(
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-        let mut body = Vec::new();
-        while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
-            let take = chunk.len().min(max_bytes.saturating_sub(body.len()));
-            body.extend_from_slice(&chunk[..take]);
-            if body.len() >= max_bytes {
-                break;
-            }
-        }
-        return Ok((status.as_u16(), content_type, body, current));
+        let (body, truncated) = if max_bytes == 0 {
+            (Vec::new(), false)
+        } else {
+            crate::webhook_out::read_capped_body(&mut resp, max_bytes, BODY_READ_TIMEOUT).await
+        };
+        return Ok((status.as_u16(), content_type, body, truncated, current));
     }
     Err("too many redirects".into())
 }
@@ -75,9 +77,9 @@ fn decode_html_entities(s: &str) -> String {
                 "quot" => Some('"'),
                 "apos" | "#39" => Some('\''),
                 "nbsp" => Some(' '),
-                _ if entity.starts_with("#x") || entity.starts_with("#X") => u32::from_str_radix(&entity[2..], 16)
-                    .ok()
-                    .and_then(char::from_u32),
+                _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+                    u32::from_str_radix(&entity[2..], 16).ok().and_then(char::from_u32)
+                }
                 _ if entity.starts_with('#') => entity[1..].parse::<u32>().ok().and_then(char::from_u32),
                 _ => None,
             };
@@ -108,53 +110,62 @@ fn parse_title_and_icons(html: &str) -> (Option<String>, Vec<(String, String)>) 
         };
         let pos = i + rel_lt;
         if lower[pos..].starts_with("<!--") {
-            i = lower[pos + 4..].find("-->").map_or(bytes.len(), |end| pos + 4 + end + 3);
+            i = lower[pos + 4..]
+                .find("-->")
+                .map_or(bytes.len(), |end| pos + 4 + end + 3);
             continue;
         }
         if lower[pos..].starts_with("<script") {
-            i = lower[pos + 7..].find("</script").map_or(bytes.len(), |end| pos + 7 + end + 8);
+            i = lower[pos + 7..]
+                .find("</script")
+                .map_or(bytes.len(), |end| pos + 7 + end + 8);
             continue;
         }
         if lower[pos..].starts_with("<style") {
-            i = lower[pos + 6..].find("</style").map_or(bytes.len(), |end| pos + 6 + end + 7);
+            i = lower[pos + 6..]
+                .find("</style")
+                .map_or(bytes.len(), |end| pos + 6 + end + 7);
             continue;
         }
 
-        if title.is_none() && lower[pos..].starts_with("<title") && matches!(bytes.get(pos + 6), Some(b'>' | b' ' | b'\t' | b'\r' | b'\n')) {
-            if let Some(gt) = html[pos..].find('>') {
-                let start = pos + gt + 1;
-                if let Some(end_rel) = lower[start..].find("</title") {
-                    let raw = decode_html_entities(&html[start..start + end_rel]);
-                    let trimmed = raw.trim();
-                    if !trimmed.is_empty() {
-                        title = Some(trimmed.to_string());
-                    }
-                    i = start + end_rel + 8;
-                    continue;
+        if title.is_none()
+            && lower[pos..].starts_with("<title")
+            && matches!(bytes.get(pos + 6), Some(b'>' | b' ' | b'\t' | b'\r' | b'\n'))
+            && let Some(gt) = html[pos..].find('>')
+        {
+            let start = pos + gt + 1;
+            if let Some(end_rel) = lower[start..].find("</title") {
+                let raw = decode_html_entities(&html[start..start + end_rel]);
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() {
+                    title = Some(trimmed.to_string());
                 }
+                i = start + end_rel + 8;
+                continue;
             }
         }
 
-        if lower[pos..].starts_with("<link") && matches!(bytes.get(pos + 5), Some(b' ' | b'\t' | b'\r' | b'\n' | b'/' | b'>')) {
-            if let Some(gt) = find_tag_end(html, pos) {
-                let attrs = parse_tag_attrs(&html[pos + 5..gt]);
-                let mut rel_val = None;
-                let mut href_val = None;
-                for (k, v) in attrs {
-                    if k.eq_ignore_ascii_case("rel") {
-                        rel_val = Some(v.trim().to_ascii_lowercase());
-                    } else if k.eq_ignore_ascii_case("href") {
-                        href_val = Some(decode_html_entities(v.trim()));
-                    }
+        if lower[pos..].starts_with("<link")
+            && matches!(bytes.get(pos + 5), Some(b' ' | b'\t' | b'\r' | b'\n' | b'/' | b'>'))
+            && let Some(gt) = find_tag_end(html, pos)
+        {
+            let attrs = parse_tag_attrs(&html[pos + 5..gt]);
+            let mut rel_val = None;
+            let mut href_val = None;
+            for (k, v) in attrs {
+                if k.eq_ignore_ascii_case("rel") {
+                    rel_val = Some(v.trim().to_ascii_lowercase());
+                } else if k.eq_ignore_ascii_case("href") {
+                    href_val = Some(decode_html_entities(v.trim()));
                 }
-                if let (Some(r), Some(h)) = (rel_val, href_val) {
-                    if !h.is_empty() {
-                        links.push((r, h));
-                    }
-                }
-                i = gt + 1;
-                continue;
             }
+            if let (Some(r), Some(h)) = (rel_val, href_val)
+                && !h.is_empty()
+            {
+                links.push((r, h));
+            }
+            i = gt + 1;
+            continue;
         }
 
         i = pos + 1;
@@ -234,13 +245,21 @@ fn parse_tag_attrs(raw: &str) -> Vec<(String, String)> {
 
 async fn find_favicon_url(links: &[(String, String)], base_url: &str) -> Option<String> {
     let base = url::Url::parse(base_url).ok()?;
-    for rel in ["icon", "shortcut icon", "apple-touch-icon", "apple-touch-icon-precomposed"] {
-        if let Some((_, href)) = links.iter().find(|(r, _)| r == rel) {
-            if let Ok(joined) = base.join(href) {
-                let candidate = joined.to_string();
-                if crate::webhook_out::pinned_client(&candidate, CRAWL_TIMEOUT).await.is_ok() {
-                    return Some(candidate);
-                }
+    for rel in [
+        "icon",
+        "shortcut icon",
+        "apple-touch-icon",
+        "apple-touch-icon-precomposed",
+    ] {
+        if let Some((_, href)) = links.iter().find(|(r, _)| r == rel)
+            && let Ok(joined) = base.join(href)
+        {
+            let candidate = joined.to_string();
+            if crate::webhook_out::pinned_client(&candidate, CRAWL_TIMEOUT)
+                .await
+                .is_ok()
+            {
+                return Some(candidate);
             }
         }
     }
@@ -250,10 +269,10 @@ async fn find_favicon_url(links: &[(String, String)], base_url: &str) -> Option<
         base.host_str()?,
         base.port().map(|p| format!(":{p}")).unwrap_or_default()
     );
-    if let Ok((status, _, _, _)) = pinned_request(reqwest::Method::HEAD, &fallback, 0).await {
-        if status == 200 {
-            return Some(fallback);
-        }
+    if let Ok((status, _, _, _, _)) = pinned_request(reqwest::Method::HEAD, &fallback, 0).await
+        && status == 200
+    {
+        return Some(fallback);
     }
     None
 }
@@ -265,7 +284,7 @@ async fn crawl_link_metadata(url: &str) -> Value {
     let mut final_url = url.to_string();
 
     match pinned_request(reqwest::Method::GET, url, MAX_HTML_BYTES).await {
-        Ok((_status, _ct, body, resolved_url)) => {
+        Ok((_status, _ct, body, _truncated, resolved_url)) => {
             final_url = resolved_url;
             let html = String::from_utf8_lossy(&body);
             let (t, l) = parse_title_and_icons(&html);
@@ -279,14 +298,16 @@ async fn crawl_link_metadata(url: &str) -> Value {
 
     let mut favicon_url: Option<String> = None;
     let mut favicon_data = default_favicon;
-    if let Some(fav_url) = find_favicon_url(&links, &final_url).await {
-        if let Ok((status, ct, bytes, _)) = pinned_request(reqwest::Method::GET, &fav_url, MAX_FAVICON_BYTES).await {
-            if status == 200 && !bytes.is_empty() {
-                let content_type = ct.unwrap_or_else(|| "image/x-icon".into());
-                favicon_data = format!("data:{content_type};base64,{}", STANDARD.encode(&bytes));
-                favicon_url = Some(fav_url);
-            }
-        }
+    if let Some(fav_url) = find_favicon_url(&links, &final_url).await
+        && let Ok((status, ct, bytes, truncated, _)) =
+            pinned_request(reqwest::Method::GET, &fav_url, MAX_FAVICON_BYTES).await
+        && !truncated
+        && status == 200
+        && !bytes.is_empty()
+    {
+        let content_type = ct.unwrap_or_else(|| "image/x-icon".into());
+        favicon_data = format!("data:{content_type};base64,{}", STANDARD.encode(&bytes));
+        favicon_url = Some(fav_url);
     }
 
     json!({
@@ -319,19 +340,18 @@ pub fn spawn_crawl_work_item_link_title(st: AppState, workspace_id: Uuid, link_i
 /// Port of Plane's `get_asset_object_metadata`.
 pub fn spawn_asset_storage_metadata(st: AppState, asset_id: Uuid) {
     tokio::spawn(async move {
-        let row: Option<(String, Value)> = match sqlx::query_as(
-            "SELECT asset, attributes FROM file_assets WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(asset_id)
-        .fetch_optional(&st.db)
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(%asset_id, error = %e, "storage metadata lookup failed");
-                return;
-            }
-        };
+        let row: Option<(String, Value)> =
+            match sqlx::query_as("SELECT asset, attributes FROM file_assets WHERE id = $1 AND deleted_at IS NULL")
+                .bind(asset_id)
+                .fetch_optional(&st.db)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(%asset_id, error = %e, "storage metadata lookup failed");
+                    return;
+                }
+            };
         let Some((key, attrs)) = row else {
             return;
         };
@@ -382,18 +402,18 @@ fn extract_image_component_asset_ids(html: &str) -> Vec<Uuid> {
             break;
         };
         let pos = i + rel;
-        if matches!(bytes.get(pos + 16), Some(b' ' | b'\t' | b'\r' | b'\n' | b'/' | b'>')) {
-            if let Some(gt) = find_tag_end(html, pos) {
-                for (k, v) in parse_tag_attrs(&html[pos + 16..gt]) {
-                    if k.eq_ignore_ascii_case("src") {
-                        if let Ok(uid) = Uuid::parse_str(v.trim()) {
-                            ids.push(uid);
-                        }
-                    }
+        if matches!(bytes.get(pos + 16), Some(b' ' | b'\t' | b'\r' | b'\n' | b'/' | b'>'))
+            && let Some(gt) = find_tag_end(html, pos)
+        {
+            for (k, v) in parse_tag_attrs(&html[pos + 16..gt]) {
+                if k.eq_ignore_ascii_case("src")
+                    && let Ok(uid) = Uuid::parse_str(v.trim())
+                {
+                    ids.push(uid);
                 }
-                i = gt + 1;
-                continue;
             }
+            i = gt + 1;
+            continue;
         }
         i = pos + 1;
     }
@@ -415,24 +435,24 @@ fn replace_image_component_srcs(html: &str, replacements: &[(String, String)]) -
             break;
         };
         let pos = i + rel;
-        if matches!(bytes.get(pos + 16), Some(b' ' | b'\t' | b'\r' | b'\n' | b'/' | b'>')) {
-            if let Some(gt) = find_tag_end(html, pos) {
-                let mut tag_slice = html[pos..=gt].to_string();
-                for (old_id, new_id) in replacements {
-                    for quote in ['"', '\''] {
-                        let pat = format!("src={quote}{old_id}{quote}");
-                        if tag_slice.contains(&pat) {
-                            let rep = format!("src={quote}{new_id}{quote}");
-                            tag_slice = tag_slice.replace(&pat, &rep);
-                        }
+        if matches!(bytes.get(pos + 16), Some(b' ' | b'\t' | b'\r' | b'\n' | b'/' | b'>'))
+            && let Some(gt) = find_tag_end(html, pos)
+        {
+            let mut tag_slice = html[pos..=gt].to_string();
+            for (old_id, new_id) in replacements {
+                for quote in ['"', '\''] {
+                    let pat = format!("src={quote}{old_id}{quote}");
+                    if tag_slice.contains(&pat) {
+                        let rep = format!("src={quote}{new_id}{quote}");
+                        tag_slice = tag_slice.replace(&pat, &rep);
                     }
                 }
-                out.push_str(&html[last..pos]);
-                out.push_str(&tag_slice);
-                last = gt + 1;
-                i = gt + 1;
-                continue;
             }
+            out.push_str(&html[last..pos]);
+            out.push_str(&tag_slice);
+            last = gt + 1;
+            i = gt + 1;
+            continue;
         }
         i = pos + 1;
     }
@@ -454,13 +474,7 @@ struct AssetRow {
 /// Note: Plane calls the Node live server `/convert-document` to regenerate `description_binary` and
 /// `description_json`. Saturn has no Node runtime, so `description_binary` is cleared to `NULL` and
 /// the frontend rebuilds the Yjs document from `description_html`.
-pub fn spawn_copy_page_assets(
-    st: AppState,
-    workspace_id: Uuid,
-    project_id: Uuid,
-    page_id: Uuid,
-    user_id: Uuid,
-) {
+pub fn spawn_copy_page_assets(st: AppState, workspace_id: Uuid, project_id: Uuid, page_id: Uuid, user_id: Uuid) {
     tokio::spawn(async move {
         let html: Option<String> = match sqlx::query_scalar(
             "SELECT description_html FROM pages WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
@@ -600,40 +614,39 @@ fn extract_page_components(html: &str) -> Vec<ExtractedComponent> {
             let len = tag_prefix.len();
             if lower[pos..].starts_with(tag_prefix)
                 && matches!(bytes.get(pos + len), Some(b' ' | b'\t' | b'\r' | b'\n' | b'/' | b'>'))
+                && let Some(gt) = find_tag_end(html, pos)
             {
-                if let Some(gt) = find_tag_end(html, pos) {
-                    let attrs: HashMap<String, String> = parse_tag_attrs(&html[pos + len..gt])
-                        .into_iter()
-                        .map(|(k, v)| (k.to_ascii_lowercase(), v))
-                        .collect();
-                    if let Some(tx_id) = attrs.get("id").and_then(|v| Uuid::parse_str(v.trim()).ok()) {
-                        let (entity_identifier, entity_name) = if is_image {
-                            (
-                                attrs.get("src").and_then(|v| Uuid::parse_str(v.trim()).ok()),
-                                "image".to_string(),
-                            )
-                        } else {
-                            let name: String = attrs
-                                .get("entity_name")
-                                .map(|s| s.trim().chars().take(30).collect())
-                                .unwrap_or_default();
-                            (
-                                attrs
-                                    .get("entity_identifier")
-                                    .and_then(|v| Uuid::parse_str(v.trim()).ok()),
-                                name,
-                            )
-                        };
-                        out.push(ExtractedComponent {
-                            transaction_id: tx_id,
-                            entity_identifier,
-                            entity_name,
-                            entity_type: None,
-                        });
-                    }
-                    i = gt + 1;
-                    break;
+                let attrs: HashMap<String, String> = parse_tag_attrs(&html[pos + len..gt])
+                    .into_iter()
+                    .map(|(k, v)| (k.to_ascii_lowercase(), v))
+                    .collect();
+                if let Some(tx_id) = attrs.get("id").and_then(|v| Uuid::parse_str(v.trim()).ok()) {
+                    let (entity_identifier, entity_name) = if is_image {
+                        (
+                            attrs.get("src").and_then(|v| Uuid::parse_str(v.trim()).ok()),
+                            "image".to_string(),
+                        )
+                    } else {
+                        let name: String = attrs
+                            .get("entity_name")
+                            .map(|s| s.trim().chars().take(30).collect())
+                            .unwrap_or_default();
+                        (
+                            attrs
+                                .get("entity_identifier")
+                                .and_then(|v| Uuid::parse_str(v.trim()).ok()),
+                            name,
+                        )
+                    };
+                    out.push(ExtractedComponent {
+                        transaction_id: tx_id,
+                        entity_identifier,
+                        entity_name,
+                        entity_type: None,
+                    });
                 }
+                i = gt + 1;
+                break;
             }
         }
         if i <= pos {
@@ -670,14 +683,13 @@ pub fn spawn_page_transaction(
             return;
         }
 
-        let has_existing_logs: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM page_logs WHERE page_id = $1 AND workspace_id = $2)",
-        )
-        .bind(page_id)
-        .bind(workspace_id)
-        .fetch_one(&st.db)
-        .await
-        .unwrap_or(false);
+        let has_existing_logs: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM page_logs WHERE page_id = $1 AND workspace_id = $2)")
+                .bind(page_id)
+                .bind(workspace_id)
+                .fetch_one(&st.db)
+                .await
+                .unwrap_or(false);
 
         let old_components = old_description_html
             .as_deref()
@@ -714,18 +726,16 @@ pub fn spawn_page_transaction(
             }
         }
 
-        if !deleted_ids.is_empty() {
-            if let Err(e) = sqlx::query(
-                "DELETE FROM page_logs WHERE page_id = $1 AND workspace_id = $2 AND transaction = ANY($3)",
-            )
-            .bind(page_id)
-            .bind(workspace_id)
-            .bind(&deleted_ids)
-            .execute(&st.db)
-            .await
-            {
-                tracing::warn!(%page_id, error = %e, "page_logs delete failed");
-            }
+        if !deleted_ids.is_empty()
+            && let Err(e) =
+                sqlx::query("DELETE FROM page_logs WHERE page_id = $1 AND workspace_id = $2 AND transaction = ANY($3)")
+                    .bind(page_id)
+                    .bind(workspace_id)
+                    .bind(&deleted_ids)
+                    .execute(&st.db)
+                    .await
+        {
+            tracing::warn!(%page_id, error = %e, "page_logs delete failed");
         }
     });
 }

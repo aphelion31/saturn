@@ -37,11 +37,20 @@ async fn update_instance(State(st): State<AppState>, user: CurrentUser, Json(b):
     require_instance_admin(&st, &user).await?;
     let obj = b.as_object().ok_or_else(|| ApiError::bad("Invalid request"))?;
     let fields = [
-        ("instance_name", "text"), ("whitelist_emails", "text"), ("instance_id", "text"),
-        ("current_version", "text"), ("latest_version", "text"), ("edition", "text"),
-        ("domain", "text"), ("namespace", "text"), ("is_telemetry_enabled", "boolean"),
-        ("is_support_required", "boolean"), ("is_signup_screen_visited", "boolean"),
-        ("is_verified", "boolean"), ("is_test", "boolean"), ("is_current_version_deprecated", "boolean"),
+        ("instance_name", "text"),
+        ("whitelist_emails", "text"),
+        ("instance_id", "text"),
+        ("current_version", "text"),
+        ("latest_version", "text"),
+        ("edition", "text"),
+        ("domain", "text"),
+        ("namespace", "text"),
+        ("is_telemetry_enabled", "boolean"),
+        ("is_support_required", "boolean"),
+        ("is_signup_screen_visited", "boolean"),
+        ("is_verified", "boolean"),
+        ("is_test", "boolean"),
+        ("is_current_version_deprecated", "boolean"),
     ];
     for (key, ty) in fields {
         if let Some(v) = obj.get(key) {
@@ -49,8 +58,13 @@ async fn update_instance(State(st): State<AppState>, user: CurrentUser, Json(b):
             if !(v.is_null() && nullable || if ty == "boolean" { v.is_boolean() } else { v.is_string() }) {
                 return Err(ApiError::bad_body(json!({key: ["Invalid value."]})));
             }
-            if ty == "text" && !matches!(key, "whitelist_emails" | "domain") && v.as_str().is_some_and(|s| s.chars().count() > 255) {
-                return Err(ApiError::bad_body(json!({key: ["Ensure this field has no more than 255 characters."]})));
+            if ty == "text"
+                && !matches!(key, "whitelist_emails" | "domain")
+                && v.as_str().is_some_and(|s| s.chars().count() > 255)
+            {
+                return Err(ApiError::bad_body(
+                    json!({key: ["Ensure this field has no more than 255 characters."]}),
+                ));
             }
         }
     }

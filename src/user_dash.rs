@@ -52,10 +52,9 @@ fn scope() -> String {
     format!("i.workspace_id = $3 AND {ACTIVE} AND {VISIBLE} AND {ASSIGNED}")
 }
 
-/// IssueActivitySerializer shape. `actor_detail` is UserLite; project/workspace/issue details are the
-/// lite serializers' fields.
-// ponytail: issue_detail carries a subset of IssueFlatSerializer fields. Add the rest if the UI reads them.
-fn activity_json() -> String {
+/// IssueActivitySerializer shape. `actor_detail` is UserLite; project/workspace/issue details match
+/// Plane's lite/flat serializers.
+pub(crate) fn activity_json() -> String {
     format!(
         "jsonb_build_object(
         'id', a.id, 'verb', a.verb, 'field', a.field, 'old_value', a.old_value, 'new_value', a.new_value,
@@ -70,9 +69,10 @@ fn activity_json() -> String {
             FROM projects p WHERE p.id = a.project_id),
         'workspace_detail', (SELECT jsonb_build_object('id', w.id, 'name', w.name, 'slug', w.slug)
             FROM workspaces w WHERE w.id = a.workspace_id),
-        'issue_detail', (SELECT jsonb_build_object('id', i.id, 'name', i.name, 'priority', i.priority,
-            'start_date', i.start_date, 'target_date', i.target_date, 'sequence_id', i.sequence_id,
-            'project_id', i.project_id) FROM issues i WHERE i.id = a.issue_id)
+        'issue_detail', (SELECT jsonb_build_object('id', i.id, 'name', i.name, 'description_json', i.description_json,
+            'description_html', i.description_html, 'priority', i.priority, 'start_date', i.start_date,
+            'target_date', i.target_date, 'sequence_id', i.sequence_id, 'sort_order', i.sort_order,
+            'is_draft', i.is_draft, 'project_id', i.project_id) FROM issues i WHERE i.id = a.issue_id)
         )",
         crate::users::USER_LITE_JSON
     )
@@ -105,14 +105,19 @@ async fn my_activities(
         "-updated_at" => "a.updated_at DESC",
         _ => "a.created_at DESC",
     };
-    let total: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM issue_activities a WHERE a.actor_id = $1 AND a.deleted_at IS NULL")
-            .bind(user.id)
-            .fetch_one(&st.db)
-            .await?;
+    let vis_from = "FROM issue_activities a
+         JOIN issues i ON i.id = a.issue_id AND i.workspace_id = a.workspace_id AND i.deleted_at IS NULL AND NOT i.is_draft
+         JOIN projects pr ON pr.id = i.project_id AND pr.workspace_id = i.workspace_id AND pr.deleted_at IS NULL
+         JOIN project_members pm ON pm.project_id = i.project_id AND pm.workspace_id = i.workspace_id
+              AND pm.member_id = $1 AND pm.is_active AND pm.deleted_at IS NULL
+         WHERE a.actor_id = $1 AND a.deleted_at IS NULL
+           AND (pm.role > 5 OR pr.guest_view_all_features OR i.created_by_id = $1)";
+    let total: i64 = sqlx::query_scalar(&format!("SELECT count(*) {vis_from}"))
+        .bind(user.id)
+        .fetch_one(&st.db)
+        .await?;
     let mut rows: Vec<Value> = sqlx::query_scalar(&format!(
-        "SELECT {} FROM issue_activities a WHERE a.actor_id = $1 AND a.deleted_at IS NULL
-         ORDER BY {order} LIMIT $2 OFFSET $3",
+        "SELECT {} {vis_from} ORDER BY {order} LIMIT $2 OFFSET $3",
         activity_json()
     ))
     .bind(user.id)
@@ -319,7 +324,6 @@ async fn dashboard(
 
 /// `GET /api/workspaces/{slug}/user-issues/{user_id}/`: work items the target is assigned to, created by,
 /// or subscribed to, that the caller can see. Uses the shared list engine (filters, order, group, cursor).
-// ponytail: user-activity export (CSV job) skipped, per scope.
 async fn user_issues(
     State(st): State<AppState>,
     user: CurrentUser,
@@ -372,22 +376,39 @@ fn like_pattern(text: &str) -> String {
 }
 
 /// `GET /api/workspaces/{slug}/entity-search/`: mention, project, issue, cycle, module and page lookups
-/// inside one project (Plane `SearchEndpoint`). Membership comes from `require_project`. Restricted
-/// guests see only the issues they created, as in the list endpoints.
-// ponytail: Plane answers 200 with data for any workspace member in user_mention. Here a non-member of
-// the project gets 403. Keeps the stricter tenant rule from AGENTS.md.
+/// inside one project (Plane `SearchEndpoint`). Non-members of `project_id` receive empty lists (`200`),
+/// workspace guests cannot discover non-member `network = 2` projects, and restricted guests see only
+/// issues they created.
 async fn entity_search(
     State(st): State<AppState>,
     user: CurrentUser,
     Path(slug): Path<String>,
     Query(q): Query<EntityQ>,
 ) -> ApiResult {
+    let query_types: Vec<&str> = q
+        .query_type
+        .as_deref()
+        .unwrap_or("user_mention")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     let Some(project_id) = q.project_id else {
         // Plane only fills results when a project is given.
         require_workspace(&st.db, &user, &slug).await?;
         return Ok(Json(json!({})));
     };
-    let p = require_project(&st.db, &user, &slug, project_id).await?;
+    let ws = require_workspace(&st.db, &user, &slug).await?;
+    let p = match require_project(&st.db, &user, &slug, project_id).await {
+        Ok(p) => p,
+        Err(_) => {
+            let mut empty = serde_json::Map::new();
+            for t in query_types {
+                empty.insert(t.to_string(), json!([]));
+            }
+            return Ok(Json(Value::Object(empty)));
+        }
+    };
     let ws_id = p.workspace_id();
     let count = q.count.unwrap_or(5).clamp(1, 100);
     let text = q.query.filter(|s| !s.is_empty());
@@ -402,13 +423,7 @@ async fn entity_search(
     let restricted = p.restricted_guest();
 
     let mut out = serde_json::Map::new();
-    for t in q
-        .query_type
-        .as_deref()
-        .unwrap_or("user_mention")
-        .split(',')
-        .map(str::trim)
-    {
+    for t in query_types {
         let rows: Vec<Value> = match t {
             "user_mention" => {
                 sqlx::query_scalar(&format!(
@@ -434,7 +449,7 @@ async fn entity_search(
                  FROM projects p JOIN workspaces w ON w.id = p.workspace_id
                  WHERE p.workspace_id = $1 AND p.deleted_at IS NULL
                    AND (EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id = p.id AND pm.member_id = $2
-                                AND pm.is_active AND pm.deleted_at IS NULL) OR p.network = 2)
+                                AND pm.is_active AND pm.deleted_at IS NULL) OR (p.network = 2 AND $5 > 5))
                    AND ($3::text IS NULL OR p.name ILIKE $3 OR p.identifier ILIKE $3)
                  ORDER BY p.created_at DESC LIMIT $4",
                 )
@@ -442,6 +457,7 @@ async fn entity_search(
                 .bind(user.id)
                 .bind(pat.as_deref())
                 .bind(count)
+                .bind(ws.role)
                 .fetch_all(&st.db)
                 .await?
             }
