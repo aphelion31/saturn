@@ -1708,13 +1708,14 @@ fn check_flags(b: &Value) -> Result<(), ApiError> {
     }
 }
 
-/// Stand-in for Plane's `validate_url` (SSRF guard): http/https only, and the host must resolve
-/// to public addresses. Loopback, private, link-local and unspecified targets are refused.
-// ponytail: DNS is resolved once here; a rebinding race before delivery is not covered. Add when delivery is ported.
+/// Stand-in for Plane's `validate_url` (SSRF guard): http/https only, no embedded credentials,
+/// and the host must resolve to public addresses. Loopback, private, link-local and unspecified
+/// targets are refused. Delivery-time DNS rebinding is prevented by `crate::webhook_out::pinned_client`,
+/// which re-resolves and pins validated IPs immediately before every outbound attempt.
 async fn check_webhook_url(raw: &str) -> Result<(), ApiError> {
     let bad = || ApiError::bad_body(json!({"url": ["Invalid or disallowed webhook URL."]}));
     let u = url::Url::parse(raw).map_err(|_| bad())?;
-    if !matches!(u.scheme(), "http" | "https") {
+    if !matches!(u.scheme(), "http" | "https") || !u.username().is_empty() || u.password().is_some() {
         return Err(bad());
     }
     let port = u.port_or_known_default().unwrap_or(443);

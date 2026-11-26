@@ -155,4 +155,75 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -b "$jar" -X POST -H 'content-type
   "$BASE/api/workspaces/$SLUG/projects/$PROJECT/estimates/")
 [[ "$code" == 400 ]] || { echo "✖ non-numeric points estimate -> $code (expected 400)" >&2; exit 1; }
 
+# 10. Completed parity shortcuts: cycle TZ, ci_retrieve issue_detail, sticky SQL/binary, v1 comment descriptions, issue-dates activity
+DB_PARITY_URL="${DATABASE_URL:-postgres://localhost/saturn}"
+
+TZ_IDENT="TZP$RANDOM"
+TZ_IDENT="${TZ_IDENT:0:10}"
+call POST "/api/workspaces/$SLUG/projects/" '{"name":"TZ Parity '$RANDOM'","identifier":"'"$TZ_IDENT"'","timezone":"Asia/Kolkata"}'
+TZ_PROJ=$(field '.id')
+call POST "/api/workspaces/$SLUG/projects/$TZ_PROJ/cycles/" '{"name":"Kolkata Cycle","start_date":"2036-02-01","end_date":"2036-02-05"}'
+TZ_CYC=$(field '.id')
+call GET "/api/workspaces/$SLUG/projects/$TZ_PROJ/cycles/$TZ_CYC/"
+jq -e '(.start_date | endswith("+05:30")) and (.end_date | endswith("+05:30"))' <<<"$body" >/dev/null \
+  || { echo "✖ cycle timestamp missing +05:30 offset: $body" >&2; exit 1; }
+call DELETE "/api/workspaces/$SLUG/projects/$TZ_PROJ/cycles/$TZ_CYC/"
+call DELETE "/api/workspaces/$SLUG/projects/$TZ_PROJ/"
+
+call POST "/api/workspaces/$SLUG/projects/$PROJECT/cycles/" '{"name":"CI Detail Cycle","start_date":"2036-03-01","end_date":"2036-03-10"}'
+CI_CYC=$(field '.id')
+call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/" '{"name":"CI Detail Issue"}'
+CI_ISSUE=$(field '.id')
+call POST "/api/workspaces/$SLUG/projects/$PROJECT/cycles/$CI_CYC/cycle-issues/" '{"issues":["'"$CI_ISSUE"'"]}'
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/cycles/$CI_CYC/cycle-issues/$CI_ISSUE/"
+jq -e --arg iid "$CI_ISSUE" '(.issue_detail.id == $iid) and ((.issue_detail.state_detail.id | length) > 0) and (.sub_issues_count == 0)' <<<"$body" >/dev/null \
+  || { echo "✖ cycle-issue retrieve missing issue_detail: $body" >&2; exit 1; }
+call DELETE "/api/workspaces/$SLUG/projects/$PROJECT/issues/$CI_ISSUE/"
+call DELETE "/api/workspaces/$SLUG/projects/$PROJECT/cycles/$CI_CYC/"
+
+call POST /api/users/api-tokens/ '{"label":"parity-v1-tok"}'
+V1_PARITY_ID=$(field '.id')
+V1_PARITY_TOK=$(field '.token')
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "X-Api-Key: $V1_PARITY_TOK" -H 'content-type: application/json' \
+  -d '{"name":"BadBin","description_html":"<p>x</p>","description_binary":"PHNjcmlwdD54PC9zY3JpcHQ+"}' \
+  "$BASE/api/v1/workspaces/$SLUG/stickies/")
+[[ "$code" == 400 ]] || { echo "✖ suspicious sticky description_binary -> $code (expected 400)" >&2; exit 1; }
+
+out=$(curl -sS -X POST -H "X-Api-Key: $V1_PARITY_TOK" -H 'content-type: application/json' \
+  -d '{"name":"Sticky A","description_html":"<p>Alpha</p>","description_binary":"AQIDBA=="}' \
+  "$BASE/api/v1/workspaces/$SLUG/stickies/")
+ST_A=$(jq -r '.id' <<<"$out")
+[[ "$(jq -r '.description_binary' <<<"$out")" == "AQIDBA==" ]] \
+  || { echo "✖ sticky description_binary mismatch: $out" >&2; exit 1; }
+ST_B=$(curl -sS -X POST -H "X-Api-Key: $V1_PARITY_TOK" -H 'content-type: application/json' \
+  -d '{"name":"Sticky B","description_html":"<p>Beta</p>","description_binary":"BQYHCA=="}' \
+  "$BASE/api/v1/workspaces/$SLUG/stickies/" | jq -r '.id')
+ST_PAGE=$(curl -sS -H "X-Api-Key: $V1_PARITY_TOK" "$BASE/api/v1/workspaces/$SLUG/stickies/?per_page=1&cursor=1:0:0")
+jq -e '(.count == 1) and (.next_page_results == true) and (.total_count >= 2)' <<<"$ST_PAGE" >/dev/null \
+  || { echo "✖ sticky SQL pagination mismatch: $ST_PAGE" >&2; exit 1; }
+curl -sf -X DELETE -H "X-Api-Key: $V1_PARITY_TOK" "$BASE/api/v1/workspaces/$SLUG/stickies/$ST_A/" >/dev/null
+curl -sf -X DELETE -H "X-Api-Key: $V1_PARITY_TOK" "$BASE/api/v1/workspaces/$SLUG/stickies/$ST_B/" >/dev/null
+
+call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/" '{"name":"V1 Comment Desc Issue"}'
+CM_ISSUE=$(field '.id')
+CM_ID=$(curl -sS -X POST -H "X-Api-Key: $V1_PARITY_TOK" -H 'content-type: application/json' \
+  -d '{"comment_html":"<p>Hello parity comment</p>"}' \
+  "$BASE/api/v1/workspaces/$SLUG/projects/$PROJECT/work-items/$CM_ISSUE/comments/" | jq -r '.id')
+DESC_OK=$(psql "$DB_PARITY_URL" -Atc "SELECT (c.description_id IS NOT NULL AND d.description_html = '<p>Hello parity comment</p>' AND jsonb_typeof(c.comment_json) = 'object' AND c.comment_json != '{}'::jsonb) FROM issue_comments c JOIN descriptions d ON d.id = c.description_id WHERE c.id = '$CM_ID'")
+[[ "$DESC_OK" == "t" ]] || { echo "✖ v1 comment missing descriptions row or comment_json ($DESC_OK)" >&2; exit 1; }
+curl -sf -X PATCH -H "X-Api-Key: $V1_PARITY_TOK" -H 'content-type: application/json' \
+  -d '{"comment_html":"<p>Updated parity comment</p>"}' \
+  "$BASE/api/v1/workspaces/$SLUG/projects/$PROJECT/work-items/$CM_ISSUE/comments/$CM_ID/" >/dev/null
+DESC_UPD=$(psql "$DB_PARITY_URL" -Atc "SELECT d.description_html = '<p>Updated parity comment</p>' FROM issue_comments c JOIN descriptions d ON d.id = c.description_id WHERE c.id = '$CM_ID'")
+[[ "$DESC_UPD" == "t" ]] || { echo "✖ v1 comment patch did not update descriptions row ($DESC_UPD)" >&2; exit 1; }
+call DELETE "/api/workspaces/$SLUG/projects/$PROJECT/issues/$CM_ISSUE/"
+call DELETE "/api/users/api-tokens/$V1_PARITY_ID/"
+
+call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/" '{"name":"Bulk Dates Activity Issue"}'
+DT_ISSUE=$(field '.id')
+call POST "/api/workspaces/$SLUG/projects/$PROJECT/issue-dates/" '{"updates":[{"id":"'"$DT_ISSUE"'","start_date":"2036-04-01","target_date":"2036-04-10"}]}'
+DT_CNT=$(psql "$DB_PARITY_URL" -Atc "SELECT count(*) FROM issue_activities WHERE issue_id = '$DT_ISSUE' AND field IN ('start_date','target_date')")
+[[ "$DT_CNT" == "2" ]] || { echo "✖ expected 2 issue_activities from issue-dates, got $DT_CNT" >&2; exit 1; }
+call DELETE "/api/workspaces/$SLUG/projects/$PROJECT/issues/$DT_ISSUE/"
+
 echo "✔ parity and live smoke checks passed"

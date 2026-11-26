@@ -242,6 +242,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     jobs::spawn(state.clone());
+    pages::spawn_room_sync(state.clone());
 
     let shutdown_state = state.clone();
     let addr = env("BIND", "0.0.0.0:3000");

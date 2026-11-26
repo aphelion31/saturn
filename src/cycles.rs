@@ -126,7 +126,6 @@ const CYCLE_FROM: &str = "FROM cycles c
     ) asg ON true";
 
 /// CycleSerializer fields plus list extras, and `status` (CURRENT / UPCOMING / COMPLETED / DRAFT).
-/// ponytail: timestamps come back as stored (UTC); Plane converts them to the project timezone.
 pub(crate) fn cycle_select(where_sql: &str) -> String {
     format!(
         "SELECT jsonb_build_object(
@@ -202,17 +201,39 @@ fn name_of(b: &Value) -> Result<Option<String>, ApiError> {
     }
 }
 
+fn localize_cycle_row(row: &mut Value, tz: Option<&str>) {
+    let Some(obj) = row.as_object_mut() else {
+        return;
+    };
+    for key in ["start_date", "end_date"] {
+        if let Some(ts) = obj.get(key).and_then(Value::as_str).map(str::to_owned) {
+            obj.insert(key.into(), Value::String(format_in_tz(&ts, tz)));
+        }
+    }
+}
+
+async fn project_tz(db: &sqlx::PgPool, project_id: Uuid) -> Result<Option<String>, ApiError> {
+    Ok(
+        sqlx::query_scalar::<_, String>("SELECT timezone FROM projects WHERE id = $1")
+            .bind(project_id)
+            .fetch_optional(db)
+            .await?,
+    )
+}
+
 /// Fetch one cycle by id in this project. 404 when missing, deleted or archived is false.
 async fn fetch_cycle(db: &sqlx::PgPool, ctx: &ProjectCtx, user: &CurrentUser, pk: Uuid) -> ApiResult {
-    sqlx::query_scalar(&format!("{} AND c.id = $4", cycle_select("TRUE")))
+    let mut row: Value = sqlx::query_scalar(&format!("{} AND c.id = $4", cycle_select("TRUE")))
         .bind(ctx.project_id)
         .bind(ctx.workspace_id())
         .bind(user.id)
         .bind(pk)
         .fetch_optional(db)
         .await?
-        .map(Json)
-        .ok_or_else(cycle_not_found)
+        .ok_or_else(cycle_not_found)?;
+    let tz = project_tz(db, ctx.project_id).await?;
+    localize_cycle_row(&mut row, tz.as_deref());
+    Ok(Json(row))
 }
 
 async fn list(
@@ -223,11 +244,12 @@ async fn list(
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER, GUEST])?;
+    let tz = project_tz(&st.db, project_id).await?;
     let order = format!("ORDER BY {IS_FAVORITE} DESC, c.created_at DESC");
     let base = "c.archived_at IS NULL";
     if q.get("cycle_view").map(String::as_str) == Some("current") {
         // Plane returns the current cycles, or all cycles when none is current.
-        let current: Vec<Value> = sqlx::query_scalar(&format!(
+        let mut current: Vec<Value> = sqlx::query_scalar(&format!(
             "{} AND {base} AND c.start_date <= now() AND c.end_date >= now() {order}",
             cycle_select("TRUE")
         ))
@@ -237,17 +259,22 @@ async fn list(
         .fetch_all(&st.db)
         .await?;
         if !current.is_empty() {
+            for row in &mut current {
+                localize_cycle_row(row, tz.as_deref());
+            }
             return Ok(Json(Value::Array(current)));
         }
     }
-    json_rows(
-        sqlx::query_scalar(&format!("{} AND {base} {order}", cycle_select("TRUE")))
-            .bind(project_id)
-            .bind(p.workspace_id())
-            .bind(user.id),
-        &st.db,
-    )
-    .await
+    let mut rows: Vec<Value> = sqlx::query_scalar(&format!("{} AND {base} {order}", cycle_select("TRUE")))
+        .bind(project_id)
+        .bind(p.workspace_id())
+        .bind(user.id)
+        .fetch_all(&st.db)
+        .await?;
+    for row in &mut rows {
+        localize_cycle_row(row, tz.as_deref());
+    }
+    Ok(Json(Value::Array(rows)))
 }
 
 async fn retrieve(
@@ -638,17 +665,20 @@ async fn archived_list(
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER])?;
-    json_rows(
-        sqlx::query_scalar(&format!(
-            "{} AND c.archived_at IS NOT NULL ORDER BY {IS_FAVORITE} DESC, c.created_at DESC",
-            cycle_select("TRUE")
-        ))
-        .bind(project_id)
-        .bind(p.workspace_id())
-        .bind(user.id),
-        &st.db,
-    )
-    .await
+    let tz = project_tz(&st.db, project_id).await?;
+    let mut rows: Vec<Value> = sqlx::query_scalar(&format!(
+        "{} AND c.archived_at IS NOT NULL ORDER BY {IS_FAVORITE} DESC, c.created_at DESC",
+        cycle_select("TRUE")
+    ))
+    .bind(project_id)
+    .bind(p.workspace_id())
+    .bind(user.id)
+    .fetch_all(&st.db)
+    .await?;
+    for row in &mut rows {
+        localize_cycle_row(row, tz.as_deref());
+    }
+    Ok(Json(Value::Array(rows)))
 }
 
 async fn archived_retrieve(
@@ -658,7 +688,7 @@ async fn archived_retrieve(
 ) -> ApiResult {
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER])?;
-    sqlx::query_scalar(&format!(
+    let mut row: Value = sqlx::query_scalar(&format!(
         "{} AND c.id = $4 AND c.archived_at IS NOT NULL",
         cycle_select("TRUE")
     ))
@@ -668,8 +698,10 @@ async fn archived_retrieve(
     .bind(pk)
     .fetch_optional(&st.db)
     .await?
-    .map(Json)
-    .ok_or_else(cycle_not_found)
+    .ok_or_else(cycle_not_found)?;
+    let tz = project_tz(&st.db, project_id).await?;
+    localize_cycle_row(&mut row, tz.as_deref());
+    Ok(Json(row))
 }
 
 /// Per-user display filters for one cycle. GET creates the row like Plane's get_or_create.
@@ -1174,8 +1206,7 @@ async fn ci_add(
     Ok((StatusCode::CREATED, Json(json!({"message": "success"}))))
 }
 
-/// One cycle-issue bridge row as Plane's CycleIssueSerializer fields.
-/// ponytail: Plane also embeds `issue_detail`; the UI reads the work item from the list instead.
+/// One cycle-issue bridge row as Plane's CycleIssueSerializer fields including `issue_detail` and `sub_issues_count`.
 async fn ci_retrieve(
     State(st): State<AppState>,
     user: CurrentUser,
@@ -1185,12 +1216,36 @@ async fn ci_retrieve(
     p.require(&[ADMIN, MEMBER])?;
     json_row(
         sqlx::query_scalar(
-            "SELECT jsonb_build_object('id', ci.id, 'cycle', ci.cycle_id, 'issue', ci.issue_id, 'project', ci.project_id,
+            "SELECT jsonb_build_object(
+                'id', ci.id, 'cycle', ci.cycle_id, 'issue', ci.issue_id, 'project', ci.project_id,
                 'workspace', ci.workspace_id, 'created_by', ci.created_by_id, 'updated_by', ci.updated_by_id,
-                'created_at', ci.created_at, 'updated_at', ci.updated_at)
-             FROM cycle_issues ci
-             WHERE ci.issue_id = $1 AND ci.cycle_id = $2 AND ci.project_id = $3 AND ci.workspace_id = $4
-               AND ci.deleted_at IS NULL",
+                'created_at', ci.created_at, 'updated_at', ci.updated_at,
+                'sub_issues_count', (SELECT count(*) FROM issues sub WHERE sub.parent_id = i.id AND sub.deleted_at IS NULL),
+                'issue_detail', (
+                    (to_jsonb(i) - 'workspace_id' - 'project_id' - 'state_id' - 'parent_id' - 'estimate_point_id' - 'type_id' - 'created_by_id' - 'updated_by_id')
+                    || jsonb_build_object(
+                        'workspace', i.workspace_id,
+                        'project', i.project_id,
+                        'state', i.state_id,
+                        'parent', i.parent_id,
+                        'estimate_point', i.estimate_point_id,
+                        'type', i.type_id,
+                        'created_by', i.created_by_id,
+                        'updated_by', i.updated_by_id,
+                        'state_detail', (SELECT jsonb_build_object('id', s.id, 'name', s.name, 'color', s.color, 'group', s.\"group\") FROM states s WHERE s.id = i.state_id),
+                        'project_detail', (SELECT jsonb_build_object('id', pr.id, 'identifier', pr.identifier, 'name', pr.name, 'cover_image', pr.cover_image, 'icon_prop', pr.icon_prop, 'emoji', pr.emoji, 'description', pr.description, 'logo_props', pr.logo_props) FROM projects pr WHERE pr.id = i.project_id),
+                        'label_details', COALESCE((SELECT jsonb_agg(jsonb_build_object('id', l.id, 'name', l.name, 'color', l.color)) FROM issue_labels il JOIN labels l ON l.id = il.label_id AND l.deleted_at IS NULL WHERE il.issue_id = i.id AND il.deleted_at IS NULL), '[]'::jsonb),
+                        'assignee_details', COALESCE((SELECT jsonb_agg(jsonb_build_object('id', u.id, 'first_name', u.first_name, 'last_name', u.last_name, 'email', u.email, 'avatar', u.avatar, 'avatar_url', COALESCE(NULLIF(u.avatar, ''), CASE WHEN u.avatar_asset_id IS NOT NULL THEN '/api/assets/v2/static/' || u.avatar_asset_id || '/' ELSE NULL END), 'display_name', u.display_name)) FROM issue_assignees ia JOIN users u ON u.id = ia.assignee_id AND u.is_active WHERE ia.issue_id = i.id AND ia.deleted_at IS NULL), '[]'::jsonb),
+                        'sub_issues_count', (SELECT count(*) FROM issues sub WHERE sub.parent_id = i.id AND sub.deleted_at IS NULL),
+                        'attachment_count', (SELECT count(*) FROM file_assets fa WHERE fa.issue_id = i.id AND fa.entity_type = 'ISSUE_ATTACHMENT' AND fa.deleted_at IS NULL),
+                        'link_count', (SELECT count(*) FROM issue_links il WHERE il.issue_id = i.id AND il.deleted_at IS NULL)
+                    )
+                )
+            )
+            FROM cycle_issues ci
+            JOIN issues i ON i.id = ci.issue_id AND i.workspace_id = ci.workspace_id AND i.deleted_at IS NULL
+            WHERE ci.issue_id = $1 AND ci.cycle_id = $2 AND ci.project_id = $3 AND ci.workspace_id = $4
+              AND ci.deleted_at IS NULL",
         )
         .bind(issue_id)
         .bind(cycle_id)
@@ -1391,8 +1446,8 @@ async fn transfer(
 /// member of (Plane's `WorkspaceCyclesEndpoint`). Reuses the per-project shape.
 async fn workspace_list(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>) -> ApiResult {
     let ws = require_workspace(&st.db, &user, &slug).await?;
-    let projects: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT pm.project_id FROM project_members pm JOIN projects p ON p.id = pm.project_id
+    let projects: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT pm.project_id, p.timezone FROM project_members pm JOIN projects p ON p.id = pm.project_id
          WHERE pm.workspace_id = $1 AND pm.member_id = $2 AND pm.is_active AND pm.deleted_at IS NULL
            AND p.deleted_at IS NULL AND p.archived_at IS NULL",
     )
@@ -1405,7 +1460,7 @@ async fn workspace_list(State(st): State<AppState>, user: CurrentUser, Path(slug
         cycle_select("TRUE")
     );
     let mut out = Vec::new();
-    for project_id in projects {
+    for (project_id, tz) in projects {
         let rows: Vec<Value> = sqlx::query_scalar(&sql)
             .bind(project_id)
             .bind(ws.workspace_id)
@@ -1413,6 +1468,7 @@ async fn workspace_list(State(st): State<AppState>, user: CurrentUser, Path(slug
             .fetch_all(&st.db)
             .await?;
         out.extend(rows.into_iter().map(|mut row| {
+            localize_cycle_row(&mut row, Some(&tz));
             if let Some(obj) = row.as_object_mut() {
                 for key in [
                     "archived_at",
