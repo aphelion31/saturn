@@ -1,0 +1,15 @@
+target/
+storage/
+.git/
+.env
+.env.*
+!.env.example
+!.env.prod.example
+web/node_modules/
+web/**/node_modules/
+web/**/build/
+web/**/.react-router/
+web/**/.turbo/
+web/**/dist/
+rust/app-cases/
+*.DS_Store
