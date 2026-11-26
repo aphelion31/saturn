@@ -462,10 +462,10 @@ async fn create_export(
     let mut project_ids: Vec<Uuid> = Vec::new();
     if let Some(arr) = body.get("project").and_then(Value::as_array) {
         for v in arr {
-            if let Some(s) = v.as_str() {
-                if let Ok(u) = Uuid::parse_str(s) {
-                    project_ids.push(u);
-                }
+            if let Some(s) = v.as_str()
+                && let Ok(u) = Uuid::parse_str(s)
+            {
+                project_ids.push(u);
             }
         }
     }
@@ -528,6 +528,7 @@ async fn create_export(
     })))
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn run_issue_export_bg(
     st: AppState,
     exporter_id: Uuid,
@@ -543,11 +544,11 @@ async fn run_issue_export_bg(
         .execute(&st.db)
         .await;
 
-    // ponytail: xlsx format falls back to CSV content with .xlsx filename; add full openxml generator when needed
     let is_json = provider == "json";
+    let is_xlsx = provider == "xlsx";
     let ext = if is_json {
         "json"
-    } else if provider == "xlsx" {
+    } else if is_xlsx {
         "xlsx"
     } else {
         "csv"
@@ -676,7 +677,7 @@ async fn run_issue_export_bg(
         }
     };
 
-    let content = if is_json {
+    let content_bytes: Vec<u8> = if is_json {
         let json_items: Vec<Value> = rows
             .into_iter()
             .map(|r| {
@@ -708,7 +709,7 @@ async fn run_issue_export_bg(
                 })
             })
             .collect();
-        serde_json::to_string_pretty(&json_items).unwrap_or_default()
+        serde_json::to_vec_pretty(&json_items).unwrap_or_default()
     } else {
         let headers = [
             "Project Name",
@@ -736,38 +737,60 @@ async fn run_issue_export_bg(
             "Attachment Count",
             "Is Draft",
         ];
-        let mut csv = String::new();
-        append_csv_line(&mut csv, headers.iter().map(|s| s.to_string()));
-        for r in rows {
-            let line = [
-                r.project_name,
-                r.project_identifier,
-                r.parent_identifier,
-                r.identifier,
-                r.sequence_id.to_string(),
-                r.issue_name,
-                r.state_name,
-                r.priority,
-                r.assignees,
-                r.subscribers,
-                r.created_by_name,
-                r.start_date,
-                r.target_date,
-                r.completed_at,
-                r.created_at,
-                r.updated_at,
-                r.archived_at,
-                r.estimate,
-                r.labels,
-                r.cycles,
-                r.modules,
-                r.link_count,
-                r.attachment_count,
-                r.is_draft.to_string(),
-            ];
-            append_csv_line(&mut csv, line.into_iter());
+        let table_rows: Vec<[String; 24]> = rows
+            .into_iter()
+            .map(|r| {
+                [
+                    r.project_name,
+                    r.project_identifier,
+                    r.parent_identifier,
+                    r.identifier,
+                    r.sequence_id.to_string(),
+                    r.issue_name,
+                    r.state_name,
+                    r.priority,
+                    r.assignees,
+                    r.subscribers,
+                    r.created_by_name,
+                    r.start_date,
+                    r.target_date,
+                    r.completed_at,
+                    r.created_at,
+                    r.updated_at,
+                    r.archived_at,
+                    r.estimate,
+                    r.labels,
+                    r.cycles,
+                    r.modules,
+                    r.link_count,
+                    r.attachment_count,
+                    r.is_draft.to_string(),
+                ]
+            })
+            .collect();
+        if is_xlsx {
+            match build_xlsx_bytes(&headers, &table_rows) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::error!("Failed to build xlsx workbook: {e}");
+                    let _ = sqlx::query(
+                        "UPDATE exporters SET status = 'failed', reason = $1, updated_at = now() WHERE id = $2",
+                    )
+                    .bind(e.to_string())
+                    .bind(exporter_id)
+                    .execute(&st.db)
+                    .await;
+                    return;
+                }
+            }
+        } else {
+            let mut csv = String::new();
+            append_csv_line(&mut csv, headers.iter().map(|s| s.to_string()));
+            for line in table_rows {
+                append_csv_line(&mut csv, line);
+            }
+            csv.into_bytes()
         }
-        csv
     };
 
     // Save to STORAGE_DIR
@@ -783,7 +806,7 @@ async fn run_issue_export_bg(
     }
 
     let file_path = export_dir.join(&filename);
-    if let Err(e) = tokio::fs::write(&file_path, content.as_bytes()).await {
+    if let Err(e) = tokio::fs::write(&file_path, &content_bytes).await {
         tracing::error!("Failed to write export file: {e}");
         let _ = sqlx::query("UPDATE exporters SET status = 'failed', reason = $1, updated_at = now() WHERE id = $2")
             .bind(e.to_string())
@@ -834,6 +857,8 @@ async fn download_export(
 
     let content_type = if provider == "json" {
         "application/json"
+    } else if provider == "xlsx" {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     } else {
         "text/csv; charset=utf-8"
     };
@@ -848,6 +873,31 @@ async fn download_export(
         h.insert(header::CONTENT_DISPOSITION, v);
     }
     Ok(res)
+}
+
+fn sanitize_spreadsheet_cell(val: &str) -> String {
+    if val.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        format!("'{val}")
+    } else {
+        val.to_string()
+    }
+}
+
+fn build_xlsx_bytes<const N: usize>(
+    headers: &[&str; N],
+    rows: &[[String; N]],
+) -> Result<Vec<u8>, rust_xlsxwriter::XlsxError> {
+    let mut wb = rust_xlsxwriter::Workbook::new();
+    let ws = wb.add_worksheet();
+    for (col, h) in headers.iter().enumerate() {
+        ws.write_string(0, col as u16, sanitize_spreadsheet_cell(h))?;
+    }
+    for (r_idx, row) in rows.iter().enumerate() {
+        for (col, val) in row.iter().enumerate() {
+            ws.write_string((r_idx + 1) as u32, col as u16, sanitize_spreadsheet_cell(val))?;
+        }
+    }
+    wb.save_to_buffer()
 }
 
 fn append_csv_line(out: &mut String, fields: impl IntoIterator<Item = String>) {
@@ -912,12 +962,12 @@ async fn export_analytics(
         })));
     }
 
-    if let Some(seg) = segment {
-        if !VALID_ANALYTICS_FIELDS.contains(&seg) || seg == x_axis {
-            return Err(ApiError::bad_body(json!({
-                "error": "Both segment and x axis cannot be same and segment should be valid"
-            })));
-        }
+    if let Some(seg) = segment
+        && (!VALID_ANALYTICS_FIELDS.contains(&seg) || seg == x_axis)
+    {
+        return Err(ApiError::bad_body(json!({
+            "error": "Both segment and x axis cannot be same and segment should be valid"
+        })));
     }
 
     // Build CSV export content in background and send email
@@ -939,6 +989,7 @@ async fn export_analytics(
     })))
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn run_analytics_export_bg(
     st: AppState,
     ws_id: Uuid,
@@ -1167,7 +1218,7 @@ async fn serve_user_activity_csv(
     append_csv_line(&mut csv, headers.iter().map(|s| s.to_string()));
     for r in rows {
         let line = [r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8];
-        append_csv_line(&mut csv, line.into_iter());
+        append_csv_line(&mut csv, line);
     }
 
     let mut res = Body::from(csv).into_response();
@@ -1231,5 +1282,17 @@ mod tests {
         for field in VALID_ANALYTICS_FIELDS {
             assert!(!analytics_field_expr(field).is_empty());
         }
+    }
+
+    #[test]
+    fn xlsx_builds_valid_openxml() {
+        let headers = ["Name", "Formula"];
+        let rows = [["Item 1".to_string(), "=SUM(A1:A2)".to_string()]];
+        let bytes = build_xlsx_bytes(&headers, &rows).unwrap();
+        assert!(bytes.starts_with(b"PK\x03\x04"), "expected ZIP/XLSX magic header");
+        assert!(
+            bytes.windows(24).any(|w| w == b"xl/worksheets/sheet1.xml"),
+            "missing worksheet XML inside xlsx zip"
+        );
     }
 }

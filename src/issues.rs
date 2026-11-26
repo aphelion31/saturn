@@ -1,6 +1,5 @@
 //! Work items (issues): CRUD, comments, links, relations, sub-issues, activity, reactions, archive, search.
 //! The list engine lives in `workitems.rs`; this module owns the issue routes.
-//! TODO (worker): port the rest of `app/urls/issue.py`.
 use std::collections::HashMap;
 
 use axum::{
@@ -279,18 +278,18 @@ async fn draft_save(
         body["description_stripped"] = Value::String(strip_tags(&clean));
         body["description_html"] = Value::String(clean);
     }
-    if let Some(name) = body.get("name") {
-        if !name.is_null() && name.as_str().is_none_or(|s| s.chars().count() > 255) {
-            return Err(ApiError::bad("Invalid name"));
-        }
+    if let Some(name) = body.get("name")
+        && !name.is_null()
+        && name.as_str().is_none_or(|s| s.chars().count() > 255)
+    {
+        return Err(ApiError::bad("Invalid name"));
     }
-    if let Some(priority) = body.get("priority") {
-        if !priority
+    if let Some(priority) = body.get("priority")
+        && !priority
             .as_str()
             .is_some_and(|p| ["none", "urgent", "high", "medium", "low"].contains(&p))
-        {
-            return Err(ApiError::bad("Invalid priority"));
-        }
+    {
+        return Err(ApiError::bad("Invalid priority"));
     }
     let start = optional_date(&body, "start_date")?;
     let target = optional_date(&body, "target_date")?;
@@ -488,10 +487,10 @@ async fn draft_convert(
         "module_ids",
         "type_id",
     ] {
-        if let Some(v) = body.get(key).or_else(|| draft.get(key)) {
-            if !v.is_null() {
-                input.insert(key.into(), v.clone());
-            }
+        if let Some(v) = body.get(key).or_else(|| draft.get(key))
+            && !v.is_null()
+        {
+            input.insert(key.into(), v.clone());
         }
     }
     let result = create_issue(&mut tx, &user, &p, &Value::Object(input)).await?;
@@ -909,9 +908,13 @@ async fn bulk_delete(
         event.field = Some("issue");
         crate::activity::record(&mut *tx, event).await?;
     }
+    let count = ids.len();
     tx.commit().await?;
+    for id in ids {
+        crate::jobs::spawn_soft_delete_cascade(st.clone(), "issues", id);
+    }
     Ok(Json(
-        serde_json::json!({"message":format!("{} issues were deleted",ids.len())}),
+        serde_json::json!({"message":format!("{count} issues were deleted")}),
     ))
 }
 async fn bulk_archive(
@@ -1235,12 +1238,12 @@ async fn relations(
         out.insert(k.into(), serde_json::json!([]));
     }
     for row in rows {
-        if let Some(k) = row["kind"].as_str() {
-            if let Some(v) = out.get_mut(k).and_then(Value::as_array_mut) {
-                let mut item = row["item"].clone();
-                item["relation_type"] = Value::String(k.into());
-                v.push(item);
-            }
+        if let Some(k) = row["kind"].as_str()
+            && let Some(v) = out.get_mut(k).and_then(Value::as_array_mut)
+        {
+            let mut item = row["item"].clone();
+            item["relation_type"] = Value::String(k.into());
+            v.push(item);
         }
     }
     Ok(Json(Value::Object(out)))
@@ -1320,6 +1323,7 @@ pub(crate) fn inverse_relation(kind: &str) -> &str {
     }
 }
 
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn relation_activity(
     tx: &mut sqlx::PgConnection,
     issue: Uuid,
@@ -1776,7 +1780,9 @@ async fn comment_detail(
         .bind(comment).bind(issue).bind(project).bind(p.workspace_id()), &st.db).await
 }
 
-fn comment_fields(body: &Value) -> Result<(Option<String>, Option<Value>, Option<&str>), ApiError> {
+type CommentFields<'a> = (Option<String>, Option<Value>, Option<&'a str>);
+
+fn comment_fields(body: &Value) -> Result<CommentFields<'_>, ApiError> {
     let object = body.as_object().ok_or_else(|| ApiError::bad("Invalid request"))?;
     let html = object
         .get("comment_html")
@@ -1916,6 +1922,7 @@ async fn comment_delete(
     event.issue_comment_id = Some(comment);
     crate::activity::record(&mut *tx, event).await?;
     tx.commit().await?;
+    crate::jobs::spawn_soft_delete_cascade(st.clone(), "issue_comments", comment);
     crate::webhook_out::emit(
         &st,
         p.workspace_id(),
@@ -2309,6 +2316,7 @@ async fn destroy(
     event.field = Some("issue");
     crate::activity::record(&mut *tx, event).await?;
     tx.commit().await?;
+    crate::jobs::spawn_soft_delete_cascade(st.clone(), "issues", issue_id);
     crate::webhook_out::emit(
         &st,
         p.workspace_id(),
@@ -2368,7 +2376,7 @@ async fn create_issue(
         }
     }
     let body = &body;
-    let name = s(&body, "name")
+    let name = s(body, "name")
         .filter(|n| !n.trim().is_empty() && n.chars().count() <= 255)
         .ok_or_else(|| ApiError::bad("A name of at most 255 characters is required"))?;
     // Reject fields not yet implemented rather than silently discard user data.
@@ -2396,19 +2404,19 @@ async fn create_issue(
         return Err(ApiError::bad("Unsupported issue creation field"));
     }
     let state = if body.get("state_id").is_some_and(|v| !v.is_null()) {
-        Some(uuid_of(&body, "state_id").ok_or_else(|| ApiError::bad("Invalid state_id"))?)
+        Some(uuid_of(body, "state_id").ok_or_else(|| ApiError::bad("Invalid state_id"))?)
     } else {
         None
     };
-    let assignees = uuid_list(&body, "assignee_ids")?;
-    let labels = uuid_list(&body, "label_ids")?;
-    let modules = uuid_list(&body, "module_ids")?;
-    let parent = optional_uuid(&body, "parent_id")?;
-    let estimate = optional_uuid(&body, "estimate_point")?;
-    let cycle = optional_uuid(&body, "cycle_id")?;
-    let issue_type = optional_uuid(&body, "type_id")?;
-    let start = optional_date(&body, "start_date")?;
-    let target = optional_date(&body, "target_date")?;
+    let assignees = uuid_list(body, "assignee_ids")?;
+    let labels = uuid_list(body, "label_ids")?;
+    let modules = uuid_list(body, "module_ids")?;
+    let parent = optional_uuid(body, "parent_id")?;
+    let estimate = optional_uuid(body, "estimate_point")?;
+    let cycle = optional_uuid(body, "cycle_id")?;
+    let issue_type = optional_uuid(body, "type_id")?;
+    let start = optional_date(body, "start_date")?;
+    let target = optional_date(body, "target_date")?;
     if start.zip(target).is_some_and(|(a, b)| a > b) {
         return Err(ApiError::bad("Start date cannot exceed target date"));
     }
@@ -2455,7 +2463,7 @@ async fn create_issue(
             }
         }
     }
-    let priority = s(&body, "priority").unwrap_or("none");
+    let priority = s(body, "priority").unwrap_or("none");
     if !["none", "urgent", "high", "medium", "low"].contains(&priority) {
         return Err(ApiError::bad("Invalid priority"));
     }

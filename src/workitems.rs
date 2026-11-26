@@ -52,6 +52,7 @@ pub enum Arg {
     Uuids(Vec<Uuid>),
     Text(String),
     Texts(Vec<String>),
+    #[expect(dead_code, reason = "variant preserved for dynamic boolean filters")]
     Bool(bool),
 }
 
@@ -204,10 +205,10 @@ pub fn apply_filters(base: &mut Base, q: &HashMap<String, String>) {
             }
         }
     }
-    if let Some(v) = get("updated_at__exact") {
-        if chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d").is_ok() {
-            base.and("i.updated_at::date = {}::date", Arg::Text(v.to_string()));
-        }
+    if let Some(v) = get("updated_at__exact")
+        && chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d").is_ok()
+    {
+        base.and("i.updated_at::date = {}::date", Arg::Text(v.to_string()));
     }
     if let Some(v) = get("updated_at__gt") {
         base.and("i.updated_at > {}::timestamptz", Arg::Text(v.to_string()));
@@ -346,7 +347,18 @@ fn parse_cursor(c: Option<&str>) -> (i64, bool) {
 }
 
 /// Paginated, optionally grouped work-item list with Plane's response envelope.
-pub async fn list(db: &PgPool, mut base: Base, q: &HashMap<String, String>, scope: Scope) -> ApiResult {
+pub async fn list(db: &PgPool, base: Base, q: &HashMap<String, String>, scope: Scope) -> ApiResult {
+    list_with(db, base, q, scope, ITEM_JSON).await
+}
+
+/// Paginated, optionally grouped work-item list using a custom SQL row projection (`ITEM_JSON` or v1 `ITEM_V1`).
+pub async fn list_with(
+    db: &PgPool,
+    mut base: Base,
+    q: &HashMap<String, String>,
+    scope: Scope,
+    item_sql: &str,
+) -> ApiResult {
     apply_filters(&mut base, q);
     let per_page: i64 = q
         .get("per_page")
@@ -387,7 +399,7 @@ pub async fn list(db: &PgPool, mut base: Base, q: &HashMap<String, String>, scop
     let Some(group_by) = group_by else {
         let rows: Vec<Value> = bind(
             sqlx::query_scalar(&format!(
-                "SELECT {ITEM_JSON} FROM issues i WHERE {} ORDER BY {order} LIMIT {} OFFSET {offset}",
+                "SELECT {item_sql} FROM issues i WHERE {} ORDER BY {order} LIMIT {} OFFSET {offset}",
                 base.sql,
                 per_page + 1
             )),
@@ -421,7 +433,7 @@ pub async fn list(db: &PgPool, mut base: Base, q: &HashMap<String, String>, scop
                       count(*) OVER (PARTITION BY g) AS gtotal, count(*) OVER (PARTITION BY g, sg) AS sgtotal
                FROM issues i, unnest({gexpr}) g, unnest({sexpr}) sg WHERE {})
              SELECT jsonb_build_object('g', i.grp, 'sg', i.sgrp, 'gt', i.gtotal, 'sgt', i.sgtotal, 'more', i.rn > {stop}, 'item',
-                                       CASE WHEN i.rn <= {stop} THEN {ITEM_JSON} END)
+                                       CASE WHEN i.rn <= {stop} THEN {item_sql} END)
              FROM x i WHERE i.rn > {offset} AND i.rn <= {stop} + 1 ORDER BY i.rn",
             base.sql,
             stop = offset + per_page

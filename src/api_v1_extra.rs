@@ -141,10 +141,7 @@ fn opt_html(b: &Value) -> ApiResult<Option<(String, Option<String>)>> {
 
 /// ILIKE pattern for Plane's `description_stripped__icontains`, with % and _ escaped.
 fn like_pattern(q: &str) -> String {
-    format!(
-        "%{}%",
-        q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
-    )
+    format!("%{}%", q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
 }
 
 // ---- workspace invitations (admin only, Plane WorkspaceOwnerPermission) ----
@@ -377,12 +374,11 @@ async fn sticky_create(
     let logo = opt_json(&b, "logo_props")?.unwrap_or_else(|| json!({}));
     let (html, stripped) = opt_html(&b)?.unwrap_or_else(|| ("<p></p>".to_string(), Some(String::new())));
     // Plane Sticky.save: next sort_order is last + 10000 across the workspace, else the request or 65535.
-    let max_sort: Option<f64> = sqlx::query_scalar(
-        "SELECT max(sort_order) FROM stickies WHERE workspace_id = $1 AND deleted_at IS NULL",
-    )
-    .bind(ws.workspace_id)
-    .fetch_one(&st.db)
-    .await?;
+    let max_sort: Option<f64> =
+        sqlx::query_scalar("SELECT max(sort_order) FROM stickies WHERE workspace_id = $1 AND deleted_at IS NULL")
+            .bind(ws.workspace_id)
+            .fetch_one(&st.db)
+            .await?;
     let sort = match max_sort {
         Some(m) => m + 10000.0,
         None => opt_f64(&b, "sort_order")?.unwrap_or(65535.0),

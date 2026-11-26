@@ -13,7 +13,7 @@ API shapes, so an existing Plane database and the unchanged frontend keep workin
 | Path          | Role                                                                                 |
 | ------------- | ------------------------------------------------------------------------------------ |
 | `src/`        | Rust backend: axum HTTP, sqlx Postgres. One module per API area                      |
-| `web/`        | Plane's pnpm workspace: `apps/web`, `apps/admin`, `apps/space` and `packages/*`      |
+| `web/`        | Saturn's Bun workspace: `apps/web`, `apps/admin`, `apps/space` and `packages/*`      |
 | `migrations/` | Plane's schema (`pg_dump` of Django's migrations) plus database defaults              |
 | `tools/`      | Schema regeneration from a Plane checkout, API smoke test                            |
 | `scripts/`    | Git hook checks, branch helper, frontend build                                       |
@@ -54,7 +54,7 @@ DATABASE_URL=postgres://localhost/saturn cargo run          # http://localhost:3
 scripts/build-web.sh                                        # build web, admin, space SPAs
 BASE=http://127.0.0.1:3000 tools/smoke.sh                   # API smoke test over real HTTP
 BASE=http://127.0.0.1:3000 node tools/e2e.mjs               # real web app in Chromium, prints failed API calls
-(cd web && pnpm turbo run check:types --filter=web)         # frontend types
+(cd web && bunx turbo run check:types --filter=web)          # frontend types
 ```
 
 Verification before claiming work is done: `cargo build`, `cargo test`, then exercise the change over

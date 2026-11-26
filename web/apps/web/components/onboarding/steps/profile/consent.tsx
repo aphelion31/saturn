@@ -15,7 +15,7 @@ export function MarketingConsent({ isChecked, handleChange }: Props) {
   return (
     <div className="flex w-full justify-center">
       <Checkbox
-        label="I agree to Plane marketing communications"
+        label="I agree to Saturn marketing communications"
         checked={isChecked}
         onCheckedChange={(checked) => handleChange(checked)}
         onKeyDown={(event) => {

@@ -29,6 +29,9 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/schema/", get(schema))
         .route("/api/v1/schema/swagger-ui/", get(swagger))
         .route("/api/v1/schema/redoc/", get(redoc))
+        .route("/api/schema/", get(schema))
+        .route("/api/schema/swagger-ui/", get(swagger))
+        .route("/api/schema/redoc/", get(redoc))
 }
 
 fn api_key(headers: &HeaderMap) -> Result<(), ApiError> {
@@ -187,14 +190,53 @@ async fn create(
         .bind(id).bind(json!({"name":name,"type":typ,"size":size})).bind(format!("{}/{}-{}",ws.workspace_id,id.simple(),name)).bind(size).bind(ws.workspace_id).bind(project).bind(user.id).bind(ext_id).bind(ext_source).execute(&st.db).await?;
     Ok(Json(assets::upload_response(id, &st.cfg.secret_key)))
 }
-async fn lookup(st: &AppState, user: &CurrentUser, slug: &str, id: Uuid) -> Result<(Value, bool), ApiError> {
+async fn lookup(
+    st: &AppState,
+    user: &CurrentUser,
+    slug: &str,
+    id: Uuid,
+) -> Result<(Value, bool, assets::PermAsset, i16), ApiError> {
+    type LookupAssetRow = (
+        Value,
+        bool,
+        Option<Uuid>,
+        Option<Uuid>,
+        Option<Uuid>,
+        Option<String>,
+        Option<Uuid>,
+    );
     let ws = require_workspace(&st.db, user, slug).await?;
-    let row: Option<(Value,bool,Option<Uuid>)>=sqlx::query_as("SELECT attributes,is_uploaded,project_id FROM file_assets WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL AND NOT is_deleted").bind(id).bind(ws.workspace_id).fetch_optional(&st.db).await?;
-    let (attrs, uploaded, project) = row.ok_or_else(ApiError::not_found)?;
+    let row: Option<LookupAssetRow> = sqlx::query_as(
+        "SELECT attributes, is_uploaded, project_id, issue_id, comment_id, entity_type, created_by_id
+             FROM file_assets WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL AND NOT is_deleted",
+    )
+    .bind(id)
+    .bind(ws.workspace_id)
+    .fetch_optional(&st.db)
+    .await?;
+    let (attrs, uploaded, project, issue_id, comment_id, entity_type, created_by_id) =
+        row.ok_or_else(ApiError::not_found)?;
     if let Some(project) = project {
-        require_project(&st.db, user, slug, project).await?;
+        let p = require_project(&st.db, user, slug, project).await?;
+        if assets::asset_hidden_from_guest(&st.db, project, user.id, p.restricted_guest(), issue_id, comment_id).await?
+        {
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                json!({"error": "You don't have access to this asset."}),
+            ));
+        }
     }
-    Ok((attrs, uploaded))
+    Ok((
+        attrs,
+        uploaded,
+        assets::PermAsset {
+            workspace_id: Some(ws.workspace_id),
+            project_id: project,
+            entity_type,
+            created_by_id,
+        },
+        ws.role,
+    ))
 }
 async fn download(
     State(st): State<AppState>,
@@ -203,7 +245,7 @@ async fn download(
     Path((slug, id)): Path<(String, Uuid)>,
 ) -> ApiResult {
     api_key(&headers)?;
-    let (attrs, uploaded) = lookup(&st, &user, &slug, id).await?;
+    let (attrs, uploaded, _, _) = lookup(&st, &user, &slug, id).await?;
     if !uploaded {
         return Err(ApiError::bad("Asset not yet uploaded"));
     }
@@ -216,24 +258,24 @@ async fn update(
     headers: HeaderMap,
     user: CurrentUser,
     Path((slug, id)): Path<(String, Uuid)>,
-    Json(b): Json<Value>,
+    body: Option<Json<Value>>,
 ) -> ApiResult<StatusCode> {
     api_key(&headers)?;
-    let (_, old) = lookup(&st, &user, &slug, id).await?;
-    let uploaded = match b.get("is_uploaded") {
-        None => old,
-        Some(v) => v.as_bool().ok_or_else(|| ApiError::bad("Invalid is_uploaded"))?,
-    };
-    let ws = require_workspace(&st.db, &user, &slug).await?;
-    sqlx::query("UPDATE file_assets SET is_uploaded=$3 WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL")
+    let _ = body;
+    let (_, _, perm, ws_role) = lookup(&st, &user, &slug, id).await?;
+    if !assets::can_modify_file_asset(&st.db, &user, ws_role, &perm).await? {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            json!({"error": "You don't have the required permissions."}),
+        ));
+    }
+    let ws_id = perm.workspace_id.expect("workspace asset");
+    sqlx::query("UPDATE file_assets SET is_uploaded=true WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL")
         .bind(id)
-        .bind(ws.workspace_id)
-        .bind(uploaded)
+        .bind(ws_id)
         .execute(&st.db)
         .await?;
-    if uploaded {
-        crate::side_effects::spawn_asset_storage_metadata(st.clone(), id);
-    }
+    crate::side_effects::spawn_asset_storage_metadata(st.clone(), id);
     no_content()
 }
 
@@ -246,28 +288,71 @@ async fn enabled(st: &AppState) -> Result<(), ApiError> {
 }
 async fn schema(State(st): State<AppState>) -> ApiResult {
     enabled(&st).await?;
-    // ponytail: static route inventory only, add generated operation schemas when detailed documentation is needed.
     let mut paths = serde_json::Map::new();
     for source in [
         include_str!("api_v1.rs"),
         include_str!("api_v1_items.rs"),
         include_str!("api_v1_assets.rs"),
+        include_str!("api_v1_extra.rs"),
     ] {
-        for path in source
-            .split('"')
-            .filter(|s| s.starts_with("/api/v1/") && s.ends_with('/'))
-        {
+        let bytes = source.as_bytes();
+        let mut idx = 0usize;
+        while let Some(rel) = source[idx..].find("\"/api/v1/") {
+            let start = idx + rel + 1;
+            let Some(end_rel) = source[start..].find('"') else {
+                break;
+            };
+            let path = &source[start..start + end_rel];
+            idx = start + end_rel + 1;
+            if !path.ends_with('/') {
+                continue;
+            }
+            let snippet_end = (idx + 220).min(bytes.len());
+            let snippet = source.get(idx..snippet_end).unwrap_or("");
             let params: Vec<Value> = path
                 .split('{')
                 .skip(1)
                 .filter_map(|part| part.split('}').next())
                 .map(|name| json!({"name":name,"in":"path","required":true,"schema":{"type":"string"}}))
                 .collect();
-            paths.insert(path.to_string(), json!({"parameters":params}));
+            let mut item = serde_json::Map::new();
+            if !params.is_empty() {
+                item.insert("parameters".into(), Value::Array(params));
+            }
+            for (needle, method) in [
+                ("get(", "get"),
+                ("post(", "post"),
+                (".post(", "post"),
+                ("patch(", "patch"),
+                (".patch(", "patch"),
+                ("put(", "put"),
+                (".put(", "put"),
+                ("delete(", "delete"),
+                (".delete(", "delete"),
+            ] {
+                if snippet.contains(needle) {
+                    item.entry(method.to_string()).or_insert_with(|| {
+                        json!({
+                            "summary": format!("{} {}", method.to_uppercase(), path),
+                            "responses": {"200": {"description": "OK"}}
+                        })
+                    });
+                }
+            }
+            if !item
+                .keys()
+                .any(|k| matches!(k.as_str(), "get" | "post" | "patch" | "put" | "delete"))
+            {
+                item.insert(
+                    "get".into(),
+                    json!({"summary": format!("GET {path}"), "responses": {"200": {"description": "OK"}}}),
+                );
+            }
+            paths.insert(path.to_string(), Value::Object(item));
         }
     }
     Ok(Json(
-        json!({"openapi":"3.0.3","info":{"title":"Saturn API","version":"1.0.0"},"paths":paths}),
+        json!({"openapi":"3.0.3","info":{"title":"Saturn API","version":env!("CARGO_PKG_VERSION")},"paths":paths}),
     ))
 }
 async fn swagger(State(st): State<AppState>) -> Result<Html<&'static str>, ApiError> {

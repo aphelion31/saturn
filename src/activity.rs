@@ -75,6 +75,7 @@ where
     Ok(())
 }
 
+#[expect(clippy::too_many_arguments)]
 pub async fn grouping(
     conn: &mut sqlx::PgConnection,
     issue: Uuid,

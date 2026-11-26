@@ -51,6 +51,25 @@ pub async fn health() -> Json<serde_json::Value> {
     Json(json!({"status": "OK"}))
 }
 
+/// Readiness probe checking PostgreSQL connectivity.
+pub async fn ready(State(st): State<AppState>) -> Response {
+    match sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(&st.db).await {
+        Ok(_) => (StatusCode::OK, Json(json!({"status": "OK"}))).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "readiness check failed");
+            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"status": "UNAVAILABLE"}))).into_response()
+        }
+    }
+}
+
+pub async fn robots_txt() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain")],
+        "User-agent: *\nDisallow: /",
+    )
+}
+
 /// Any `/api/...` route Saturn does not implement yet. Logged so gaps are visible.
 pub async fn not_implemented(req: Request) -> Response {
     tracing::warn!(method = %req.method(), path = %req.uri().path(), "unported endpoint");
@@ -74,10 +93,26 @@ pub async fn origin_check(State(st): State<AppState>, req: Request, next: Next) 
             .get(header::HOST)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let origin_host = origin.split("://").nth(1).unwrap_or("");
+        let origin_host = origin.split("://").nth(1).unwrap_or("").trim_end_matches('/');
         let web_host = st.cfg.web_url.split("://").nth(1).unwrap_or("").trim_end_matches('/');
+        let extra_ok = ["APP_BASE_URL", "ADMIN_BASE_URL", "SPACE_BASE_URL", "LIVE_BASE_URL"]
+            .into_iter()
+            .chain(std::iter::once("CORS_ALLOWED_ORIGINS"))
+            .any(|var| {
+                std::env::var(var).ok().is_some_and(|raw| {
+                    raw.split(',').any(|entry| {
+                        entry
+                            .trim()
+                            .split("://")
+                            .nth(1)
+                            .unwrap_or("")
+                            .trim_end_matches('/')
+                            .eq_ignore_ascii_case(origin_host)
+                    })
+                })
+            });
         let ok = !origin_host.is_empty()
-            && (origin_host.eq_ignore_ascii_case(host) || origin_host.eq_ignore_ascii_case(web_host));
+            && (origin_host.eq_ignore_ascii_case(host) || origin_host.eq_ignore_ascii_case(web_host) || extra_ok);
         if !ok {
             return (
                 StatusCode::FORBIDDEN,

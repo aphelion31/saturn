@@ -1066,12 +1066,13 @@ async fn activity_retrieve(
 /// Plane v1 IssueSerializer fields: model columns as plain ids, minus description_json/stripped.
 /// `assignees` and `labels` are uuid lists. Not restricted by `ACTIVE`, callers add their own filter.
 const ITEM_V1: &str = "jsonb_build_object(
-    'id', i.id, 'name', i.name, 'description_html', i.description_html, 'priority', i.priority,
-    'start_date', i.start_date, 'target_date', i.target_date, 'sequence_id', i.sequence_id,
+    'id', i.id, 'name', i.name, 'description_html', i.description_html, 'description_binary', i.description_binary,
+    'priority', i.priority, 'start_date', i.start_date, 'target_date', i.target_date, 'sequence_id', i.sequence_id,
     'sort_order', i.sort_order, 'completed_at', i.completed_at, 'archived_at', i.archived_at,
-    'is_draft', i.is_draft, 'external_id', i.external_id, 'external_source', i.external_source,
-    'point', i.point, 'estimate_point', i.estimate_point_id, 'state', i.state_id, 'parent', i.parent_id,
-    'type', i.type_id, 'project', i.project_id, 'workspace', i.workspace_id,
+    'deleted_at', i.deleted_at, 'is_draft', i.is_draft, 'external_id', i.external_id,
+    'external_source', i.external_source, 'point', i.point, 'estimate_point', i.estimate_point_id,
+    'state', i.state_id, 'parent', i.parent_id, 'type', i.type_id, 'type_id', i.type_id,
+    'project', i.project_id, 'workspace', i.workspace_id,
     'created_by', i.created_by_id, 'updated_by', i.updated_by_id,
     'created_at', i.created_at, 'updated_at', i.updated_at,
     'assignees', COALESCE((SELECT jsonb_agg(a.assignee_id) FROM issue_assignees a JOIN users u ON u.id = a.assignee_id
@@ -1128,11 +1129,11 @@ async fn list(
         vec![Arg::Uuid(project_id), Arg::Uuid(p.workspace_id())],
     );
     scoped(&p, &mut base);
-    let mut resp = workitems::list(&st.db, base, &q, Scope::Project(project_id)).await?;
-    if let Some(orig) = requested_group_by {
-        if let Some(obj) = resp.0.as_object_mut() {
-            obj.insert("grouped_by".to_string(), json!(orig));
-        }
+    let mut resp = workitems::list_with(&st.db, base, &q, Scope::Project(project_id), ITEM_V1).await?;
+    if let Some(orig) = requested_group_by
+        && let Some(obj) = resp.0.as_object_mut()
+    {
+        obj.insert("grouped_by".to_string(), json!(orig));
     }
     Ok(resp)
 }
@@ -1438,11 +1439,12 @@ async fn update(
         sqlx::query("UPDATE issues SET completed_at = CASE WHEN $4 THEN now() ELSE NULL END WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL")
             .bind(pk).bind(project_id).bind(p.workspace_id()).bind(is_done).execute(&mut *tx).await?;
     }
-    if (b.get("state_id").is_some() || b.get("state").is_some()) && target_state_id != old_state_id {
-        if let Some(sid) = target_state_id {
-            sqlx::query("UPDATE issues SET state_id = $4, updated_at = now(), updated_by_id = $5 WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL")
+    if (b.get("state_id").is_some() || b.get("state").is_some())
+        && target_state_id != old_state_id
+        && let Some(sid) = target_state_id
+    {
+        sqlx::query("UPDATE issues SET state_id = $4, updated_at = now(), updated_by_id = $5 WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL")
                 .bind(pk).bind(project_id).bind(p.workspace_id()).bind(sid).bind(user.id).execute(&mut *tx).await?;
-        }
     }
 
     let has_start = b.get("start_date").is_some();

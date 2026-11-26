@@ -1,8 +1,8 @@
 {
   "name": "admin",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "private": true,
-  "description": "Admin UI for Plane",
+  "description": "Admin UI for Saturn",
   "license": "AGPL-3.0",
   "type": "module",
   "scripts": {

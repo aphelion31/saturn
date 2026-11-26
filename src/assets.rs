@@ -170,6 +170,7 @@ struct NewAsset<'a> {
     target_user_id: Option<Uuid>,
     page_id: Option<Uuid>,
     comment_id: Option<Uuid>,
+    draft_issue_id: Option<Uuid>,
     images_only: bool,
 }
 
@@ -205,8 +206,8 @@ async fn insert_asset(st: &AppState, a: NewAsset<'_>, b: &Value) -> ApiResult {
     let key = format!("{}/{}-{}", a.workspace_id, id.simple(), name);
     sqlx::query(
         "INSERT INTO file_assets (id, attributes, asset, size, workspace_id, created_by_id, updated_by_id, entity_type,
-                                  entity_identifier, project_id, issue_id, user_id, page_id, comment_id, is_uploaded)
-         VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8, $9, $10, $11, $12, $13, false)",
+                                  entity_identifier, project_id, issue_id, user_id, page_id, comment_id, draft_issue_id, is_uploaded)
+         VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8, $9, $10, $11, $12, $13, $14, false)",
     )
     .bind(id)
     .bind(json!({"name": name, "type": typ, "size": size}))
@@ -221,20 +222,107 @@ async fn insert_asset(st: &AppState, a: NewAsset<'_>, b: &Value) -> ApiResult {
     .bind(a.target_user_id)
     .bind(a.page_id)
     .bind(a.comment_id)
+    .bind(a.draft_issue_id)
     .execute(&st.db)
     .await?;
     Ok(Json(upload_response(id, &st.cfg.secret_key)))
 }
 
-fn entity_ids(entity_type: &str, b: &Value) -> (Option<Uuid>, Option<Uuid>, Option<Uuid>, Option<Uuid>) {
-    let id = uuid_of(b, "entity_identifier");
+#[derive(Default)]
+struct EntityIds {
+    issue_id: Option<Uuid>,
+    target_user_id: Option<Uuid>,
+    page_id: Option<Uuid>,
+    comment_id: Option<Uuid>,
+    draft_issue_id: Option<Uuid>,
+}
+
+fn entity_ids(entity_type: &str, id: Option<Uuid>) -> EntityIds {
     match entity_type {
-        "ISSUE_ATTACHMENT" | "ISSUE_DESCRIPTION" => (id, None, None, None),
-        "USER_AVATAR" | "USER_COVER" => (None, id, None, None),
-        "PAGE_DESCRIPTION" => (None, None, id, None),
-        "COMMENT_DESCRIPTION" => (None, None, None, id),
-        _ => (None, None, None, None),
+        "ISSUE_ATTACHMENT" | "ISSUE_DESCRIPTION" => EntityIds {
+            issue_id: id,
+            ..Default::default()
+        },
+        "USER_AVATAR" | "USER_COVER" => EntityIds {
+            target_user_id: id,
+            ..Default::default()
+        },
+        "PAGE_DESCRIPTION" => EntityIds {
+            page_id: id,
+            ..Default::default()
+        },
+        "COMMENT_DESCRIPTION" => EntityIds {
+            comment_id: id,
+            ..Default::default()
+        },
+        "DRAFT_ISSUE_DESCRIPTION" => EntityIds {
+            draft_issue_id: id,
+            ..Default::default()
+        },
+        _ => EntityIds::default(),
     }
+}
+
+async fn can_bind_asset(
+    db: &sqlx::PgPool,
+    user_id: Uuid,
+    workspace_id: Uuid,
+    entity_type: &str,
+    entity_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+) -> Result<bool, ApiError> {
+    let Some(eid) = entity_id else {
+        return Ok(true);
+    };
+    if matches!(entity_type, "USER_AVATAR" | "USER_COVER") {
+        return Ok(eid == user_id);
+    }
+    if entity_type == "DRAFT_ISSUE_DESCRIPTION" {
+        return Ok(sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM draft_issues WHERE id = $1 AND workspace_id = $2 AND created_by_id = $3 AND ($4::uuid IS NULL OR project_id = $4) AND deleted_at IS NULL)",
+        )
+        .bind(eid)
+        .bind(workspace_id)
+        .bind(user_id)
+        .bind(project_id)
+        .fetch_one(db)
+        .await?);
+    }
+    let sql = match entity_type {
+        "ISSUE_ATTACHMENT" | "ISSUE_DESCRIPTION" => {
+            "SELECT EXISTS (
+            SELECT 1 FROM issues i
+            JOIN project_members pm ON pm.project_id = i.project_id AND pm.workspace_id = i.workspace_id
+            WHERE i.id = $1 AND i.workspace_id = $2 AND i.deleted_at IS NULL
+              AND pm.member_id = $3 AND pm.is_active AND pm.deleted_at IS NULL
+              AND ($4::uuid IS NULL OR i.project_id = $4))"
+        }
+        "COMMENT_DESCRIPTION" => {
+            "SELECT EXISTS (
+            SELECT 1 FROM issue_comments ic
+            JOIN project_members pm ON pm.project_id = ic.project_id AND pm.workspace_id = ic.workspace_id
+            WHERE ic.id = $1 AND ic.workspace_id = $2 AND ic.deleted_at IS NULL
+              AND pm.member_id = $3 AND pm.is_active AND pm.deleted_at IS NULL
+              AND ($4::uuid IS NULL OR ic.project_id = $4))"
+        }
+        "PAGE_DESCRIPTION" => {
+            "SELECT EXISTS (
+            SELECT 1 FROM project_pages pp
+            JOIN pages p ON p.id = pp.page_id AND p.workspace_id = pp.workspace_id
+            JOIN project_members pm ON pm.project_id = pp.project_id AND pm.workspace_id = pp.workspace_id
+            WHERE pp.page_id = $1 AND pp.workspace_id = $2 AND pp.deleted_at IS NULL AND p.deleted_at IS NULL
+              AND pm.member_id = $3 AND pm.is_active AND pm.deleted_at IS NULL
+              AND ($4::uuid IS NULL OR pp.project_id = $4))"
+        }
+        _ => return Ok(true),
+    };
+    Ok(sqlx::query_scalar(sql)
+        .bind(eid)
+        .bind(workspace_id)
+        .bind(user_id)
+        .bind(project_id)
+        .fetch_one(db)
+        .await?)
 }
 
 async fn create_workspace_asset(
@@ -251,18 +339,30 @@ async fn create_workspace_asset(
             json!({"error": "Only workspace admins can upload a workspace logo."}),
         ));
     }
-    let (issue_id, target_user_id, page_id, comment_id) = entity_ids(entity_type, &b);
+    let entity_id = uuid_of(&b, "entity_identifier");
+    let explicit_project = uuid_of(&b, "project_id");
+    let check_project = if entity_type == "PROJECT_COVER" {
+        entity_id
+    } else {
+        explicit_project
+    };
+    if !can_bind_asset(&st.db, user.id, ws.workspace_id, entity_type, entity_id, check_project).await? {
+        return Err(ApiError::bad_body(
+            json!({"error": "Invalid entity identifier.", "status": false}),
+        ));
+    }
+    let ids = entity_ids(entity_type, entity_id);
     let project_id = if entity_type == "PROJECT_COVER" {
-        uuid_of(&b, "entity_identifier")
-    } else if let Some(pid) = uuid_of(&b, "project_id") {
+        entity_id
+    } else if let Some(pid) = explicit_project {
         Some(pid)
-    } else if let Some(iid) = issue_id {
+    } else if let Some(iid) = ids.issue_id {
         sqlx::query_scalar("SELECT project_id FROM issues WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL")
             .bind(iid)
             .bind(ws.workspace_id)
             .fetch_optional(&st.db)
             .await?
-    } else if let Some(cid) = comment_id {
+    } else if let Some(cid) = ids.comment_id {
         sqlx::query_scalar(
             "SELECT project_id FROM issue_comments WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
         )
@@ -270,15 +370,42 @@ async fn create_workspace_asset(
         .bind(ws.workspace_id)
         .fetch_optional(&st.db)
         .await?
-    } else if let Some(pgid) = page_id {
+    } else if let Some(pgid) = ids.page_id {
         sqlx::query_scalar("SELECT project_id FROM project_pages WHERE page_id = $1 AND workspace_id = $2 AND deleted_at IS NULL LIMIT 1")
             .bind(pgid)
             .bind(ws.workspace_id)
             .fetch_optional(&st.db)
             .await?
+    } else if let Some(did) = ids.draft_issue_id {
+        sqlx::query_scalar(
+            "SELECT project_id FROM draft_issues WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
+        )
+        .bind(did)
+        .bind(ws.workspace_id)
+        .fetch_optional(&st.db)
+        .await?
     } else {
         None
     };
+    if project_id.is_some()
+        && !can_modify_file_asset(
+            &st.db,
+            &user,
+            ws.role,
+            &PermAsset {
+                workspace_id: Some(ws.workspace_id),
+                project_id,
+                entity_type: Some(entity_type.to_string()),
+                created_by_id: Some(user.id),
+            },
+        )
+        .await?
+    {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            json!({"error": "You don't have the required permissions."}),
+        ));
+    }
     insert_asset(
         &st,
         NewAsset {
@@ -286,10 +413,11 @@ async fn create_workspace_asset(
             user_id: user.id,
             entity_type,
             project_id,
-            issue_id,
-            target_user_id,
-            page_id,
-            comment_id,
+            issue_id: ids.issue_id,
+            target_user_id: ids.target_user_id,
+            page_id: ids.page_id,
+            comment_id: ids.comment_id,
+            draft_issue_id: ids.draft_issue_id,
             images_only: true,
         },
         &b,
@@ -306,7 +434,22 @@ async fn create_project_asset(
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER, GUEST])?;
     let entity_type = s(&b, "entity_type").unwrap_or("");
-    let (issue_id, _, page_id, comment_id) = entity_ids(entity_type, &b);
+    let entity_id = uuid_of(&b, "entity_identifier");
+    if !can_bind_asset(
+        &st.db,
+        user.id,
+        p.workspace_id(),
+        entity_type,
+        entity_id,
+        Some(project_id),
+    )
+    .await?
+    {
+        return Err(ApiError::bad_body(
+            json!({"error": "Invalid entity identifier.", "status": false}),
+        ));
+    }
+    let ids = entity_ids(entity_type, entity_id);
     insert_asset(
         &st,
         NewAsset {
@@ -314,10 +457,11 @@ async fn create_project_asset(
             user_id: user.id,
             entity_type,
             project_id: Some(project_id),
-            issue_id,
+            issue_id: ids.issue_id,
             target_user_id: None,
-            page_id,
-            comment_id,
+            page_id: ids.page_id,
+            comment_id: ids.comment_id,
+            draft_issue_id: ids.draft_issue_id,
             images_only: false,
         },
         &b,
@@ -452,6 +596,10 @@ pub(crate) async fn legacy_attachment_upload(
             }
             Some("asset") => {
                 let name = sanitize_filename(field.file_name().unwrap_or(""));
+                let ct = field.content_type().unwrap_or("").to_string();
+                if !crate::api_v1_assets::MIME.contains(&ct.as_str()) {
+                    return Err(ApiError::bad("Invalid file type."));
+                }
                 let mut buf = Vec::new();
                 while let Some(chunk) = field.chunk().await.map_err(|_| ApiError::bad("Upload interrupted"))? {
                     if buf.len() + chunk.len() > st.cfg.file_size_limit as usize {
@@ -529,10 +677,10 @@ pub(crate) fn disk_path(st: &AppState, key: &str) -> Result<std::path::PathBuf, 
         return Err(ApiError::bad("Invalid asset key"));
     }
     let path = st.cfg.storage_dir.join(key);
-    if let (Ok(real), Ok(root)) = (path.canonicalize(), st.cfg.storage_dir.canonicalize()) {
-        if !real.starts_with(&root) {
-            return Err(ApiError::not_found());
-        }
+    if let (Ok(real), Ok(root)) = (path.canonicalize(), st.cfg.storage_dir.canonicalize())
+        && !real.starts_with(&root)
+    {
+        return Err(ApiError::not_found());
     }
     Ok(path)
 }
@@ -624,7 +772,7 @@ async fn set_uploaded(st: &AppState, asset_id: Uuid, entity_type: &str, b: &Valu
             "UPDATE workspaces w SET logo_asset_id = f.id, logo = '' FROM file_assets f WHERE f.id = $1 AND w.id = f.workspace_id"
         }
         "PROJECT_COVER" => {
-            "UPDATE projects p SET cover_image_asset_id = f.id, cover_image = '' FROM file_assets f WHERE f.id = $1 AND p.id = f.project_id"
+            "UPDATE projects p SET cover_image_asset_id = f.id, cover_image = '' FROM file_assets f WHERE f.id = $1 AND p.id = f.project_id AND p.workspace_id = f.workspace_id"
         }
         "USER_AVATAR" => {
             "UPDATE users u SET avatar_asset_id = f.id, avatar = '' FROM file_assets f WHERE f.id = $1 AND u.id = f.user_id"
@@ -677,7 +825,47 @@ async fn delete_asset(
     no_content()
 }
 
-/// Members of the workspace may read its assets; project-scoped assets need project membership.
+pub(crate) async fn asset_hidden_from_guest(
+    db: &sqlx::PgPool,
+    project_id: Uuid,
+    user_id: Uuid,
+    restricted_guest: bool,
+    issue_id: Option<Uuid>,
+    comment_id: Option<Uuid>,
+) -> Result<bool, ApiError> {
+    if !restricted_guest {
+        return Ok(false);
+    }
+    let target_issue = match issue_id {
+        Some(id) => Some(id),
+        None => match comment_id {
+            Some(cid) => {
+                sqlx::query_scalar(
+                    "SELECT issue_id FROM issue_comments WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
+                )
+                .bind(cid)
+                .bind(project_id)
+                .fetch_optional(db)
+                .await?
+            }
+            None => None,
+        },
+    };
+    let Some(iid) = target_issue else {
+        return Ok(false);
+    };
+    let own: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM issues WHERE id = $1 AND project_id = $2 AND created_by_id = $3 AND deleted_at IS NULL)",
+    )
+    .bind(iid)
+    .bind(project_id)
+    .bind(user_id)
+    .fetch_one(db)
+    .await?;
+    Ok(!own)
+}
+
+/// Members of the workspace may read its assets; project-scoped assets need project membership and guest visibility.
 async fn readable_asset(
     st: &AppState,
     user: &CurrentUser,
@@ -685,9 +873,10 @@ async fn readable_asset(
     asset_id: Uuid,
     project_id: Option<Uuid>,
 ) -> Result<(String, Value), ApiError> {
+    type ReadableAssetRow = (String, Value, Option<Uuid>, Option<Uuid>, Option<Uuid>);
     let ws = require_workspace(&st.db, user, slug).await?;
-    let row: Option<(String, Value, Option<Uuid>)> = sqlx::query_as(
-        "SELECT asset, attributes, project_id FROM file_assets
+    let row: Option<ReadableAssetRow> = sqlx::query_as(
+        "SELECT asset, attributes, project_id, issue_id, comment_id FROM file_assets
          WHERE id = $1 AND workspace_id = $2 AND ($3::uuid IS NULL OR project_id = $3) AND is_uploaded AND deleted_at IS NULL",
     )
     .bind(asset_id)
@@ -695,9 +884,15 @@ async fn readable_asset(
     .bind(project_id)
     .fetch_optional(&st.db)
     .await?;
-    let (key, attrs, pid) = row.ok_or_else(ApiError::not_found)?;
+    let (key, attrs, pid, issue_id, comment_id) = row.ok_or_else(ApiError::not_found)?;
     if let Some(pid) = pid {
-        require_project(&st.db, user, slug, pid).await?;
+        let p = require_project(&st.db, user, slug, pid).await?;
+        if asset_hidden_from_guest(&st.db, pid, user.id, p.restricted_guest(), issue_id, comment_id).await? {
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                json!({"error": "You don't have access to this asset."}),
+            ));
+        }
     }
     Ok((key, attrs))
 }
@@ -744,16 +939,23 @@ async fn check_asset(
     Path((slug, id)): Path<(String, Uuid)>,
 ) -> ApiResult {
     let ws = require_workspace(&st.db, &user, &slug).await?;
-    let row: Option<(Option<Uuid>,)> =
-        sqlx::query_as("SELECT project_id FROM file_assets WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL")
-            .bind(id)
-            .bind(ws.workspace_id)
-            .fetch_optional(&st.db)
-            .await?;
+    let row: Option<(Option<Uuid>, Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
+        "SELECT project_id, issue_id, comment_id FROM file_assets WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .bind(ws.workspace_id)
+    .fetch_optional(&st.db)
+    .await?;
     let exists = match row {
         None => false,
-        Some((None,)) => true,
-        Some((Some(project),)) => require_project(&st.db, &user, &slug, project).await.is_ok(),
+        Some((None, _, _)) => true,
+        Some((Some(project), issue_id, comment_id)) => {
+            if let Ok(p) = require_project(&st.db, &user, &slug, project).await {
+                !asset_hidden_from_guest(&st.db, project, user.id, p.restricted_guest(), issue_id, comment_id).await?
+            } else {
+                false
+            }
+        }
     };
     Ok(Json(json!({"exists": exists})))
 }
@@ -804,42 +1006,51 @@ async fn duplicate_asset(
             .fetch_one(&st.db)
             .await?;
     let entity = uuid_of(&b, "entity_id");
-    let project = if entity_type == "PROJECT_COVER" {
+    let explicit_project = if entity_type == "PROJECT_COVER" {
         entity
     } else {
         uuid_of(&b, "project_id").or(source_project)
     };
-    if let Some(project) = project {
+    if let Some(project) = explicit_project {
         require_project(&st.db, &user, &slug, project).await?;
     }
-    if matches!(entity_type, "USER_AVATAR" | "USER_COVER") && entity != Some(user.id) {
-        return Err(ApiError::forbidden());
+    if !can_bind_asset(&st.db, user.id, ws.workspace_id, entity_type, entity, explicit_project).await? {
+        return Err(ApiError::bad("Invalid entity type or entity id"));
     }
-    if let Some(entity) = entity {
-        let sql = match entity_type {
-            "ISSUE_ATTACHMENT" | "ISSUE_DESCRIPTION" => Some(
-                "SELECT EXISTS (SELECT 1 FROM issues WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL)",
-            ),
-            "COMMENT_DESCRIPTION" => Some(
-                "SELECT EXISTS (SELECT 1 FROM issue_comments WHERE id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL)",
-            ),
-            "PAGE_DESCRIPTION" => Some(
-                "SELECT EXISTS (SELECT 1 FROM project_pages WHERE page_id = $1 AND project_id = $2 AND workspace_id = $3 AND deleted_at IS NULL)",
-            ),
-            _ => None,
-        };
-        if let Some(sql) = sql {
-            let valid: bool = sqlx::query_scalar(sql)
-                .bind(entity)
-                .bind(project)
-                .bind(ws.workspace_id)
-                .fetch_one(&st.db)
-                .await?;
-            if !valid {
-                return Err(ApiError::not_found());
-            }
-        }
-    }
+    let ids = entity_ids(entity_type, entity);
+    let project = if let Some(pid) = explicit_project {
+        Some(pid)
+    } else if let Some(iid) = ids.issue_id {
+        sqlx::query_scalar("SELECT project_id FROM issues WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL")
+            .bind(iid)
+            .bind(ws.workspace_id)
+            .fetch_optional(&st.db)
+            .await?
+    } else if let Some(cid) = ids.comment_id {
+        sqlx::query_scalar(
+            "SELECT project_id FROM issue_comments WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
+        )
+        .bind(cid)
+        .bind(ws.workspace_id)
+        .fetch_optional(&st.db)
+        .await?
+    } else if let Some(pgid) = ids.page_id {
+        sqlx::query_scalar("SELECT project_id FROM project_pages WHERE page_id = $1 AND workspace_id = $2 AND deleted_at IS NULL LIMIT 1")
+            .bind(pgid)
+            .bind(ws.workspace_id)
+            .fetch_optional(&st.db)
+            .await?
+    } else if let Some(did) = ids.draft_issue_id {
+        sqlx::query_scalar(
+            "SELECT project_id FROM draft_issues WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
+        )
+        .bind(did)
+        .bind(ws.workspace_id)
+        .fetch_optional(&st.db)
+        .await?
+    } else {
+        None
+    };
     let new_id = Uuid::new_v4();
     let name = sanitize_filename(attrs.get("name").and_then(Value::as_str).unwrap_or("unnamed"));
     let new_key = format!("{}/{}-{}", ws.workspace_id, new_id.simple(), name);
@@ -848,12 +1059,13 @@ async fn duplicate_asset(
         tokio::fs::create_dir_all(parent).await.map_err(io_err)?;
     }
     tokio::fs::copy(disk_path(&st, &key)?, &dest).await.map_err(io_err)?;
-    let result = sqlx::query("INSERT INTO file_assets (id, attributes, asset, size, workspace_id, created_by_id, updated_by_id, entity_type, project_id, issue_id, page_id, comment_id, user_id, is_uploaded) SELECT $1, attributes, $2, size, workspace_id, $3, $3, $4, $5, $6, $7, $8, $9, true FROM file_assets WHERE id = $10 AND workspace_id = $11 AND deleted_at IS NULL")
+    let result = sqlx::query("INSERT INTO file_assets (id, attributes, asset, size, workspace_id, created_by_id, updated_by_id, entity_type, project_id, issue_id, page_id, comment_id, user_id, draft_issue_id, is_uploaded) SELECT $1, attributes, $2, size, workspace_id, $3, $3, $4, $5, $6, $7, $8, $9, $10, true FROM file_assets WHERE id = $11 AND workspace_id = $12 AND deleted_at IS NULL")
         .bind(new_id).bind(&new_key).bind(user.id).bind(entity_type).bind(project)
-        .bind(if matches!(entity_type, "ISSUE_ATTACHMENT" | "ISSUE_DESCRIPTION") { entity } else { None })
-        .bind(if entity_type == "PAGE_DESCRIPTION" { entity } else { None })
-        .bind(if entity_type == "COMMENT_DESCRIPTION" { entity } else { None })
-        .bind(if matches!(entity_type, "USER_AVATAR" | "USER_COVER") { entity } else { None })
+        .bind(ids.issue_id)
+        .bind(ids.page_id)
+        .bind(ids.comment_id)
+        .bind(ids.target_user_id)
+        .bind(ids.draft_issue_id)
         .bind(id).bind(ws.workspace_id).execute(&st.db).await;
     if let Err(e) = result {
         let _ = tokio::fs::remove_file(dest).await;
@@ -878,7 +1090,7 @@ async fn bulk_assets(
             v.as_str()
                 .and_then(|s| {
                     let clean = s.split('?').next().unwrap_or(s).trim_end_matches('/');
-                    let last = clean.split('/').last().unwrap_or(clean);
+                    let last = clean.split('/').next_back().unwrap_or(clean);
                     Uuid::parse_str(last).ok()
                 })
                 .ok_or_else(|| ApiError::bad("Invalid asset id"))
@@ -904,6 +1116,9 @@ async fn bulk_assets(
         .await?;
         return no_content();
     }
+    if !can_bind_asset(&st.db, user.id, p.workspace_id(), &typ, Some(entity), Some(project)).await? {
+        return no_content();
+    }
     let sql = match typ.as_str() {
         "ISSUE_DESCRIPTION" => {
             "UPDATE file_assets SET issue_id = $5, project_id = $4 WHERE id = ANY($1) AND workspace_id = $2 AND created_by_id = $3 AND (project_id IS NULL OR project_id = $4) AND deleted_at IS NULL AND EXISTS (SELECT 1 FROM issues WHERE id = $5 AND project_id = $4 AND workspace_id = $2 AND deleted_at IS NULL)"
@@ -915,7 +1130,7 @@ async fn bulk_assets(
             "UPDATE file_assets SET page_id = $5, project_id = $4 WHERE id = ANY($1) AND workspace_id = $2 AND created_by_id = $3 AND (project_id IS NULL OR project_id = $4) AND deleted_at IS NULL AND EXISTS (SELECT 1 FROM project_pages WHERE page_id = $5 AND project_id = $4 AND workspace_id = $2 AND deleted_at IS NULL)"
         }
         "DRAFT_ISSUE_DESCRIPTION" => {
-            "UPDATE file_assets SET draft_issue_id = $5, project_id = $4 WHERE id = ANY($1) AND workspace_id = $2 AND created_by_id = $3 AND (project_id IS NULL OR project_id = $4) AND deleted_at IS NULL AND EXISTS (SELECT 1 FROM draft_issues WHERE id = $5 AND project_id = $4 AND workspace_id = $2 AND deleted_at IS NULL)"
+            "UPDATE file_assets SET draft_issue_id = $5, project_id = $4 WHERE id = ANY($1) AND workspace_id = $2 AND created_by_id = $3 AND (project_id IS NULL OR project_id = $4) AND deleted_at IS NULL AND EXISTS (SELECT 1 FROM draft_issues WHERE id = $5 AND project_id = $4 AND workspace_id = $2 AND created_by_id = $3 AND deleted_at IS NULL)"
         }
         _ => return no_content(),
     };
@@ -1059,6 +1274,7 @@ async fn create_attachment(
             target_user_id: None,
             page_id: None,
             comment_id: None,
+            draft_issue_id: None,
             images_only: false,
         },
         &b,
@@ -1206,15 +1422,14 @@ pub(crate) async fn require_workspace_by_id(
 }
 
 #[derive(Clone, Debug, sqlx::FromRow)]
-struct PermAsset {
-    id: Uuid,
-    workspace_id: Option<Uuid>,
-    project_id: Option<Uuid>,
-    entity_type: Option<String>,
-    created_by_id: Option<Uuid>,
+pub(crate) struct PermAsset {
+    pub(crate) workspace_id: Option<Uuid>,
+    pub(crate) project_id: Option<Uuid>,
+    pub(crate) entity_type: Option<String>,
+    pub(crate) created_by_id: Option<Uuid>,
 }
 
-async fn can_modify_file_asset(
+pub(crate) async fn can_modify_file_asset(
     db: &sqlx::PgPool,
     user: &CurrentUser,
     workspace_role: i16,
@@ -1249,7 +1464,7 @@ async fn can_modify_file_asset(
     if asset.entity_type.as_deref() == Some("ISSUE_ATTACHMENT") {
         return Ok(role == Some(ADMIN));
     }
-    Ok(role.map_or(false, |r| r >= MEMBER))
+    Ok(role.is_some_and(|r| r >= MEMBER))
 }
 
 /// GET /api/users/file-assets/
@@ -1347,12 +1562,13 @@ async fn legacy_upload_user_asset(
 
 /// Helper to load a user's asset by pk (UUID or asset path). Returns 403 if owned by another user.
 async fn check_user_asset_pk(st: &AppState, user: &CurrentUser, pk: &str) -> Result<(Uuid, Option<String>), ApiError> {
+    type UserAssetRow = (Uuid, Option<Uuid>, Option<Uuid>, Option<String>);
     let clean_pk = pk.split('?').next().unwrap_or(pk);
     if clean_pk.contains("..") || clean_pk.starts_with('/') || clean_pk.contains('\\') {
         return Err(ApiError::bad("Invalid asset key"));
     }
     let parsed_uuid = Uuid::parse_str(clean_pk).ok();
-    let row: Option<(Uuid, Option<Uuid>, Option<Uuid>, Option<String>)> = sqlx::query_as(
+    let row: Option<UserAssetRow> = sqlx::query_as(
         "SELECT id, created_by_id, user_id, entity_type FROM file_assets
          WHERE ($1::uuid IS NOT NULL AND id = $1)
             OR asset = $2
@@ -1428,8 +1644,18 @@ async fn legacy_get_workspace_asset(
            AND f.deleted_at IS NULL
            AND (f.project_id IS NULL OR EXISTS (
                SELECT 1 FROM project_members pm
+               JOIN projects pr ON pr.id = pm.project_id AND pr.workspace_id = pm.workspace_id AND pr.deleted_at IS NULL
                WHERE pm.workspace_id = f.workspace_id AND pm.project_id = f.project_id
                  AND pm.member_id = $4 AND pm.is_active AND pm.deleted_at IS NULL
+                 AND (
+                     pm.role > 5 OR pr.guest_view_all_features
+                     OR COALESCE(f.issue_id, (SELECT ic.issue_id FROM issue_comments ic WHERE ic.id = f.comment_id AND ic.deleted_at IS NULL)) IS NULL
+                     OR EXISTS (
+                         SELECT 1 FROM issues i
+                         WHERE i.id = COALESCE(f.issue_id, (SELECT ic.issue_id FROM issue_comments ic WHERE ic.id = f.comment_id AND ic.deleted_at IS NULL))
+                           AND i.project_id = f.project_id AND i.created_by_id = $4 AND i.deleted_at IS NULL
+                     )
+                 )
            ))
          ORDER BY f.created_at DESC"
     ))
@@ -1459,8 +1685,8 @@ async fn legacy_delete_workspace_asset(
         return Err(ApiError::bad("Invalid asset key"));
     }
     let full_key = format!("{workspace_id}/{clean_key}");
-    let asset: Option<PermAsset> = sqlx::query_as(
-        "SELECT id, workspace_id, project_id, entity_type, created_by_id FROM file_assets
+    let asset: Option<(Uuid, Option<String>)> = sqlx::query_as(
+        "SELECT id, entity_type FROM file_assets
          WHERE (asset = $1 OR asset = $2) AND workspace_id = $3 AND deleted_at IS NULL",
     )
     .bind(&full_key)
@@ -1468,12 +1694,16 @@ async fn legacy_delete_workspace_asset(
     .bind(workspace_id)
     .fetch_optional(&st.db)
     .await?;
-
-    let asset = asset.ok_or_else(ApiError::not_found)?;
-    if !can_modify_file_asset(&st.db, &user, ws.role, &asset).await? {
+    let (asset_id, _) = asset.ok_or_else(ApiError::not_found)?;
+    let perm: PermAsset =
+        sqlx::query_as("SELECT workspace_id, project_id, entity_type, created_by_id FROM file_assets WHERE id = $1")
+            .bind(asset_id)
+            .fetch_one(&st.db)
+            .await?;
+    if !can_modify_file_asset(&st.db, &user, ws.role, &perm).await? {
         return Err(ApiError::forbidden());
     }
-    soft_delete(&st, asset.id, asset.entity_type.as_deref().unwrap_or("")).await?;
+    soft_delete(&st, asset_id, perm.entity_type.as_deref().unwrap_or("")).await?;
     no_content()
 }
 
@@ -1489,22 +1719,34 @@ async fn legacy_restore_workspace_asset(
         return Err(ApiError::bad("Invalid asset key"));
     }
     let full_key = format!("{workspace_id}/{clean_key}");
-    let asset: Option<PermAsset> = sqlx::query_as(
-        "SELECT id, workspace_id, project_id, entity_type, created_by_id FROM file_assets
+    let asset: Option<(Uuid, PermAsset)> =
+        sqlx::query_as::<_, (Uuid, Option<Uuid>, Option<Uuid>, Option<String>, Option<Uuid>)>(
+            "SELECT id, workspace_id, project_id, entity_type, created_by_id FROM file_assets
          WHERE (asset = $1 OR asset = $2) AND workspace_id = $3",
-    )
-    .bind(&full_key)
-    .bind(clean_key)
-    .bind(workspace_id)
-    .fetch_optional(&st.db)
-    .await?;
+        )
+        .bind(&full_key)
+        .bind(clean_key)
+        .bind(workspace_id)
+        .fetch_optional(&st.db)
+        .await?
+        .map(|(id, workspace_id, project_id, entity_type, created_by_id)| {
+            (
+                id,
+                PermAsset {
+                    workspace_id,
+                    project_id,
+                    entity_type,
+                    created_by_id,
+                },
+            )
+        });
 
-    let asset = asset.ok_or_else(ApiError::not_found)?;
-    if !can_modify_file_asset(&st.db, &user, ws.role, &asset).await? {
+    let (asset_id, perm) = asset.ok_or_else(ApiError::not_found)?;
+    if !can_modify_file_asset(&st.db, &user, ws.role, &perm).await? {
         return Err(ApiError::forbidden());
     }
     sqlx::query("UPDATE file_assets SET is_deleted = false, deleted_at = NULL, updated_at = now() WHERE id = $1 AND workspace_id = $2")
-        .bind(asset.id)
+        .bind(asset_id)
         .bind(workspace_id)
         .execute(&st.db)
         .await?;
@@ -1525,8 +1767,18 @@ async fn legacy_list_workspace_assets(
              WHERE f.workspace_id = $1 AND f.deleted_at IS NULL
                AND (f.project_id IS NULL OR EXISTS (
                    SELECT 1 FROM project_members pm
+                   JOIN projects pr ON pr.id = pm.project_id AND pr.workspace_id = pm.workspace_id AND pr.deleted_at IS NULL
                    WHERE pm.workspace_id = f.workspace_id AND pm.project_id = f.project_id
                      AND pm.member_id = $2 AND pm.is_active AND pm.deleted_at IS NULL
+                     AND (
+                         pm.role > 5 OR pr.guest_view_all_features
+                         OR COALESCE(f.issue_id, (SELECT ic.issue_id FROM issue_comments ic WHERE ic.id = f.comment_id AND ic.deleted_at IS NULL)) IS NULL
+                         OR EXISTS (
+                             SELECT 1 FROM issues i
+                             WHERE i.id = COALESCE(f.issue_id, (SELECT ic.issue_id FROM issue_comments ic WHERE ic.id = f.comment_id AND ic.deleted_at IS NULL))
+                               AND i.project_id = f.project_id AND i.created_by_id = $2 AND i.deleted_at IS NULL
+                         )
+                     )
                ))
              ORDER BY f.created_at DESC"
         ))
@@ -1574,6 +1826,9 @@ async fn legacy_create_workspace_asset(
                 Some("asset" | "file") => {
                     let name = sanitize_filename(field.file_name().unwrap_or("unnamed"));
                     let typ = field.content_type().unwrap_or("application/octet-stream").to_string();
+                    if !crate::api_v1_assets::MIME.contains(&typ.as_str()) {
+                        return Err(ApiError::bad("Invalid file type."));
+                    }
                     let mut buf = Vec::new();
                     let mut field = field;
                     while let Some(chunk) = field.chunk().await.map_err(|_| ApiError::bad("Upload interrupted"))? {

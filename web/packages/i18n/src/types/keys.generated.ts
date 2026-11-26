@@ -5,7 +5,7 @@
  */
 
 // AUTO-GENERATED — DO NOT EDIT
-// Generated from 28 English namespace files (3931 keys)
+// Generated from 28 English namespace files (3939 keys)
 // Run: pnpm run generate:types
 
 export type TTranslationKeys =
@@ -1740,6 +1740,7 @@ export type TTranslationKeys =
   | "power_k.search_menu.clear_search"
   | "power_k.search_menu.go_to_advanced_search"
   | "power_k.search_menu.no_results"
+  | "power_k.search_menu.search_commands"
   | "power_k.shortcuts_modal.no_results"
   | "power_k.shortcuts_modal.search_placeholder"
   | "power_k.shortcuts_modal.sequence_separator"
@@ -2465,6 +2466,13 @@ export type TTranslationKeys =
   | "renew"
   | "required"
   | "restore"
+  | "rich_filters.filter_item.invalid"
+  | "rich_filters.filter_item.invalid_tooltip"
+  | "rich_filters.filter_item.remove"
+  | "rich_filters.operators.between"
+  | "rich_filters.operators.is"
+  | "rich_filters.operators.is_any_of"
+  | "rich_filters.properties.subscriber"
   | "rich_filters.view_controls.hide_filters"
   | "rich_filters.view_controls.save_as"
   | "rich_filters.view_controls.save_options"

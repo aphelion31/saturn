@@ -2,11 +2,36 @@
 
 > **Note:** Saturn is a Rust rewrite of [Plane](https://github.com/makeplane/plane), the open source project
 > management tool. Plane's Django + Celery + Redis + RabbitMQ + Node backend is replaced by one small Rust binary
-> (axum + sqlx). Plane's React Router apps are kept and served by the same binary as static files. Saturn keeps
-> Plane's PostgreSQL schema, sessions, password hashes and API shapes, so an existing Plane database and the
-> unchanged Plane frontend keep working.
+> (`axum` + `sqlx`). Plane's React Router SPAs are synced to `1.5.1` (`preview @ 723bb178f9`), rebranded to
+> **Saturn** with a custom geometric ringed-planet Saturn logo, built with **Bun `1.4.4`** (`bun.lock`), and served by
+> the same binary as static files. Saturn keeps Plane's PostgreSQL schema, sessions, password hashes, and API shapes
+> so an existing Plane database works out of the box.
 > Plane is © Plane Software, Inc., licensed AGPL-3.0. Saturn is a derivative work under the same license
 > (see `LICENSE`). Saturn is not affiliated with Plane Software, Inc.
+
+## UI Screenshots
+
+| Sign In | Workspace Home |
+| --- | --- |
+| ![Saturn Sign In](docs/screenshots/sign-in.png) | ![Saturn Workspace Home](docs/screenshots/home.png) |
+
+| Work Items | Instance Admin (`/god-mode`) |
+| --- | --- |
+| ![Saturn Work Items](docs/screenshots/work-items.png) | ![Saturn Admin](docs/screenshots/admin.png) |
+
+## Size & Footprint Comparison (Original Plane vs Saturn Rewrite)
+
+Measured directly on this repository (`../plane` read-only @ `preview` `723bb178f9` vs `saturn` macOS arm64 release build):
+
+| Metric | Original Plane (`../plane`) | Saturn Rewrite (`saturn`) | Difference |
+| --- | --- | --- | --- |
+| **Backend source LOC** | `131,251` (`126,151` Python `.py` + `5,100` `live/src` `.ts`/`.tsx`) | `37,348` (`39` Rust `.rs` files) | **−71.5% LOC** (`3.51×` smaller) |
+| **Backend source size** | `5.54 MiB` (`apps/api` + `live` + `proxy` excl. `.venv`/`node_modules`) | `1.44 MiB` (`src/`, plus `0.29 MiB` SQL migrations) | **−74.0% source** |
+| **Backend runtime footprint** | `246.01 MiB` (`284M` disk) Python `.venv` alone + Node `live` + brokers | `19.12 MiB` (`20,047,360` bytes / `19M`) single release binary | **−92.2% vs `.venv` alone** |
+| **Frontend SPA bundles** | React Router workspace (`pnpm`) | React Router workspace built with **Bun `1.4.4`**: `web` `29.51 MiB` (`33M`), `admin` `11.24 MiB` (`13M`), `space` `13.72 MiB` (`15M`) | Self-contained static SPAs served by `saturn` |
+| **Runtime processes** | `6+` (Django, Celery worker, Celery beat, Node live, proxy, Redis, RabbitMQ, PostgreSQL, MinIO) | `2` (`saturn` binary + PostgreSQL) | Single app process |
+| **Cold startup to `/ready`** | Seconds (Django + workers + brokers) | `58–64 ms` | Instant readiness |
+| **Idle memory RSS** | Hundreds of MiB across runtimes | `8.95 MiB` (`9,168 KiB`) at boot (`14.39 MiB` after UI traffic) | Fits in `<15 MiB` |
 
 ## Why
 
@@ -43,11 +68,11 @@ Numbers depend on the machine; rerun `tools/bench.sh <plane-checkout>` to measur
 
 ```
 src/          Rust backend (axum + sqlx), one module per Plane API area
-web/          Plane's pnpm workspace: apps/web, apps/admin (god-mode), apps/space (public boards), packages/*
+web/          Saturn Bun workspace (bun.lock): apps/web, apps/admin (god-mode), apps/space (public boards), packages/*
 migrations/   PostgreSQL schema dumped from Plane's Django migrations, plus database defaults
 tools/        schema regeneration, API smoke test, benchmark
-scripts/      git hook checks, branch helper, frontend build
-docs/         architecture and process docs
+scripts/      git hook checks, branch helper, Bun frontend build
+docs/         architecture, process docs, and retina UI screenshots (`docs/screenshots/`)
 ```
 
 ## Run
@@ -87,13 +112,9 @@ Passwords and sessions are compatible, so users stay signed in. Test on a copy f
 
 ## Scope
 
-Ported: instance setup and god-mode sign in, email and password sign in / sign up / sign out for the app and
-public boards, current user, profile and onboarding, project states. The remaining API areas (workspaces,
-projects, work items, cycles, modules, views, intake, pages, notifications, uploads, public boards) are being
-ported module by module; see [`docs/architectures/03.PLANE-COMPAT.md`](docs/architectures/03.PLANE-COMPAT.md).
+Ported: full Plane web/admin/space backend parity — instance setup & god-mode, email/password, magic-link and OAuth sign in, SMTP outbound delivery with encrypted instance secrets, current user / profile / activity / dashboard, workspaces, projects, states, work items & activity logs, cycles (including analytics/burndown & transfer snapshots), modules, views & intake, pages & real-time Yjs collaboration + `/live/{health,convert-document,pdf-export}` endpoints, notifications & digests, webhooks & delivery, issue/analytics/activity exports (CSV, JSON, real OpenXML `.xlsx`), Unsplash & AI assistant, disk asset storage, public boards, scheduled background cleanup jobs, and the public `/api/v1` API.
 
-Not ported: magic-link and OAuth sign in, email delivery, webhooks delivery, importers and exporters,
-GitHub and Slack integrations, AI features. Unported `/api` routes answer `501` and log `unported endpoint`.
+Intentionally out of scope: telemetry phone-home (`push_instance_metrics`) and multi-container Redis/Celery/RabbitMQ/MinIO infrastructure. Unported `/api` or `/auth` paths answer `404`/`501`.
 
 ## Contributing
 

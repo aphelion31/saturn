@@ -117,8 +117,8 @@ const COUNTS: &str = "LEFT JOIN LATERAL (
            count(*) FILTER (WHERE s.group = 'started') AS started_issues,
            count(*) FILTER (WHERE s.group = 'unstarted') AS unstarted_issues,
            count(*) FILTER (WHERE s.group = 'backlog') AS backlog_issues,
-           COALESCE(sum(ep.value::float8) FILTER (WHERE ep.id IS NOT NULL), 0)::float8 AS total_ep,
-           COALESCE(sum(ep.value::float8) FILTER (WHERE s.group = 'completed'), 0)::float8 AS completed_ep
+           COALESCE(sum(CASE WHEN ep.value ~ '^ *([0-9]+\\.?[0-9]*|\\.[0-9]+) *$' THEN ep.value::float8 END) FILTER (WHERE ep.id IS NOT NULL), 0)::float8 AS total_ep,
+           COALESCE(sum(CASE WHEN ep.value ~ '^ *([0-9]+\\.?[0-9]*|\\.[0-9]+) *$' THEN ep.value::float8 END) FILTER (WHERE s.group = 'completed'), 0)::float8 AS completed_ep
     FROM module_issues mi
     JOIN issues i ON i.id = mi.issue_id AND i.workspace_id = m.workspace_id AND i.project_id = m.project_id AND i.deleted_at IS NULL AND i.archived_at IS NULL AND NOT i.is_draft
     LEFT JOIN states s ON s.id = i.state_id AND s.workspace_id = m.workspace_id AND s.project_id = m.project_id AND s.deleted_at IS NULL
@@ -496,6 +496,7 @@ async fn destroy(
         sqlx::query(q).bind(pk).execute(&mut *tx).await?;
     }
     tx.commit().await?;
+    crate::jobs::spawn_soft_delete_cascade(st.clone(), "modules", pk);
     crate::webhook_out::emit(&st, p.workspace_id(), "module", "deleted", json!({"id": pk}), user.id);
     no_content()
 }
@@ -711,13 +712,11 @@ async fn get_issue(
     let p = require_project(&st.db, &user, &slug, project_id).await?;
     p.require(&[ADMIN, MEMBER])?;
     json_row(
-        sqlx::query_scalar(&format!(
-            "SELECT jsonb_build_object('id', mi.id, 'module_id', mi.module_id, 'issue_id', mi.issue_id,
+        sqlx::query_scalar("SELECT jsonb_build_object('id', mi.id, 'module_id', mi.module_id, 'issue_id', mi.issue_id,
                     'project_id', mi.project_id, 'workspace_id', mi.workspace_id, 'created_at', mi.created_at,
                     'updated_at', mi.updated_at, 'created_by', mi.created_by_id, 'updated_by', mi.updated_by_id)
              FROM module_issues mi JOIN issues i ON i.id = mi.issue_id AND i.deleted_at IS NULL
-             WHERE mi.module_id = $1 AND mi.issue_id = $2 AND mi.project_id = $3 AND mi.workspace_id = $4 AND mi.deleted_at IS NULL"
-        ))
+             WHERE mi.module_id = $1 AND mi.issue_id = $2 AND mi.project_id = $3 AND mi.workspace_id = $4 AND mi.deleted_at IS NULL")
         .bind(module_id)
         .bind(issue_id)
         .bind(project_id)
@@ -1202,20 +1201,6 @@ async fn get_archived(
     .await
 }
 
-#[cfg(test)]
-mod tests {
-    use super::check_url;
-
-    #[test]
-    fn check_url_adds_scheme_and_rejects_other_schemes() {
-        assert_eq!(check_url("example.com/x").unwrap(), "http://example.com/x");
-        assert_eq!(check_url("https://a.b").unwrap(), "https://a.b");
-        assert!(check_url("ftp://nope").is_err());
-        assert!(check_url("javascript:alert(1)").is_err());
-        assert!(check_url("http://").is_err());
-    }
-}
-
 /// `GET /api/workspaces/{slug}/modules/`: non-archived modules of every project the user is an active
 /// member of (Plane's `WorkspaceModulesEndpoint`).
 async fn workspace_list(State(st): State<AppState>, user: CurrentUser, Path(slug): Path<String>) -> ApiResult {
@@ -1235,4 +1220,18 @@ async fn workspace_list(State(st): State<AppState>, user: CurrentUser, Path(slug
         &st.db,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_url;
+
+    #[test]
+    fn check_url_adds_scheme_and_rejects_other_schemes() {
+        assert_eq!(check_url("example.com/x").unwrap(), "http://example.com/x");
+        assert_eq!(check_url("https://a.b").unwrap(), "https://a.b");
+        assert!(check_url("ftp://nope").is_err());
+        assert!(check_url("javascript:alert(1)").is_err());
+        assert!(check_url("http://").is_err());
+    }
 }

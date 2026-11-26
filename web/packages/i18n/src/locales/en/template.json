@@ -170,7 +170,7 @@
           },
           "company_name": {
             "label": "Company name",
-            "placeholder": "Plane",
+            "placeholder": "Saturn",
             "validation": {
               "required": "Company name is required",
               "maxLength": "Company name should be less than 255 characters"
@@ -186,7 +186,7 @@
           },
           "privacy_policy_url": {
             "label": "Link to your privacy policy",
-            "placeholder": "https://planes.so/privacy-policy",
+            "placeholder": "https://plane.so/privacy-policy",
             "validation": {
               "invalid": "Invalid URL",
               "maxLength": "URL should be less than 800 characters"
@@ -194,7 +194,7 @@
           },
           "terms_of_service_url": {
             "label": "Link to your terms of use",
-            "placeholder": "https://planes.so/terms-of-use",
+            "placeholder": "https://plane.so/terms-of-use",
             "validation": {
               "invalid": "Invalid URL",
               "maxLength": "URL should be less than 800 characters"
@@ -227,7 +227,7 @@
     "empty_state": {
       "upgrade": {
         "title": "Templates",
-        "description": "With project, work-item, and page templates in Plane, you don't have to create a project from scratch or set work item props manually.",
+        "description": "With project, work-item, and page templates in Saturn, you don't have to create a project from scratch or set work item props manually.",
         "sub_description": "Get 80% of your admin time back when you use Templates."
       },
       "no_templates": {

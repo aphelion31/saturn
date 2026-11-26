@@ -2,7 +2,7 @@
 use crate::common::*;
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{StatusCode, header},
     response::IntoResponse,
     routing::get,
@@ -57,6 +57,7 @@ pub fn routes() -> Router<AppState> {
             "/api/workspaces/{slug}/projects/{project_id}/pages/{page_id}/duplicate/",
             axum::routing::post(duplicate),
         )
+        .route("/api/workspaces/{slug}/pages/{page_id}/live-access/", get(live_access))
         .route("/live/collaboration", get(collaboration))
 }
 
@@ -89,7 +90,16 @@ async fn retrieve(
     let ctx = require_project(&st.db, &user, &slug, project).await?;
     ctx.require(&[ADMIN, MEMBER, GUEST])?;
     if !q.get("track_visit").is_some_and(|v| v.eq_ignore_ascii_case("false")) {
-        crate::recent_visits::record(&st.db, crate::recent_visits::Visit { workspace_id: ctx.workspace_id(), user_id: user.id, entity_name: "page", entity_identifier: id, project_id: Some(project) });
+        crate::recent_visits::record(
+            &st.db,
+            crate::recent_visits::Visit {
+                workspace_id: ctx.workspace_id(),
+                user_id: user.id,
+                entity_name: "page",
+                entity_identifier: id,
+                project_id: Some(project),
+            },
+        );
     }
     fetch(&st, &user, &slug, project, id).await
 }
@@ -107,6 +117,49 @@ async fn summary(State(st): State<AppState>, user: CurrentUser, Path((slug, proj
     json_row(sqlx::query_scalar(&format!("SELECT jsonb_build_object('public_pages',count(*) FILTER (WHERE p.access=0 AND p.archived_at IS NULL),'private_pages',count(*) FILTER (WHERE p.access=1 AND p.archived_at IS NULL),'archived_pages',count(*) FILTER (WHERE p.archived_at IS NOT NULL)) FROM pages p WHERE {SCOPE} AND p.parent_id IS NULL"))
         .bind(ctx.workspace_id()).bind(project).bind(user.id).bind(ctx.restricted_guest()), &st.db).await
 }
+fn optional_html(b: &Value) -> Result<Option<&str>, ApiError> {
+    match b.get("description_html") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        Some(_) => Err(ApiError::bad_body(json!({"description_html": "Not a valid string."}))),
+    }
+}
+
+async fn validate_page_parent(
+    db: &sqlx::PgPool,
+    workspace_id: Uuid,
+    project_id: Uuid,
+    page_id: Option<Uuid>,
+    b: &Value,
+) -> Result<(bool, Option<Uuid>), ApiError> {
+    let Some(raw) = b.get("parent") else {
+        return Ok((false, None));
+    };
+    if raw.is_null() {
+        return Ok((true, None));
+    }
+    let parent_id = uuid_of(b, "parent").ok_or_else(|| ApiError::bad("Invalid parent page"))?;
+    if page_id == Some(parent_id) {
+        return Err(ApiError::bad("Page cannot be its own parent"));
+    }
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM pages p
+            JOIN project_pages pp ON pp.page_id = p.id AND pp.workspace_id = p.workspace_id AND pp.deleted_at IS NULL
+            WHERE p.id = $1 AND p.workspace_id = $2 AND pp.project_id = $3 AND p.deleted_at IS NULL
+        )",
+    )
+    .bind(parent_id)
+    .bind(workspace_id)
+    .bind(project_id)
+    .fetch_one(db)
+    .await?;
+    if !exists {
+        return Err(ApiError::bad("Parent page not found"));
+    }
+    Ok((true, Some(parent_id)))
+}
+
 async fn create(
     State(st): State<AppState>,
     user: CurrentUser,
@@ -115,15 +168,16 @@ async fn create(
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let ctx = require_project(&st.db, &user, &slug, project).await?;
     ctx.require(&[ADMIN, MEMBER])?;
-    let html = sanitize_html(s(&b, "description_html").unwrap_or("<p></p>"))?;
+    let html = sanitize_html(optional_html(&b)?.unwrap_or("<p></p>"))?;
     let stripped = strip_tags(&html);
     let access = b.get("access").and_then(Value::as_i64).unwrap_or(0);
     if !(0..=1).contains(&access) {
         return Err(ApiError::bad("Invalid access"));
     }
+    let (_, parent_id) = validate_page_parent(&st.db, ctx.workspace_id(), project, None, &b).await?;
     let mut tx = st.db.begin().await?;
-    let id: Uuid = sqlx::query_scalar("INSERT INTO pages (name,color,workspace_id,owned_by_id,created_by_id,updated_by_id,access,description_html,description_stripped) VALUES ($1,$2,$3,$4,$4,$4,$5,$6,$7) RETURNING id")
-        .bind(s(&b,"name").unwrap_or("")).bind(s(&b,"color").unwrap_or("")).bind(ctx.workspace_id()).bind(user.id).bind(access as i16).bind(&html).bind(&stripped)
+    let id: Uuid = sqlx::query_scalar("INSERT INTO pages (name,color,workspace_id,owned_by_id,created_by_id,updated_by_id,access,parent_id,description_html,description_stripped) VALUES ($1,$2,$3,$4,$4,$4,$5,$6,$7,$8) RETURNING id")
+        .bind(s(&b,"name").unwrap_or("")).bind(s(&b,"color").unwrap_or("")).bind(ctx.workspace_id()).bind(user.id).bind(access as i16).bind(parent_id).bind(&html).bind(&stripped)
         .fetch_one(&mut *tx).await?;
     sqlx::query("INSERT INTO project_pages (workspace_id,project_id,page_id,created_by_id,updated_by_id) VALUES ($1,$2,$3,$4,$4)")
         .bind(ctx.workspace_id()).bind(project).bind(id).bind(user.id).execute(&mut *tx).await?;
@@ -161,10 +215,11 @@ async fn update(
     if access != old_access as i64 && owner != user.id {
         return Err(ApiError::forbidden());
     }
-    let html = s(&b, "description_html").map(sanitize_html).transpose()?;
+    let (parent_set, parent_id) = validate_page_parent(&st.db, ctx.workspace_id(), project, Some(id), &b).await?;
+    let html = optional_html(&b)?.map(sanitize_html).transpose()?;
     let stripped = html.as_deref().map(strip_tags);
-    sqlx::query(&format!("WITH updated AS (UPDATE pages p SET name=COALESCE($6,p.name),color=COALESCE($7,p.color),access=$8,view_props=COALESCE($9,p.view_props),logo_props=COALESCE($10,p.logo_props),description_html=COALESCE($11,p.description_html),description_stripped=COALESCE($12,p.description_stripped),updated_by_id=$3,updated_at=now() WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked RETURNING p.*) INSERT INTO page_versions (workspace_id,page_id,owned_by_id,created_by_id,updated_by_id,last_saved_at,description_binary,description_html,description_json,description_stripped) SELECT workspace_id,id,owned_by_id,$3,$3,now(),description_binary,description_html,description_json,description_stripped FROM updated WHERE $11::text IS NOT NULL"))
-        .bind(ctx.workspace_id()).bind(project).bind(user.id).bind(ctx.restricted_guest()).bind(id).bind(s(&b,"name")).bind(s(&b,"color")).bind(access as i16).bind(b.get("view_props")).bind(b.get("logo_props")).bind(&html).bind(stripped).execute(&st.db).await?;
+    sqlx::query(&format!("WITH updated AS (UPDATE pages p SET name=COALESCE($6,p.name),color=COALESCE($7,p.color),access=$8,view_props=COALESCE($9,p.view_props),logo_props=COALESCE($10,p.logo_props),description_html=COALESCE($11,p.description_html),description_stripped=COALESCE($12,p.description_stripped),parent_id=CASE WHEN $13 THEN $14 ELSE p.parent_id END,updated_by_id=$3,updated_at=now() WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked RETURNING p.*) INSERT INTO page_versions (workspace_id,page_id,owned_by_id,created_by_id,updated_by_id,last_saved_at,description_binary,description_html,description_json,description_stripped) SELECT workspace_id,id,owned_by_id,$3,$3,now(),description_binary,description_html,description_json,description_stripped FROM updated WHERE $11::text IS NOT NULL"))
+        .bind(ctx.workspace_id()).bind(project).bind(user.id).bind(ctx.restricted_guest()).bind(id).bind(s(&b,"name")).bind(s(&b,"color")).bind(access as i16).bind(b.get("view_props")).bind(b.get("logo_props")).bind(&html).bind(stripped).bind(parent_set).bind(parent_id).execute(&st.db).await?;
     if html.is_some() {
         crate::side_effects::spawn_page_transaction(st.clone(), ctx.workspace_id(), id, html, old_html);
     }
@@ -204,6 +259,7 @@ async fn destroy(
     .bind(id)
     .execute(&st.db)
     .await?;
+    crate::jobs::spawn_soft_delete_cascade(st.clone(), "pages", id);
     no_content()
 }
 async fn description(
@@ -236,7 +292,7 @@ async fn update_description(
 ) -> ApiResult {
     let ctx = require_project(&st.db, &user, &slug, project).await?;
     ctx.require(&[ADMIN, MEMBER])?;
-    let html = s(&b, "description_html").map(sanitize_html).transpose()?;
+    let html = optional_html(&b)?.map(sanitize_html).transpose()?;
     let stripped = html.as_deref().map(strip_tags);
     let binary = match b.get("description_binary") {
         None => None,
@@ -244,15 +300,17 @@ async fn update_description(
         _ => return Err(ApiError::bad("Invalid description_binary")),
     };
     let old_html: Option<String> = if html.is_some() {
-        sqlx::query_scalar(&format!("SELECT p.description_html FROM pages p WHERE {SCOPE} AND p.id=$5"))
-            .bind(ctx.workspace_id())
-            .bind(project)
-            .bind(user.id)
-            .bind(ctx.restricted_guest())
-            .bind(id)
-            .fetch_optional(&st.db)
-            .await?
-            .flatten()
+        sqlx::query_scalar(&format!(
+            "SELECT p.description_html FROM pages p WHERE {SCOPE} AND p.id=$5"
+        ))
+        .bind(ctx.workspace_id())
+        .bind(project)
+        .bind(user.id)
+        .bind(ctx.restricted_guest())
+        .bind(id)
+        .fetch_optional(&st.db)
+        .await?
+        .flatten()
     } else {
         None
     };
@@ -267,13 +325,35 @@ async fn update_description(
     Ok(Json(json!({"message":"Updated successfully"})))
 }
 
-async fn set_flag(
+async fn set_locked(
     st: AppState,
     user: CurrentUser,
     (slug, project, id): PagePath,
-    archived: Option<bool>,
-    locked: Option<bool>,
+    locked: bool,
 ) -> ApiResult<StatusCode> {
+    let ctx = require_project(&st.db, &user, &slug, project).await?;
+    ctx.require(&[ADMIN, MEMBER])?;
+    let r = sqlx::query(&format!(
+        "UPDATE pages p SET is_locked=$6, updated_at=now(), updated_by_id=$3 WHERE {SCOPE} AND p.id=$5"
+    ))
+    .bind(ctx.workspace_id())
+    .bind(project)
+    .bind(user.id)
+    .bind(ctx.restricted_guest())
+    .bind(id)
+    .bind(locked)
+    .execute(&st.db)
+    .await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    }
+    no_content()
+}
+async fn archive(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, id)): Path<PagePath>,
+) -> ApiResult {
     let ctx = require_project(&st.db, &user, &slug, project).await?;
     ctx.require(&[ADMIN, MEMBER])?;
     let owner: Option<Uuid> =
@@ -285,25 +365,101 @@ async fn set_flag(
             .bind(id)
             .fetch_optional(&st.db)
             .await?;
-    if owner.ok_or_else(ApiError::not_found)? != user.id && archived.is_some() {
-        ctx.require(&[ADMIN])?;
+    let owner = owner.ok_or_else(ApiError::not_found)?;
+    if owner != user.id && !ctx.is_admin() && !ctx.ws.is_admin() {
+        return Err(ApiError::bad("Only the owner or admin can archive the page"));
     }
-    sqlx::query(&format!("UPDATE pages p SET archived_at=CASE WHEN $6::boolean IS NULL THEN p.archived_at WHEN $6 THEN CURRENT_DATE ELSE NULL END, is_locked=COALESCE($7,p.is_locked), updated_at=now(), updated_by_id=$3 WHERE {SCOPE} AND p.id=$5"))
-        .bind(ctx.workspace_id()).bind(project).bind(user.id).bind(ctx.restricted_guest()).bind(id).bind(archived).bind(locked).execute(&st.db).await?;
-    // ponytail: descendant archive propagation and favorite cleanup are not implemented.
+    let now = chrono::Utc::now();
+    let mut tx = st.db.begin().await?;
+    sqlx::query(
+        "UPDATE user_favorites SET deleted_at=now()
+         WHERE entity_type='page' AND entity_identifier=$1 AND project_id=$2 AND workspace_id=$3 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .bind(project)
+    .bind(ctx.workspace_id())
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "WITH RECURSIVE descendants AS (
+            SELECT id FROM pages WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL
+            UNION ALL
+            SELECT p.id FROM pages p JOIN descendants d ON p.parent_id=d.id
+            WHERE p.workspace_id=$2 AND p.deleted_at IS NULL
+         )
+         UPDATE pages SET archived_at=$3, updated_at=now(), updated_by_id=$4
+         WHERE id IN (SELECT id FROM descendants)",
+    )
+    .bind(id)
+    .bind(ctx.workspace_id())
+    .bind(now)
+    .bind(user.id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Json(json!({"archived_at": now.to_rfc3339()})))
+}
+async fn unarchive(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, project, id)): Path<PagePath>,
+) -> ApiResult<StatusCode> {
+    let ctx = require_project(&st.db, &user, &slug, project).await?;
+    ctx.require(&[ADMIN, MEMBER])?;
+    let row: Option<(Uuid, Option<Uuid>)> = sqlx::query_as(&format!(
+        "SELECT p.owned_by_id, p.parent_id FROM pages p WHERE {SCOPE} AND p.id=$5"
+    ))
+    .bind(ctx.workspace_id())
+    .bind(project)
+    .bind(user.id)
+    .bind(ctx.restricted_guest())
+    .bind(id)
+    .fetch_optional(&st.db)
+    .await?;
+    let (owner, parent_id) = row.ok_or_else(ApiError::not_found)?;
+    if owner != user.id && !ctx.is_admin() && !ctx.ws.is_admin() {
+        return Err(ApiError::bad("Only the owner or admin can un archive the page"));
+    }
+    let mut tx = st.db.begin().await?;
+    if let Some(pid) = parent_id {
+        let parent_archived: Option<bool> = sqlx::query_scalar(
+            "SELECT archived_at IS NOT NULL FROM pages WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL",
+        )
+        .bind(pid)
+        .bind(ctx.workspace_id())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if parent_archived == Some(true) {
+            sqlx::query("UPDATE pages SET parent_id=NULL, updated_at=now(), updated_by_id=$2 WHERE id=$1")
+                .bind(id)
+                .bind(user.id)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    sqlx::query(
+        "WITH RECURSIVE descendants AS (
+            SELECT id FROM pages WHERE id=$1 AND workspace_id=$2 AND deleted_at IS NULL
+            UNION ALL
+            SELECT p.id FROM pages p JOIN descendants d ON p.parent_id=d.id
+            WHERE p.workspace_id=$2 AND p.deleted_at IS NULL
+         )
+         UPDATE pages SET archived_at=NULL, updated_at=now(), updated_by_id=$3
+         WHERE id IN (SELECT id FROM descendants)",
+    )
+    .bind(id)
+    .bind(ctx.workspace_id())
+    .bind(user.id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     no_content()
 }
-async fn archive(State(st): State<AppState>, user: CurrentUser, Path(path): Path<PagePath>) -> ApiResult<StatusCode> {
-    set_flag(st, user, path, Some(true), None).await
-}
-async fn unarchive(State(st): State<AppState>, user: CurrentUser, Path(path): Path<PagePath>) -> ApiResult<StatusCode> {
-    set_flag(st, user, path, Some(false), None).await
-}
 async fn lock(State(st): State<AppState>, user: CurrentUser, Path(path): Path<PagePath>) -> ApiResult<StatusCode> {
-    set_flag(st, user, path, None, Some(true)).await
+    set_locked(st, user, path, true).await
 }
 async fn unlock(State(st): State<AppState>, user: CurrentUser, Path(path): Path<PagePath>) -> ApiResult<StatusCode> {
-    set_flag(st, user, path, None, Some(false)).await
+    set_locked(st, user, path, false).await
 }
 async fn access(
     State(st): State<AppState>,
@@ -401,14 +557,111 @@ struct Room {
     dirty_since: Option<tokio::time::Instant>,
     last_change: tokio::time::Instant,
     editor: Uuid,
+    workspace_id: Uuid,
+    project_id: Uuid,
+    restricted: bool,
 }
 static ROOMS: std::sync::OnceLock<tokio::sync::Mutex<Rooms>> = std::sync::OnceLock::new();
+
+/// Flush all dirty collaborative page rooms on graceful shutdown.
+pub async fn flush_all_rooms(st: &AppState) {
+    let Some(rooms) = ROOMS.get() else {
+        return;
+    };
+    let entries: Vec<(Uuid, std::sync::Arc<tokio::sync::Mutex<Room>>)> = {
+        let map = rooms.lock().await;
+        map.iter().map(|(&id, r)| (id, r.clone())).collect()
+    };
+    for (id, room) in entries {
+        let mut r = room.lock().await;
+        if r.dirty_since.is_some() {
+            let ws = r.workspace_id;
+            let pid = r.project_id;
+            let restricted = r.restricted;
+            if let Err(e) = persist_live(st, pid, ws, restricted, id, &mut r).await {
+                tracing::warn!(page = %id, error = %e, "failed to flush live page during shutdown");
+            }
+        }
+    }
+}
+
+async fn resolve_live_access(
+    db: &sqlx::PgPool,
+    slug: &str,
+    page_id: Uuid,
+    user_id: Uuid,
+    project_filter: Option<Uuid>,
+    action: &str,
+) -> Result<Option<(Uuid, Uuid, bool, bool)>, ApiError> {
+    let rows: Vec<(Uuid, Uuid, i16, Uuid, i16, bool)> = sqlx::query_as(
+        "SELECT pp.workspace_id, pp.project_id, pm.role, p.owned_by_id, p.access, pr.guest_view_all_features
+         FROM project_pages pp
+         JOIN pages p ON p.id = pp.page_id AND p.workspace_id = pp.workspace_id AND p.deleted_at IS NULL
+         JOIN projects pr ON pr.id = pp.project_id AND pr.workspace_id = pp.workspace_id AND pr.deleted_at IS NULL
+         JOIN workspaces w ON w.id = pp.workspace_id AND w.deleted_at IS NULL
+         JOIN project_members pm ON pm.project_id = pr.id AND pm.workspace_id = w.id
+              AND pm.member_id = $4 AND pm.is_active AND pm.deleted_at IS NULL
+         WHERE pp.page_id = $1 AND w.slug = $2 AND ($3::uuid IS NULL OR pp.project_id = $3) AND pp.deleted_at IS NULL",
+    )
+    .bind(page_id)
+    .bind(slug)
+    .bind(project_filter)
+    .bind(user_id)
+    .fetch_all(db)
+    .await?;
+
+    let mut read_only_candidate = None;
+    for (ws_id, pid, role, owner_id, access, guest_view_all) in rows {
+        let is_owner = owner_id == user_id;
+        if !is_owner && (access == 1 || (role == GUEST && !guest_view_all)) {
+            continue;
+        }
+        let read_only = !is_owner && role == GUEST;
+        let restricted = role == GUEST && !guest_view_all;
+        if action == "edit" {
+            if read_only {
+                continue;
+            }
+            return Ok(Some((ws_id, pid, false, restricted)));
+        }
+        if !read_only {
+            return Ok(Some((ws_id, pid, false, restricted)));
+        }
+        if read_only_candidate.is_none() {
+            read_only_candidate = Some((ws_id, pid, true, restricted));
+        }
+    }
+    Ok(read_only_candidate)
+}
+
+/// Plane `PageLiveAccessEndpoint`: `GET /api/workspaces/{slug}/pages/{page_id}/live-access/?action=view|edit`.
+async fn live_access(
+    State(st): State<AppState>,
+    user: CurrentUser,
+    Path((slug, page_id)): Path<(String, Uuid)>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> ApiResult {
+    let action = q.get("action").map(String::as_str).unwrap_or("");
+    if !matches!(action, "view" | "edit") {
+        return Err(ApiError::bad("action must be view or edit"));
+    }
+    let Some((_, project_id, read_only, _)) =
+        resolve_live_access(&st.db, &slug, page_id, user.id, None, action).await?
+    else {
+        return Err(ApiError(StatusCode::NOT_FOUND, json!({"error": "Page not found"})));
+    };
+    if action == "edit" {
+        Ok(Json(json!({"project_id": project_id})))
+    } else {
+        Ok(Json(json!({"project_id": project_id, "read_only": read_only})))
+    }
+}
 
 #[derive(Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LiveQuery {
     workspace_slug: String,
-    project_id: Uuid,
+    project_id: Option<Uuid>,
     document_type: Option<String>,
 }
 
@@ -430,15 +683,19 @@ async fn collaboration(
             return Err(ApiError::forbidden());
         }
     }
-    let ctx = require_project(&st.db, &user, &q.workspace_slug, q.project_id).await?;
-    ctx.require(&[ADMIN, MEMBER])?;
+    if let Some(pid) = q.project_id {
+        let ctx = require_project(&st.db, &user, &q.workspace_slug, pid).await?;
+        ctx.require(&[ADMIN, MEMBER, GUEST])?;
+    } else {
+        require_workspace(&st.db, &user, &q.workspace_slug).await?;
+    }
     if q.document_type.as_deref().is_some_and(|t| t != "project_page") {
         // ponytail: only project page documents are supported.
         return Err(ApiError::bad("Unsupported document type"));
     }
     Ok(ws
         .max_message_size(10 * 1024 * 1024)
-        .on_upgrade(move |socket| live_socket(socket, st, user, q, ctx.workspace_id(), ctx.restricted_guest())))
+        .on_upgrade(move |socket| live_socket(socket, st, user, q)))
 }
 
 fn put_var(mut n: usize, out: &mut Vec<u8>) {
@@ -484,7 +741,7 @@ fn frame(name: &str, typ: usize, subtype: Option<usize>, payload: &[u8]) -> Vec<
 
 async fn persist_live(
     st: &AppState,
-    q: &LiveQuery,
+    project_id: Uuid,
     workspace: Uuid,
     restricted: bool,
     id: Uuid,
@@ -505,11 +762,11 @@ async fn persist_live(
     };
     let mut tx = st.db.begin().await?;
     let previous: Option<String> = sqlx::query_scalar(&format!("SELECT p.description_html FROM pages p WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL FOR UPDATE"))
-        .bind(workspace).bind(q.project_id).bind(room.editor).bind(restricted).bind(id).fetch_optional(&mut *tx).await?;
+        .bind(workspace).bind(project_id).bind(room.editor).bind(restricted).bind(id).fetch_optional(&mut *tx).await?;
     let previous = previous.ok_or_else(|| anyhow::anyhow!("page no longer writable"))?;
     let Some((html, json, title)) = converted else {
         sqlx::query(&format!("UPDATE pages p SET description_binary=$6,updated_by_id=$3,updated_at=now() WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL"))
-            .bind(workspace).bind(q.project_id).bind(room.editor).bind(restricted).bind(id).bind(&room.state).execute(&mut *tx).await?;
+            .bind(workspace).bind(project_id).bind(room.editor).bind(restricted).bind(id).bind(&room.state).execute(&mut *tx).await?;
         tx.commit().await?;
         room.dirty_since = None;
         return Ok(());
@@ -517,7 +774,7 @@ async fn persist_live(
     let stripped = strip_tags(&html);
     let title = title.filter(|s| !s.trim().is_empty());
     sqlx::query(&format!("UPDATE pages p SET description_binary=$6,description_html=$7,description_json=$8,description_stripped=$9,name=COALESCE($10,p.name),updated_by_id=$3,updated_at=now() WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL"))
-        .bind(workspace).bind(q.project_id).bind(room.editor).bind(restricted).bind(id)
+        .bind(workspace).bind(project_id).bind(room.editor).bind(restricted).bind(id)
         .bind(&room.state).bind(&html).bind(&json).bind(&stripped).bind(&title).execute(&mut *tx).await?;
     if previous != html {
         let latest: Option<(Uuid, Uuid, bool)> = sqlx::query_as("SELECT id,owned_by_id,last_saved_at >= now() - interval '10 minutes' FROM page_versions WHERE workspace_id=$1 AND page_id=$2 AND deleted_at IS NULL ORDER BY last_saved_at DESC LIMIT 1")
@@ -542,14 +799,7 @@ async fn persist_live(
     Ok(())
 }
 
-async fn live_socket(
-    mut socket: axum::extract::ws::WebSocket,
-    st: AppState,
-    user: CurrentUser,
-    q: LiveQuery,
-    workspace: Uuid,
-    restricted: bool,
-) {
+async fn live_socket(mut socket: axum::extract::ws::WebSocket, st: AppState, user: CurrentUser, q: LiveQuery) {
     use axum::extract::ws::Message;
     use yrs::{Doc, ReadTxn, StateVector, Transact, Update, updates::decoder::Decode};
     let first = match socket.recv().await {
@@ -567,9 +817,30 @@ async fn live_socket(
     {
         return;
     }
-    let existing: Option<(Option<Vec<u8>>, String, String)> = match sqlx::query_as(&format!("SELECT p.description_binary,p.description_html,p.name FROM pages p WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL"))
-        .bind(workspace).bind(q.project_id).bind(user.id).bind(restricted).bind(id).fetch_optional(&st.db).await { Ok(v)=>v, Err(_)=>return };
-    let Some((binary, html, title)) = existing else { return };
+    let Ok(Some((workspace, project_id, initial_read_only, restricted))) =
+        resolve_live_access(&st.db, &q.workspace_slug, id, user.id, q.project_id, "view").await
+    else {
+        return;
+    };
+    let existing: Option<(Option<Vec<u8>>, String, String, bool)> = match sqlx::query_as(&format!(
+        "SELECT p.description_binary, p.description_html, p.name, (p.is_locked OR p.archived_at IS NOT NULL)
+         FROM pages p WHERE {SCOPE} AND p.id=$5"
+    ))
+    .bind(workspace)
+    .bind(project_id)
+    .bind(user.id)
+    .bind(restricted)
+    .bind(id)
+    .fetch_optional(&st.db)
+    .await
+    {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let Some((binary, html, title, locked_or_archived)) = existing else {
+        return;
+    };
+    let read_only = initial_read_only || locked_or_archived;
     let rooms = ROOMS.get_or_init(|| tokio::sync::Mutex::new(Rooms::new()));
     let room = {
         let mut map = rooms.lock().await;
@@ -582,10 +853,12 @@ async fn live_socket(
                     let Ok(state) = crate::live_doc::initialize(&html, &title) else {
                         return;
                     };
-                    let result = sqlx::query(&format!("UPDATE pages p SET description_binary=$6 WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL AND (p.description_binary IS NULL OR octet_length(p.description_binary)=0)"))
-                        .bind(workspace).bind(q.project_id).bind(user.id).bind(restricted).bind(id).bind(&state).execute(&st.db).await;
-                    if !matches!(result, Ok(ref r) if r.rows_affected()==1) {
-                        return;
+                    if !read_only {
+                        let result = sqlx::query(&format!("UPDATE pages p SET description_binary=$6 WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL AND (p.description_binary IS NULL OR octet_length(p.description_binary)=0)"))
+                            .bind(workspace).bind(project_id).bind(user.id).bind(restricted).bind(id).bind(&state).execute(&st.db).await;
+                        if !matches!(result, Ok(ref r) if r.rows_affected()==1) {
+                            return;
+                        }
                     }
                     state
                 }
@@ -597,14 +870,18 @@ async fn live_socket(
                 dirty_since: None,
                 last_change: tokio::time::Instant::now(),
                 editor: user.id,
+                workspace_id: workspace,
+                project_id,
+                restricted,
             }));
             map.insert(id, room.clone());
             room
         }
     };
     let mut rx = room.lock().await.events.subscribe();
+    let mode_label: &[u8] = if read_only { b"read-only" } else { b"read-write" };
     if socket
-        .send(Message::Binary(frame(name, 2, Some(2), b"read-write").into()))
+        .send(Message::Binary(frame(name, 2, Some(2), mode_label).into()))
         .await
         .is_err()
     {
@@ -615,20 +892,30 @@ async fn live_socket(
         tokio::select! {
             _ = tick.tick() => {
                 let mut r = room.lock().await;
-                if r.dirty_since.is_some_and(|since| since.elapsed() >= std::time::Duration::from_secs(10) || r.last_change.elapsed() >= std::time::Duration::from_secs(2)) {
-                    if let Err(e) = persist_live(&st, &q, workspace, restricted, id, &mut r).await {
+                if r.dirty_since.is_some_and(|since| since.elapsed() >= std::time::Duration::from_secs(10) || r.last_change.elapsed() >= std::time::Duration::from_secs(2))
+                    && let Err(e) = persist_live(&st, project_id, workspace, restricted, id, &mut r).await {
                         tracing::error!(error = %e, page = %id, "failed to persist live page");
                     }
-                }
             }
             incoming=socket.recv()=> {
                 let Some(Ok(Message::Binary(data)))=incoming else { break };
-                let allowed: bool = sqlx::query_scalar(&format!("SELECT EXISTS(SELECT 1 FROM pages p WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL AND EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id=$2 AND pm.workspace_id=$1 AND pm.member_id=$3 AND pm.is_active AND pm.deleted_at IS NULL))"))
-                    .bind(workspace).bind(q.project_id).bind(user.id).bind(restricted).bind(id).fetch_one(&st.db).await.unwrap_or(false);
-                if !allowed { break; }
+                let Ok(Some((_, _, ro_now, _))) =
+                    resolve_live_access(&st.db, &q.workspace_slug, id, user.id, Some(project_id), "view").await
+                else {
+                    break;
+                };
                 let mut p=0; if get_buf(&data,&mut p)!=Some(name.as_bytes()) { break; }
                 let Some(typ)=get_var(&data,&mut p) else { break };
-                if typ==1 { let _=room.lock().await.events.send(data.to_vec()); continue; }
+                if typ==1 {
+                    if !read_only && !ro_now {
+                        let writable: bool = sqlx::query_scalar(&format!("SELECT EXISTS(SELECT 1 FROM pages p WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL)"))
+                            .bind(workspace).bind(project_id).bind(user.id).bind(restricted).bind(id).fetch_one(&st.db).await.unwrap_or(false);
+                        if writable {
+                            let _=room.lock().await.events.send(data.to_vec());
+                        }
+                    }
+                    continue;
+                }
                 if typ!=0 { continue; }
                 let Some(sub)=get_var(&data,&mut p) else { break }; let Some(payload)=get_buf(&data,&mut p) else { break };
                 let mut room=room.lock().await;
@@ -641,6 +928,14 @@ async fn live_socket(
                     if socket.send(Message::Binary(frame(name,0,Some(1),&update).into())).await.is_err() { break; }
                     if socket.send(Message::Binary(frame(name,0,Some(0),&vector).into())).await.is_err() { break; }
                 } else if sub==1 || sub==2 {
+                    if read_only || ro_now {
+                        continue;
+                    }
+                    let writable: bool = sqlx::query_scalar(&format!("SELECT EXISTS(SELECT 1 FROM pages p WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL)"))
+                        .bind(workspace).bind(project_id).bind(user.id).bind(restricted).bind(id).fetch_one(&st.db).await.unwrap_or(false);
+                    if !writable {
+                        continue;
+                    }
                     let Ok(update)=Update::decode_v1(payload) else { break };
                     if doc.transact_mut().apply_update(update).is_err() { break; }
                     let state=doc.transact().encode_state_as_update_v1(&StateVector::default());
@@ -653,9 +948,11 @@ async fn live_socket(
                 }
             },
             event=rx.recv()=> {
-                let allowed: bool = sqlx::query_scalar(&format!("SELECT EXISTS(SELECT 1 FROM pages p WHERE {SCOPE} AND p.id=$5 AND NOT p.is_locked AND p.archived_at IS NULL AND EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id=$2 AND pm.workspace_id=$1 AND pm.member_id=$3 AND pm.is_active AND pm.deleted_at IS NULL))"))
-                    .bind(workspace).bind(q.project_id).bind(user.id).bind(restricted).bind(id).fetch_one(&st.db).await.unwrap_or(false);
-                if !allowed { break; }
+                let Ok(Some(_)) =
+                    resolve_live_access(&st.db, &q.workspace_slug, id, user.id, Some(project_id), "view").await
+                else {
+                    break;
+                };
                 match event { Ok(data)=>if socket.send(Message::Binary(data.into())).await.is_err(){break}, Err(_)=>break }
             }
         }
@@ -664,12 +961,15 @@ async fn live_socket(
     let mut map = rooms.lock().await;
     if std::sync::Arc::strong_count(&room) == 2 {
         let mut r = room.lock().await;
-        if r.dirty_since.is_none() || persist_live(&st, &q, workspace, restricted, id, &mut r).await.is_ok() {
+        if r.dirty_since.is_none()
+            || persist_live(&st, project_id, workspace, restricted, id, &mut r)
+                .await
+                .is_ok()
+        {
             map.remove(&id);
         } else {
             tracing::error!(page = %id, "failed to flush live page on disconnect; retaining room state");
             let retry_room = room.clone();
-            let retry_query = q.clone();
             let retry_state = st.clone();
             tokio::spawn(async move {
                 loop {
@@ -677,7 +977,7 @@ async fn live_socket(
                     let mut map = rooms.lock().await;
                     let mut room = retry_room.lock().await;
                     if room.dirty_since.is_none()
-                        || persist_live(&retry_state, &retry_query, workspace, restricted, id, &mut room)
+                        || persist_live(&retry_state, project_id, workspace, restricted, id, &mut room)
                             .await
                             .is_ok()
                     {

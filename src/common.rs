@@ -7,7 +7,14 @@ use axum::{
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use uuid::Uuid;
+
+#[derive(Clone, Debug)]
+pub(crate) struct ApiKeyAuthFlag(pub Arc<AtomicBool>);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -156,11 +163,17 @@ async fn resolve_user(st: &AppState, parts: &Parts) -> Result<Option<CurrentUser
         .bind(key)
         .fetch_optional(&st.db)
         .await?;
-        return Ok(row.map(|(id, email)| CurrentUser {
-            id,
-            email,
-            session_key: None,
-        }));
+        if let Some((id, email)) = row {
+            if let Some(flag) = parts.extensions.get::<ApiKeyAuthFlag>() {
+                flag.0.store(true, Ordering::Relaxed);
+            }
+            return Ok(Some(CurrentUser {
+                id,
+                email,
+                session_key: None,
+            }));
+        }
+        return Ok(None);
     }
     let admin = parts.uri.path().contains("instances");
     let name = if admin {
@@ -195,6 +208,7 @@ pub const GUEST: i16 = 5;
 #[derive(Clone, Debug)]
 pub struct WorkspaceCtx {
     pub workspace_id: Uuid,
+    #[expect(dead_code, reason = "kept in WorkspaceCtx for handler context diagnostics")]
     pub slug: String,
     pub user_id: Uuid,
     pub role: i16,
@@ -412,11 +426,70 @@ pub fn sanitize_html(html: &str) -> Result<String, ApiError> {
     Ok(cleaner.clean(html).to_string())
 }
 
+/// Parse an IANA timezone string, falling back to UTC on unknown or missing values.
+pub fn parse_tz(name: Option<&str>) -> chrono_tz::Tz {
+    name.and_then(|s| s.parse::<chrono_tz::Tz>().ok())
+        .unwrap_or(chrono_tz::UTC)
+}
+
+/// Midnight of `day` in `tz_name` converted to UTC (mirrors Plane's `snooze_day_start` / `project_day_start`).
+pub fn tz_day_start(day: chrono::NaiveDate, tz_name: Option<&str>) -> chrono::DateTime<chrono::Utc> {
+    use chrono::TimeZone;
+    let tz = parse_tz(tz_name);
+    let naive = day.and_hms_opt(0, 0, 0).expect("valid midnight");
+    match tz.from_local_datetime(&naive) {
+        chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => dt.with_timezone(&chrono::Utc),
+        chrono::LocalResult::None => {
+            let next = day.and_hms_opt(1, 0, 0).expect("valid 01:00");
+            tz.from_local_datetime(&next)
+                .earliest()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|| chrono::DateTime::from_naive_utc_and_offset(naive, chrono::Utc))
+        }
+    }
+}
+
+/// Regex matching Plane's `NUMERIC_ESTIMATE_PATTERN` (`^ *([0-9]+\.?[0-9]*|\.[0-9]+) *$`).
+pub(crate) const NON_NUMERIC_ESTIMATE_ERROR: &str = "Value must be a number for a points estimate";
+
+/// Return `true` iff `value` is a plain non-negative decimal (with optional spaces), matching Plane's `is_numeric_estimate`.
+pub(crate) fn is_numeric_estimate(value: &str) -> bool {
+    let s = value.trim_matches(' ');
+    if s.is_empty() {
+        return false;
+    }
+    let mut dots = 0usize;
+    let mut digits = 0usize;
+    for b in s.bytes() {
+        if b.is_ascii_digit() {
+            digits += 1;
+        } else if b == b'.' {
+            dots += 1;
+            if dots > 1 {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    digits > 0
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn strip_tags_works() {
         assert_eq!(super::strip_tags("<p>hi <b>there</b></p>"), "hi there");
+    }
+
+    #[test]
+    fn numeric_estimate_validation() {
+        for ok in ["0", "5", " 3.5 ", ".5", "5.", "123.456"] {
+            assert!(super::is_numeric_estimate(ok), "expected numeric: {ok:?}");
+        }
+        for bad in ["", " ", ".", "-1", "+1", "1e5", "1_0", "XL", "M = 2", "nan", "inf"] {
+            assert!(!super::is_numeric_estimate(bad), "expected non-numeric: {bad:?}");
+        }
     }
 
     #[test]

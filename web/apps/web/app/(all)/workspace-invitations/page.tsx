@@ -93,7 +93,7 @@ function WorkspaceInvitationPage() {
               align="center"
               assetKey="inbox"
               title={`You have been invited to ${invitationDetail.workspace.name}`}
-              description="Your workspace is where you'll create projects, collaborate on your work items, and organize different streams of work in your Plane account."
+              description="Your workspace is where you'll create projects, collaborate on your work items, and organize different streams of work in your Saturn account."
               actions={[
                 { label: "Accept", variant: "primary", onClick: handleAccept },
                 { label: "Ignore", variant: "secondary", onClick: handleReject },
@@ -106,7 +106,7 @@ function WorkspaceInvitationPage() {
               align="center"
               assetKey="project"
               title={`You are already a member of ${invitationDetail.workspace.name}`}
-              description="Your workspace is where you'll create projects, collaborate on your work items, and organize different streams of work in your Plane account."
+              description="Your workspace is where you'll create projects, collaborate on your work items, and organize different streams of work in your Saturn account."
               customButton={
                 <Button
                   variant="primary"
@@ -123,7 +123,7 @@ function WorkspaceInvitationPage() {
               align="center"
               assetKey="invalid-link"
               title="This invitation link is not active anymore."
-              description="Your workspace is where you'll create projects, collaborate on your work items, and organize different streams of work in your Plane account."
+              description="Your workspace is where you'll create projects, collaborate on your work items, and organize different streams of work in your Saturn account."
               customButton={
                 <div className="flex flex-col items-center gap-4">
                   <Button

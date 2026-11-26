@@ -49,7 +49,7 @@ async fn token_update(
             return Err(ApiError::bad_body(json!({key: ["Not a valid string."]})));
         }
     }
-    json_row(sqlx::query_scalar(&format!("UPDATE api_tokens AS t SET label=COALESCE($3,label), description=COALESCE($4,description), updated_at=now(), updated_by_id=$2 WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL RETURNING {TOKEN_READ_JSON} || jsonb_build_object('token', t.token)"))
+    json_row(sqlx::query_scalar(&format!("UPDATE api_tokens AS t SET label=COALESCE($3,label), description=COALESCE($4,description), updated_at=now(), updated_by_id=$2 WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL RETURNING {TOKEN_READ_JSON}"))
         .bind(pk).bind(user.id).bind(s(&b,"label")).bind(s(&b,"description")), &st.db).await
 }
 
@@ -687,7 +687,7 @@ async fn update_email(
         .execute(&mut *tx)
         .await?;
     let updated: Value = match sqlx::query_scalar(&format!(
-        "UPDATE users u SET email = $2, is_email_verified = false, updated_at = now()
+        "UPDATE users u SET email = $2, is_email_verified = true, updated_at = now()
          WHERE u.id = $1 RETURNING {USER_ME_JSON}"
     ))
     .bind(user.id)
