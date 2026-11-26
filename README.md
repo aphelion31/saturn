@@ -71,7 +71,7 @@ src/          Rust backend (axum + sqlx), one module per Plane API area
 web/          Saturn Bun workspace (bun.lock): apps/web, apps/admin (god-mode), apps/space (public boards), packages/*
 docker/       Container builds and reverse proxy config (`axum/Dockerfile`, `nginx/{Dockerfile,nginx.conf}`)
 migrations/   PostgreSQL schema dumped from Plane's Django migrations, plus database defaults
-tools/        schema regeneration, API smoke test, benchmark
+tools/        API smoke test, E2E check, benchmark
 scripts/      git hook checks, branch helper, Bun frontend build
 docs/         architecture, process docs, and retina UI screenshots (`docs/screenshots/`)
 ```
@@ -153,7 +153,7 @@ Details: [commit](docs/github/01.GIT-COMMIT.md), [branch](docs/github/02.GIT-BRA
 
 ## Tests
 
-Smoke tests need `bash`, `curl`, `jq` and `psql`. Python is only needed to regenerate the schema from Plane (`tools/plane-schema.sh`, `tools/django_defaults.py`), never to run Saturn.
+Smoke tests need `bash`, `curl`, `jq` and `psql`. Saturn has no Python dependency.
 
 ```bash
 cargo test                                  # unit tests (Django session and password compatibility, helpers)
