@@ -575,9 +575,9 @@ async fn magic_generate(
     crate::outbound::send_mail_bg(
         &st,
         email.clone(),
-        format!("Your unique Plane login code is {token}"),
-        format!("<p>Your unique Plane login code is <strong>{token}</strong>. It expires in 10 minutes.</p>"),
-        format!("Your unique Plane login code is {token}. It expires in 10 minutes."),
+        format!("Your unique Saturn login code is {token}"),
+        format!("<p>Your unique Saturn login code is <strong>{token}</strong>. It expires in 10 minutes.</p>"),
+        format!("Your unique Saturn login code is {token}. It expires in 10 minutes."),
     );
     if std::env::var("SATURN_DEV_LOG_TOKENS").as_deref() == Ok("1") {
         tracing::info!(%email, %token, "magic code");
@@ -779,7 +779,7 @@ async fn forgot(st: AppState, h: HeaderMap, b: EmailCheck, app: App) -> Result<R
         crate::outbound::send_mail_bg(
             &st,
             email.to_string(),
-            "Set a new password for your Plane account".into(),
+            "Set a new password for your Saturn account".into(),
             format!("<p>Reset your password: <a href=\"{url}\">{url}</a></p><p>The link expires in 1 hour.</p>"),
             format!("Reset your password: {url}\nThe link expires in 1 hour."),
         );

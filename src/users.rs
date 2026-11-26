@@ -126,13 +126,13 @@ async fn deactivate(State(st): State<AppState>, user: CurrentUser) -> Result<Res
     .await?;
     tx.commit().await?;
     let text = format!(
-        "Your account has been deactivated on Plane. {}/login",
+        "Your account has been deactivated on Saturn. {}/login",
         st.cfg.web_url.trim_end_matches('/')
     );
     crate::outbound::send_mail_bg(
         &st,
         user.email.clone(),
-        format!("{} has been deactivated on Plane", user.email),
+        format!("{} has been deactivated on Saturn", user.email),
         ammonia::clean(&text),
         text,
     );
@@ -636,8 +636,8 @@ async fn generate_email_code(State(st): State<AppState>, user: CurrentUser, Json
         &st,
         email.clone(),
         "Verify your new email address".into(),
-        format!("<p>Your Plane email verification code is <strong>{token}</strong>. It expires in 10 minutes.</p>"),
-        format!("Your Plane email verification code is {token}. It expires in 10 minutes."),
+        format!("<p>Your Saturn email verification code is <strong>{token}</strong>. It expires in 10 minutes.</p>"),
+        format!("Your Saturn email verification code is {token}. It expires in 10 minutes."),
     );
     Ok(Json(json!({"message": "Verification code sent to email"})))
 }
@@ -716,10 +716,10 @@ async fn update_email(
         crate::outbound::send_mail_bg(
             &st,
             to,
-            "Plane email address successfully updated".into(),
-            "<p>The email address on your Plane account was changed. If this was not you, contact your administrator.</p>"
+            "Saturn email address successfully updated".into(),
+            "<p>The email address on your Saturn account was changed. If this was not you, contact your administrator.</p>"
                 .into(),
-            "The email address on your Plane account was changed. If this was not you, contact your administrator."
+            "The email address on your Saturn account was changed. If this was not you, contact your administrator."
                 .into(),
         );
     }
