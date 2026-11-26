@@ -1,0 +1,43 @@
+# Work item lifecycle against the real API.
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/issues/?per_page=10"
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/issues/?group_by=state_id&sub_group_by=priority"
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/issues/list/"
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/v2/issues/"
+call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/" '{"name":"Smoke issue"}'
+ISSUE=$(field '.id')
+SEQ=$(field '.sequence_id')
+IDENT=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "select identifier from projects where id='$PROJECT'")
+call GET "/api/workspaces/$SLUG/work-items/$IDENT-$SEQ/?expand=issue_reactions,issue_attachments,issue_link,parent"
+jq -e 'keys == (["id","name","state_id","sort_order","completed_at","estimate_point","priority","start_date","target_date","sequence_id","project_id","parent_id","cycle_id","module_ids","label_ids","assignee_ids","sub_issues_count","created_at","updated_at","created_by","updated_by","attachment_count","link_count","is_draft","archived_at","description_html","is_subscribed","is_intake","parent","issue_reactions","issue_link","issue_attachments"] | sort)' <<<"$body" >/dev/null
+call GET "/api/workspaces/$SLUG/work-items/$IDENT-$SEQ/"
+jq -e 'has("is_intake") and has("is_subscribed") and (has("parent")|not) and (has("issue_link")|not)' <<<"$body" >/dev/null
+# Exact body Plane's create modal sends (read-only project_id, empty state_id, null module_ids).
+call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/" '{"project_id":"'"$PROJECT"'","type_id":null,"name":"Modal issue","description_html":"<p></p>","estimate_point":null,"state_id":"","parent_id":null,"priority":"none","assignee_ids":[],"label_ids":[],"cycle_id":null,"module_ids":null,"start_date":null,"target_date":null}'
+[[ "$(field '.state_id')" != "null" && "$(field '.state_id')" != "" ]] || { echo "✖ modal create did not get default state" >&2; exit 1; }
+call PATCH "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/" '{"start_date":"2030-01-01","target_date":"2030-01-20"}'
+call PATCH "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/" '{"target_date":"2030-01-10"}'
+[[ "$(field '.target_date')" == '2030-01-10' ]]
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/"
+call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/" '{"name":"Smoke related issue"}'
+RELATED=$(field '.id')
+call PATCH "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/" '{"name":"Smoke issue updated"}'
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/history/?activity_type=issue-property"
+jq -e 'any(.[]; .actor_detail and .issue_detail and .project_detail and .workspace_detail)' <<<"$body" >/dev/null
+call GET "/api/workspaces/$SLUG/search/?search=Smoke"
+jq -e '.results | (has("issue") and has("page") and has("issue_view") and has("intake")) and .issue' <<<"$body" >/dev/null
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/search-issues/?search=Smoke"
+jq -e . <<<"$body" >/dev/null
+call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/comments/" '{"comment_html":"<p>Smoke comment</p>"}'
+call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/issue-links/" '{"url":"https://example.com","title":"Example"}'
+call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/issue-relation/" "{\"relation_type\":\"relates_to\",\"issues\":[\"$RELATED\"]}"
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/issue-relation/"
+STATE=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "select id from states where project_id='$PROJECT' and \"group\"='completed' and deleted_at is null limit 1")
+[[ -n "$STATE" ]] || { echo 'No completed state for issue smoke test' >&2; exit 1; }
+call POST "/api/workspaces/$SLUG/projects/$PROJECT/bulk-operation-issues/" "{\"issue_ids\":[\"$ISSUE\"],\"properties\":{\"state_id\":\"$STATE\",\"priority\":\"high\"}}"
+call POST "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/archive/" '{}'
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/archived-issues/"
+jq -e --arg id "$ISSUE" 'any(.results[]; .id == $id)' <<<"$body" >/dev/null
+call DELETE "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/archive/"
+call GET "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/"
+call DELETE "/api/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE/"
+call DELETE "/api/workspaces/$SLUG/projects/$PROJECT/bulk-delete-issues/" "{\"issue_ids\":[\"$RELATED\"]}"

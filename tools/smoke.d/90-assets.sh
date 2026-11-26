@@ -1,0 +1,138 @@
+# File uploads on local disk (src/assets.rs): presign, multipart upload, mark uploaded, download.
+call POST "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/" '{"name":"smoke.txt","type":"text/plain","size":12,"entity_type":"ISSUE_DESCRIPTION"}'
+ASSET=$(field '.asset_id')
+TOKEN=$(field '.upload_data.fields.token')
+code=$(curl -s -o /dev/null -w '%{http_code}' -F "token=$TOKEN" -F "file=@-;filename=smoke.txt" "$BASE/api/assets/v2/upload/$ASSET/" <<< "hello saturn")
+[[ "$code" == 204 ]] || { echo "✖ upload -> $code" >&2; exit 1; }
+echo "✔ POST /api/assets/v2/upload/{id}/ -> $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -F "token=bad" -F "file=@-;filename=x.txt" "$BASE/api/assets/v2/upload/$ASSET/" <<< "x")
+[[ "$code" == 400 || "$code" == 403 ]] || { echo "✖ bad token upload -> $code" >&2; exit 1; }
+echo "✔ bad token rejected -> $code"
+call PATCH "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/$ASSET/" '{}'
+got=$(curl -s -b "$jar" "$BASE/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/$ASSET/")
+[[ "$got" == "hello saturn" ]] || { echo "✖ download returned: $got" >&2; exit 1; }
+echo "✔ download round trip"
+call GET "/api/assets/v2/workspaces/$SLUG/check/$ASSET/"
+jq -e '.exists == true' <<<"$body" >/dev/null
+for url in "/api/assets/v2/workspaces/$SLUG/download/$ASSET/" "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/download/$ASSET/"; do
+  got=$(curl -s -b "$jar" "$BASE$url")
+  [[ "$got" == "hello saturn" ]] || { echo "✖ forced download failed" >&2; exit 1; }
+done
+call POST "/api/assets/v2/workspaces/$SLUG/duplicate-assets/$ASSET/" '{"entity_type":"ISSUE_DESCRIPTION"}'
+COPY=$(field '.asset_id')
+call POST "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/$PROJECT/bulk/" "{\"asset_ids\":[\"$COPY\"]}"
+call DELETE "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/$ASSET/"
+call POST "/api/assets/v2/workspaces/$SLUG/restore/$ASSET/" '{}'
+call DELETE "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/$ASSET/"
+
+# Plane #10128 & #9551: empty MIME (.txt) and .md attachment files accepted
+WS_ID=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "select id from workspaces where slug='$SLUG'")
+ISSUE_ID=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "select id from issues where workspace_id='$WS_ID' and project_id='$PROJECT' and deleted_at is null limit 1")
+if [ -n "$ISSUE_ID" ]; then
+  # Empty MIME type
+  call POST "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE_ID/attachments/" '{"name":"notes.txt","type":"","size":5}'
+  TXT_ASSET=$(field '.asset_id')
+  TXT_TOKEN=$(field '.upload_data.fields.token')
+  curl -s -o /dev/null -F "token=$TXT_TOKEN" -F "file=@-;filename=notes.txt" "$BASE/api/assets/v2/upload/$TXT_ASSET/" <<< "notes"
+  call PATCH "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE_ID/attachments/$TXT_ASSET/" '{}'
+  hdr=$(curl -s -I -b "$jar" "$BASE/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE_ID/attachments/$TXT_ASSET/")
+  [[ "$hdr" =~ "attachment" ]] || { echo "✖ expected attachment Content-Disposition" >&2; exit 1; }
+  [[ "$hdr" =~ "nosniff" ]] || { echo "✖ expected nosniff header" >&2; exit 1; }
+  echo "✔ empty MIME attachment served as attachment + nosniff"
+  call DELETE "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE_ID/attachments/$TXT_ASSET/"
+
+  # .md file
+  call POST "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE_ID/attachments/" '{"name":"README.md","type":"text/markdown","size":6}'
+  MD_ASSET=$(field '.asset_id')
+  MD_TOKEN=$(field '.upload_data.fields.token')
+  curl -s -o /dev/null -F "token=$MD_TOKEN" -F "file=@-;filename=README.md" "$BASE/api/assets/v2/upload/$MD_ASSET/" <<< "# test"
+  call PATCH "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE_ID/attachments/$MD_ASSET/" '{}'
+  call DELETE "/api/assets/v2/workspaces/$SLUG/projects/$PROJECT/issues/$ISSUE_ID/attachments/$MD_ASSET/"
+  echo "✔ .md attachment accepted and deleted"
+
+  # Plane #9564: description image assets must not get asset_url with project None and must set project_id
+  call POST "/api/assets/v2/workspaces/$SLUG/" "{\"entity_type\":\"ISSUE_DESCRIPTION\",\"entity_identifier\":\"$ISSUE_ID\",\"name\":\"desc.png\",\"type\":\"image/png\",\"size\":10}"
+  DESC_ASSET=$(field '.asset_id')
+  DESC_URL=$(field '.asset_url')
+  [[ "$DESC_URL" != *"None"* ]] || { echo "✖ description asset_url contains None: $DESC_URL" >&2; exit 1; }
+  db_pid=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "select project_id from file_assets where id='$DESC_ASSET'")
+  [[ -n "$db_pid" && "$db_pid" != "" ]] || { echo "✖ description asset project_id is empty" >&2; exit 1; }
+  echo "✔ description asset has valid project_id ($db_pid) and no None in asset_url"
+  call DELETE "/api/assets/v2/workspaces/$SLUG/$DESC_ASSET/"
+fi
+
+# --- Legacy file-assets endpoints ---
+# User file-assets: upload multipart
+code=$(curl -s -b "$jar" -o /tmp/legacy_user_upload.json -w '%{http_code}' \
+  -F "entity_type=USER_AVATAR" -F "asset=@-;filename=avatar.png" "$BASE/api/users/file-assets/" <<< "user avatar data")
+[[ "$code" == 201 ]] || { echo "✖ POST /api/users/file-assets/ -> $code" >&2; exit 1; }
+echo "✔ POST /api/users/file-assets/ -> $code"
+U_ASSET=$(jq -r '.id' /tmp/legacy_user_upload.json)
+U_KEY=$(jq -r '.asset' /tmp/legacy_user_upload.json)
+
+# User file-assets: list
+call GET "/api/users/file-assets/"
+jq -e --arg id "$U_ASSET" 'any(.[]; .id == $id)' <<<"$body" >/dev/null
+echo "✔ GET /api/users/file-assets/ lists created asset"
+
+# User file-assets: retrieve (Plane shape: 200 {data:[...], status})
+call GET "/api/users/file-assets/$U_ASSET/"
+[[ "$(field '.data[0].id')" == "$U_ASSET" && "$(field '.status')" == "true" ]] || { echo "✖ GET /api/users/file-assets/{pk}/ failed" >&2; exit 1; }
+call GET "/api/users/file-assets/no-such-key/"
+[[ "$(field '.status')" == "false" ]] || { echo "✖ GET unknown user asset should be status=false" >&2; exit 1; }
+echo "✔ GET /api/users/file-assets/{pk}/ -> 200"
+
+# Workspace file-assets: POST upload
+code=$(curl -s -b "$jar" -o /tmp/legacy_ws_upload.json -w '%{http_code}' \
+  -F "entity_type=ISSUE_ATTACHMENT" -F "project_id=$PROJECT" -F "asset=@-;filename=legacy_doc.pdf" \
+  "$BASE/api/workspaces/$SLUG/file-assets/" <<< "workspace pdf data")
+[[ "$code" == 201 ]] || { echo "✖ POST /api/workspaces/{slug}/file-assets/ -> $code" >&2; exit 1; }
+echo "✔ POST /api/workspaces/{slug}/file-assets/ -> $code"
+WS_ASSET=$(jq -r '.id' /tmp/legacy_ws_upload.json)
+WS_FULL_KEY=$(jq -r '.asset' /tmp/legacy_ws_upload.json)
+# Extract asset_key part (after workspace_id/)
+WS_ASSET_KEY="${WS_FULL_KEY#*/}"
+
+# Workspace file-assets: GET list by slug
+call GET "/api/workspaces/$SLUG/file-assets/"
+jq -e --arg id "$WS_ASSET" 'any(.[]; .id == $id)' <<<"$body" >/dev/null
+echo "✔ GET /api/workspaces/{slug}/file-assets/ lists created asset"
+
+# Workspace file-assets: GET by workspace_id and asset_key
+call GET "/api/workspaces/file-assets/$WS_ID/$WS_ASSET_KEY/"
+jq -e --arg id "$WS_ASSET" '.data | any(.[]; .id == $id)' <<<"$body" >/dev/null
+echo "✔ GET /api/workspaces/file-assets/{workspace_id}/{asset_key}/ -> 200"
+
+# Workspace file-assets: DELETE and restore
+call DELETE "/api/workspaces/file-assets/$WS_ID/$WS_ASSET_KEY/"
+call POST "/api/workspaces/file-assets/$WS_ID/$WS_ASSET_KEY/restore/"
+
+# Plane #10216: asset id with query string stripped
+call GET "/api/workspaces/file-assets/$WS_ID/$WS_ASSET_KEY?size=medium/"
+jq -e --arg id "$WS_ASSET" '.data | any(.[]; .id == $id)' <<<"$body" >/dev/null
+echo "✔ Plane #10216: asset key with query string resolves correctly"
+
+call DELETE "/api/workspaces/file-assets/$WS_ID/$WS_ASSET_KEY/"
+echo "✔ DELETE and restore /api/workspaces/file-assets/{workspace_id}/{asset_key}/ -> ok"
+
+# User file-assets: DELETE own
+call DELETE "/api/users/file-assets/$U_ASSET/"
+echo "✔ DELETE /api/users/file-assets/{pk}/ -> 204"
+
+# Plane #10216: POST on /api/workspaces/file-assets/{workspace_id}/{asset_key}/ is 405 Method Not Allowed
+code=$(curl -s -b "$jar" -o /dev/null -w '%{http_code}' -X POST "$BASE/api/workspaces/file-assets/$WS_ID/$WS_ASSET_KEY/")
+[[ "$code" == 405 ]] || { echo "✖ POST on workspace_id/asset_key route -> $code (expected 405)" >&2; exit 1; }
+echo "✔ Plane #10216: POST on workspace_id/asset_key route -> 405"
+
+# Plane #10212: legacy file-asset POST fields are read-only (forged project/issue/is_uploaded ignored)
+code=$(curl -s -b "$jar" -o /tmp/forged_upload.json -w '%{http_code}' \
+  -F "project_id=$PROJECT" -F "is_uploaded=true" -F "asset=@-;filename=forged.png" \
+  "$BASE/api/workspaces/$SLUG/file-assets/" <<< "forged file")
+[[ "$code" == 201 ]] || { echo "✖ POST forged upload -> $code" >&2; exit 1; }
+FORGED_ID=$(jq -r '.id' /tmp/forged_upload.json)
+forged_pid=$(psql "${DATABASE_URL:-postgres://localhost/saturn}" -Atc "select project_id from file_assets where id='$FORGED_ID'")
+[[ -z "$forged_pid" ]] || { echo "✖ forged project_id was not ignored: $forged_pid" >&2; exit 1; }
+FORGED_KEY=$(jq -r '.asset' /tmp/forged_upload.json)
+call DELETE "/api/workspaces/file-assets/$WS_ID/${FORGED_KEY#*/}/"
+echo "✔ Plane #10212: legacy file-asset POST forged identity fields ignored"
+

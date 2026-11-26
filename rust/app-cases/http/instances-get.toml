@@ -1,0 +1,16 @@
+[request]
+method = "GET"
+path = "/api/instances/"
+
+[response]
+status = 200
+
+[response.headers]
+allow = "GET, PATCH, HEAD, OPTIONS"
+cache-control = "private, max-age=12"
+content-type = "application/json"
+cross-origin-opener-policy = "same-origin"
+referrer-policy = "same-origin"
+vary = "Accept-Encoding, Cookie, origin"
+x-content-type-options = "nosniff"
+x-frame-options = "DENY"

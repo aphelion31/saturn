@@ -1,0 +1,905 @@
+{
+ "basic": {
+  "input": "<p>Hello <strong>world</strong> and <em>it</em> <u>u</u> <s>s</s> <code>c</code> <a href=\"https://x.dev\">link</a></p>",
+  "binary": "AgSp+/eQCgAHAQV0aXRsZQMHaGVhZGluZwcAqfv3kAoABgQAqfv3kAoBC1RpdGxlIGJhc2ljKACp+/eQCgAFbGV2ZWwBfQEavdHJwQgABwEHZGVmYXVsdAMJcGFyYWdyYXBoBwC90cnBCAAGBAC90cnBCAEGSGVsbG8ghr3RycEIBwRib2xkAnt9hL3RycEICAV3b3JsZIa90cnBCA0EYm9sZARudWxshL3RycEIDgUgYW5kIIa90cnBCBMGaXRhbGljAnt9hL3RycEIFAJpdIa90cnBCBYGaXRhbGljBG51bGyEvdHJwQgXASCGvdHJwQgYCXVuZGVybGluZQJ7fYS90cnBCBkBdYa90cnBCBoJdW5kZXJsaW5lBG51bGyEvdHJwQgbASCGvdHJwQgcBnN0cmlrZQJ7fYS90cnBCB0Bc4a90cnBCB4Gc3RyaWtlBG51bGyEvdHJwQgfASCGvdHJwQggBGNvZGUCe32EvdHJwQghAWOGvdHJwQgiBGNvZGUEbnVsbIS90cnBCCMBIIa90cnBCCQEbGlua8sBeyJocmVmIjoiaHR0cHM6Ly94LmRldiIsInRhcmdldCI6Il9ibGFuayIsInJlbCI6Im5vb3BlbmVyIG5vcmVmZXJyZXIgbm9mb2xsb3ciLCJjbGFzcyI6InRleHQtYWNjZW50LXNlY29uZGFyeSB1bmRlcmxpbmUgdW5kZXJsaW5lLW9mZnNldC1bM3B4XSBob3Zlcjp0ZXh0LWFjY2VudC1wcmltYXJ5IHRyYW5zaXRpb24tY29sb3JzIGN1cnNvci1wb2ludGVyIn2EvdHJwQglBGxpbmuGvdHJwQgpBGxpbmsEbnVsbAA=",
+  "html": "<p class=\"editor-paragraph-block\">Hello <strong>world</strong> and <em>it</em> <u>u</u> <s>s</s> <code class=\"rounded-sm bg-layer-3 px-[6px] py-[1.5px] font-code font-medium text-(--extended-color-orange-600) border-[0.5px] border-subtle\" spellcheck=\"false\">c</code> <a target=\"_blank\" rel=\"noopener noreferrer nofollow\" class=\"text-accent-secondary underline underline-offset-[3px] hover:text-accent-primary transition-colors cursor-pointer\" href=\"https://x.dev\">link</a></p>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "paragraph",
+     "attrs": {
+      "textAlign": null
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "Hello "
+      },
+      {
+       "type": "text",
+       "marks": [
+        {
+         "type": "bold"
+        }
+       ],
+       "text": "world"
+      },
+      {
+       "type": "text",
+       "text": " and "
+      },
+      {
+       "type": "text",
+       "marks": [
+        {
+         "type": "italic"
+        }
+       ],
+       "text": "it"
+      },
+      {
+       "type": "text",
+       "text": " "
+      },
+      {
+       "type": "text",
+       "marks": [
+        {
+         "type": "underline"
+        }
+       ],
+       "text": "u"
+      },
+      {
+       "type": "text",
+       "text": " "
+      },
+      {
+       "type": "text",
+       "marks": [
+        {
+         "type": "strike"
+        }
+       ],
+       "text": "s"
+      },
+      {
+       "type": "text",
+       "text": " "
+      },
+      {
+       "type": "text",
+       "marks": [
+        {
+         "type": "code"
+        }
+       ],
+       "text": "c"
+      },
+      {
+       "type": "text",
+       "text": " "
+      },
+      {
+       "type": "text",
+       "marks": [
+        {
+         "type": "link",
+         "attrs": {
+          "href": "https://x.dev",
+          "target": "_blank",
+          "rel": "noopener noreferrer nofollow",
+          "class": "text-accent-secondary underline underline-offset-[3px] hover:text-accent-primary transition-colors cursor-pointer"
+         }
+        }
+       ],
+       "text": "link"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "headings": {
+  "input": "<h1>One</h1><h2>Two</h2><h3>Three</h3><p></p>",
+  "binary": "AgSCoZrNBAAHAQV0aXRsZQMHaGVhZGluZwcAgqGazQQABgQAgqGazQQBDlRpdGxlIGhlYWRpbmdzKACCoZrNBAAFbGV2ZWwBfQEN9ra6qAEABwEHZGVmYXVsdAMHaGVhZGluZwcA9ra6qAEABgQA9ra6qAEBA09uZSgA9ra6qAEABWxldmVsAX0Bh/a2uqgBAAMHaGVhZGluZwcA9ra6qAEGBgQA9ra6qAEHA1R3bygA9ra6qAEGBWxldmVsAX0Ch/a2uqgBBgMHaGVhZGluZwcA9ra6qAEMBgQA9ra6qAENBVRocmVlKAD2trqoAQwFbGV2ZWwBfQOH9ra6qAEMAwlwYXJhZ3JhcGgA",
+  "html": "<h1 class=\"editor-heading-block\">One</h1><h2 class=\"editor-heading-block\">Two</h2><h3 class=\"editor-heading-block\">Three</h3><p class=\"editor-paragraph-block\"></p>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "heading",
+     "attrs": {
+      "textAlign": null,
+      "level": 1
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "One"
+      }
+     ]
+    },
+    {
+     "type": "heading",
+     "attrs": {
+      "textAlign": null,
+      "level": 2
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "Two"
+      }
+     ]
+    },
+    {
+     "type": "heading",
+     "attrs": {
+      "textAlign": null,
+      "level": 3
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "Three"
+      }
+     ]
+    },
+    {
+     "type": "paragraph",
+     "attrs": {
+      "textAlign": null
+     }
+    }
+   ]
+  }
+ },
+ "lists": {
+  "input": "<ul><li><p>a</p></li><li><p>b</p><ul><li><p>c</p></li></ul></li></ul><ol><li><p>1</p></li></ol>",
+  "binary": "AhTF8pLdBAAHAQdkZWZhdWx0AwpidWxsZXRMaXN0BwDF8pLdBAADCGxpc3RJdGVtBwDF8pLdBAEDCXBhcmFncmFwaAcAxfKS3QQCBgQAxfKS3QQDAWGHxfKS3QQBAwhsaXN0SXRlbQcAxfKS3QQFAwlwYXJhZ3JhcGgHAMXykt0EBgYEAMXykt0EBwFih8Xykt0EBgMKYnVsbGV0TGlzdAcAxfKS3QQJAwhsaXN0SXRlbQcAxfKS3QQKAwlwYXJhZ3JhcGgHAMXykt0ECwYEAMXykt0EDAFjh8Xykt0EAAMLb3JkZXJlZExpc3QHAMXykt0EDgMIbGlzdEl0ZW0HAMXykt0EDwMJcGFyYWdyYXBoBwDF8pLdBBAGBADF8pLdBBEBMSgAxfKS3QQOBXN0YXJ0AX0BBLHMovEDAAcBBXRpdGxlAwdoZWFkaW5nBwCxzKLxAwAGBACxzKLxAwELVGl0bGUgbGlzdHMoALHMovEDAAVsZXZlbAF9AQA=",
+  "html": "<ul class=\"list-disc pl-7 space-y-(--list-spacing-y)\"><li class=\"not-prose space-y-2\"><p class=\"editor-paragraph-block\">a</p></li><li class=\"not-prose space-y-2\"><p class=\"editor-paragraph-block\">b</p><ul class=\"list-disc pl-7 space-y-(--list-spacing-y)\"><li class=\"not-prose space-y-2\"><p class=\"editor-paragraph-block\">c</p></li></ul></li></ul><ol class=\"list-decimal pl-7 space-y-(--list-spacing-y)\"><li class=\"not-prose space-y-2\"><p class=\"editor-paragraph-block\">1</p></li></ol>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "bulletList",
+     "content": [
+      {
+       "type": "listItem",
+       "content": [
+        {
+         "type": "paragraph",
+         "attrs": {
+          "textAlign": null
+         },
+         "content": [
+          {
+           "type": "text",
+           "text": "a"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "type": "listItem",
+       "content": [
+        {
+         "type": "paragraph",
+         "attrs": {
+          "textAlign": null
+         },
+         "content": [
+          {
+           "type": "text",
+           "text": "b"
+          }
+         ]
+        },
+        {
+         "type": "bulletList",
+         "content": [
+          {
+           "type": "listItem",
+           "content": [
+            {
+             "type": "paragraph",
+             "attrs": {
+              "textAlign": null
+             },
+             "content": [
+              {
+               "type": "text",
+               "text": "c"
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "type": "orderedList",
+     "attrs": {
+      "start": 1,
+      "type": null
+     },
+     "content": [
+      {
+       "type": "listItem",
+       "content": [
+        {
+         "type": "paragraph",
+         "attrs": {
+          "textAlign": null
+         },
+         "content": [
+          {
+           "type": "text",
+           "text": "1"
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "tasks": {
+  "input": "<ul data-type=\"taskList\"><li data-type=\"taskItem\" data-checked=\"true\"><p>done</p></li><li data-type=\"taskItem\" data-checked=\"false\"><p>todo</p></li></ul>",
+  "binary": "AgTZ2vfdCgAHAQV0aXRsZQMHaGVhZGluZwcA2dr33QoABgQA2dr33QoBC1RpdGxlIHRhc2tzKADZ2vfdCgAFbGV2ZWwBfQELmsmx4wYABwEHZGVmYXVsdAMIdGFza0xpc3QHAJrJseMGAAMIdGFza0l0ZW0HAJrJseMGAQMJcGFyYWdyYXBoBwCaybHjBgIGBACaybHjBgMEZG9uZSgAmsmx4wYBB2NoZWNrZWQBeIeaybHjBgEDCHRhc2tJdGVtBwCaybHjBgkDCXBhcmFncmFwaAcAmsmx4wYKBgQAmsmx4wYLBHRvZG8oAJrJseMGCQdjaGVja2VkAXkA",
+  "html": "<ul class=\"not-prose pl-2 space-y-2\" data-type=\"taskList\"><li class=\"flex\" data-checked=\"true\" data-type=\"taskItem\"><label><input type=\"checkbox\" checked=\"checked\"><span></span></label><div><p class=\"editor-paragraph-block\">done</p></div></li><li class=\"flex\" data-checked=\"false\" data-type=\"taskItem\"><label><input type=\"checkbox\"><span></span></label><div><p class=\"editor-paragraph-block\">todo</p></div></li></ul>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "taskList",
+     "content": [
+      {
+       "type": "taskItem",
+       "attrs": {
+        "checked": true
+       },
+       "content": [
+        {
+         "type": "paragraph",
+         "attrs": {
+          "textAlign": null
+         },
+         "content": [
+          {
+           "type": "text",
+           "text": "done"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "type": "taskItem",
+       "attrs": {
+        "checked": false
+       },
+       "content": [
+        {
+         "type": "paragraph",
+         "attrs": {
+          "textAlign": null
+         },
+         "content": [
+          {
+           "type": "text",
+           "text": "todo"
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "quote_code": {
+  "input": "<blockquote><p>q</p></blockquote><pre><code class=\"language-rust\">fn main() {}\nx &lt; y</code></pre><hr>",
+  "binary": "AgnE4vzXCAAHAQdkZWZhdWx0AwpibG9ja3F1b3RlBwDE4vzXCAADCXBhcmFncmFwaAcAxOL81wgBBgQAxOL81wgCAXGHxOL81wgAAwljb2RlQmxvY2sHAMTi/NcIBAYEAMTi/NcIBRJmbiBtYWluKCkge30KeCA8IHkoAMTi/NcIBAhsYW5ndWFnZQF3BHJ1c3SHxOL81wgEAw5ob3Jpem9udGFsUnVsZQSY4YZJAAcBBXRpdGxlAwdoZWFkaW5nBwCY4YZJAAYEAJjhhkkBEFRpdGxlIHF1b3RlX2NvZGUoAJjhhkkABWxldmVsAX0BAA==",
+  "html": "<blockquote><p class=\"editor-paragraph-block\">q</p></blockquote><pre><code class=\"language-rust\">fn main() {}\nx &lt; y</code></pre><div class=\"py-4 border-strong-1\" data-type=\"horizontalRule\"><div></div></div>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "blockquote",
+     "content": [
+      {
+       "type": "paragraph",
+       "attrs": {
+        "textAlign": null
+       },
+       "content": [
+        {
+         "type": "text",
+         "text": "q"
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "type": "codeBlock",
+     "attrs": {
+      "language": "rust"
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "fn main() {}\nx < y"
+      }
+     ]
+    },
+    {
+     "type": "horizontalRule"
+    }
+   ]
+  }
+ },
+ "mention": {
+  "input": "<p>hi <mention-component id=\"m1\" entity_identifier=\"11111111-1111-1111-1111-111111111111\" entity_name=\"user_mention\"></mention-component></p>",
+  "binary": "AgekgMqVDQAHAQdkZWZhdWx0AwlwYXJhZ3JhcGgHAKSAypUNAAYEAKSAypUNAQNoaSCHpIDKlQ0BAwdtZW50aW9uKACkgMqVDQUCaWQBdwJtMSgApIDKlQ0FEWVudGl0eV9pZGVudGlmaWVyAXckMTExMTExMTEtMTExMS0xMTExLTExMTEtMTExMTExMTExMTExKACkgMqVDQULZW50aXR5X25hbWUBdwx1c2VyX21lbnRpb24E8tS0ggIABwEFdGl0bGUDB2hlYWRpbmcHAPLUtIICAAYEAPLUtIICAQ1UaXRsZSBtZW50aW9uKADy1LSCAgAFbGV2ZWwBfQEA",
+  "html": "<p class=\"editor-paragraph-block\">hi <mention-component id=\"m1\" entity_identifier=\"11111111-1111-1111-1111-111111111111\" entity_name=\"user_mention\"></mention-component></p>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "paragraph",
+     "attrs": {
+      "textAlign": null
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "hi "
+      },
+      {
+       "type": "mention",
+       "attrs": {
+        "id": "m1",
+        "entity_identifier": "11111111-1111-1111-1111-111111111111",
+        "entity_name": "user_mention"
+       }
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "image": {
+  "input": "<image-component src=\"22222222-2222-2222-2222-222222222222\" width=\"35%\" height=\"auto\" aspectratio=\"1.5\" alignment=\"center\" id=\"img1\"></image-component>",
+  "binary": "Agj7o/uAAgAHAQdkZWZhdWx0Aw5pbWFnZUNvbXBvbmVudCgA+6P7gAIAA3NyYwF3JDIyMjIyMjIyLTIyMjItMjIyMi0yMjIyLTIyMjIyMjIyMjIyMigA+6P7gAIABXdpZHRoAXcDMzUlKAD7o/uAAgAGaGVpZ2h0AXcEYXV0bygA+6P7gAIAAmlkAXcEaW1nMSgA+6P7gAIAC2FzcGVjdFJhdGlvAXw/wAAAKAD7o/uAAgAJYWxpZ25tZW50AXcGY2VudGVyKAD7o/uAAgAGc3RhdHVzAXcHcGVuZGluZwSntvqbAQAHAQV0aXRsZQMHaGVhZGluZwcAp7b6mwEABgQAp7b6mwEBC1RpdGxlIGltYWdlKACntvqbAQAFbGV2ZWwBfQEA",
+  "html": "<image-component src=\"22222222-2222-2222-2222-222222222222\" width=\"35%\" height=\"auto\" id=\"img1\" aspectratio=\"1.5\" alignment=\"center\" status=\"pending\"></image-component>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "imageComponent",
+     "attrs": {
+      "src": "22222222-2222-2222-2222-222222222222",
+      "alt": null,
+      "title": null,
+      "width": "35%",
+      "height": "auto",
+      "id": "img1",
+      "aspectRatio": 1.5,
+      "alignment": "center",
+      "status": "pending"
+     }
+    }
+   ]
+  }
+ },
+ "callout": {
+  "input": "<div data-block-type=\"callout-component\" data-icon-color=\"#6d7b8a\" data-icon-name=\"FileText\" data-emoji-unicode=\"128512\" data-emoji-url=\"https://cdn.jsdelivr.net/npm/emoji-datasource-apple/img/apple/64/1f600.png\" data-logo-in-use=\"emoji\" data-background=\"gray\"><p>note</p></div>",
+  "binary": "AguBha7DCgAHAQdkZWZhdWx0AxBjYWxsb3V0Q29tcG9uZW50BwCBha7DCgADCXBhcmFncmFwaAcAgYWuwwoBBgQAgYWuwwoCBG5vdGUoAIGFrsMKAA9kYXRhLWljb24tY29sb3IBdwcjNmQ3YjhhKACBha7DCgAOZGF0YS1pY29uLW5hbWUBdwhGaWxlVGV4dCgAgYWuwwoAEmRhdGEtZW1vamktdW5pY29kZQF9gNgPKACBha7DCgAOZGF0YS1lbW9qaS11cmwBd0podHRwczovL2Nkbi5qc2RlbGl2ci5uZXQvbnBtL2Vtb2ppLWRhdGFzb3VyY2UtYXBwbGUvaW1nL2FwcGxlLzY0LzFmNjAwLnBuZygAgYWuwwoAEGRhdGEtbG9nby1pbi11c2UBdwVlbW9qaSgAgYWuwwoAD2RhdGEtYmFja2dyb3VuZAF3BGdyYXkoAIGFrsMKAA9kYXRhLWJsb2NrLXR5cGUBdxFjYWxsb3V0LWNvbXBvbmVudASegJaJBAAHAQV0aXRsZQMHaGVhZGluZwcAnoCWiQQABgQAnoCWiQQBDVRpdGxlIGNhbGxvdXQoAJ6AlokEAAVsZXZlbAF9AQA=",
+  "html": "<div data-icon-color=\"#6d7b8a\" data-icon-name=\"FileText\" data-emoji-unicode=\"128512\" data-emoji-url=\"https://cdn.jsdelivr.net/npm/emoji-datasource-apple/img/apple/64/1f600.png\" data-logo-in-use=\"emoji\" data-background=\"gray\" data-block-type=\"callout-component\"><p class=\"editor-paragraph-block\">note</p></div>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "calloutComponent",
+     "attrs": {
+      "id": null,
+      "data-icon-color": "#6d7b8a",
+      "data-icon-name": "FileText",
+      "data-emoji-unicode": 128512,
+      "data-emoji-url": "https://cdn.jsdelivr.net/npm/emoji-datasource-apple/img/apple/64/1f600.png",
+      "data-logo-in-use": "emoji",
+      "data-background": "gray",
+      "data-block-type": "callout-component"
+     },
+     "content": [
+      {
+       "type": "paragraph",
+       "attrs": {
+        "textAlign": null
+       },
+       "content": [
+        {
+         "type": "text",
+         "text": "note"
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "table": {
+  "input": "<table><tbody><tr><th><p>h</p></th><th><p>h2</p></th></tr><tr><td><p>c</p></td><td><p>d</p></td></tr></tbody></table>",
+  "binary": "AiGZgYjlCAAHAQdkZWZhdWx0AwV0YWJsZQcAmYGI5QgAAwh0YWJsZVJvdwcAmYGI5QgBAwt0YWJsZUhlYWRlcgcAmYGI5QgCAwlwYXJhZ3JhcGgHAJmBiOUIAwYEAJmBiOUIBAFoKACZgYjlCAIHY29sc3BhbgF9ASgAmYGI5QgCB3Jvd3NwYW4BfQEoAJmBiOUIAghjb2x3aWR0aAF1AX2WAigAmYGI5QgCCmJhY2tncm91bmQBdwRub25lh5mBiOUIAgMLdGFibGVIZWFkZXIHAJmBiOUICgMJcGFyYWdyYXBoBwCZgYjlCAsGBACZgYjlCAwCaDIoAJmBiOUICgdjb2xzcGFuAX0BKACZgYjlCAoHcm93c3BhbgF9ASgAmYGI5QgKCGNvbHdpZHRoAXUBfZYCKACZgYjlCAoKYmFja2dyb3VuZAF3BG5vbmWHmYGI5QgBAwh0YWJsZVJvdwcAmYGI5QgTAwl0YWJsZUNlbGwHAJmBiOUIFAMJcGFyYWdyYXBoBwCZgYjlCBUGBACZgYjlCBYBYygAmYGI5QgUB2NvbHNwYW4BfQEoAJmBiOUIFAdyb3dzcGFuAX0BKACZgYjlCBQIY29sd2lkdGgBdQF9lgKHmYGI5QgUAwl0YWJsZUNlbGwHAJmBiOUIGwMJcGFyYWdyYXBoBwCZgYjlCBwGBACZgYjlCB0BZCgAmYGI5QgbB2NvbHNwYW4BfQEoAJmBiOUIGwdyb3dzcGFuAX0BKACZgYjlCBsIY29sd2lkdGgBdQF9lgIEu/64jQQABwEFdGl0bGUDB2hlYWRpbmcHALv+uI0EAAYEALv+uI0EAQtUaXRsZSB0YWJsZSgAu/64jQQABWxldmVsAX0BAA==",
+  "html": "<table><tbody><tr style=\"\"><th colspan=\"1\" rowspan=\"1\" colwidth=\"150\" background=\"none\" style=\"background-color: none;\"><p class=\"editor-paragraph-block\">h</p></th><th colspan=\"1\" rowspan=\"1\" colwidth=\"150\" background=\"none\" style=\"background-color: none;\"><p class=\"editor-paragraph-block\">h2</p></th></tr><tr style=\"\"><td colspan=\"1\" rowspan=\"1\" colwidth=\"150\" style=\"\"><p class=\"editor-paragraph-block\">c</p></td><td colspan=\"1\" rowspan=\"1\" colwidth=\"150\" style=\"\"><p class=\"editor-paragraph-block\">d</p></td></tr></tbody></table>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "table",
+     "content": [
+      {
+       "type": "tableRow",
+       "attrs": {
+        "background": null,
+        "textColor": null
+       },
+       "content": [
+        {
+         "type": "tableHeader",
+         "attrs": {
+          "colspan": 1,
+          "rowspan": 1,
+          "colwidth": [
+           150
+          ],
+          "background": "none"
+         },
+         "content": [
+          {
+           "type": "paragraph",
+           "attrs": {
+            "textAlign": null
+           },
+           "content": [
+            {
+             "type": "text",
+             "text": "h"
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "type": "tableHeader",
+         "attrs": {
+          "colspan": 1,
+          "rowspan": 1,
+          "colwidth": [
+           150
+          ],
+          "background": "none"
+         },
+         "content": [
+          {
+           "type": "paragraph",
+           "attrs": {
+            "textAlign": null
+           },
+           "content": [
+            {
+             "type": "text",
+             "text": "h2"
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "type": "tableRow",
+       "attrs": {
+        "background": null,
+        "textColor": null
+       },
+       "content": [
+        {
+         "type": "tableCell",
+         "attrs": {
+          "colspan": 1,
+          "rowspan": 1,
+          "colwidth": [
+           150
+          ],
+          "background": null,
+          "textColor": null
+         },
+         "content": [
+          {
+           "type": "paragraph",
+           "attrs": {
+            "textAlign": null
+           },
+           "content": [
+            {
+             "type": "text",
+             "text": "c"
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "type": "tableCell",
+         "attrs": {
+          "colspan": 1,
+          "rowspan": 1,
+          "colwidth": [
+           150
+          ],
+          "background": null,
+          "textColor": null
+         },
+         "content": [
+          {
+           "type": "paragraph",
+           "attrs": {
+            "textAlign": null
+           },
+           "content": [
+            {
+             "type": "text",
+             "text": "d"
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "color": {
+  "input": "<p><span style=\"color: var(--editor-colors-red-text)\" data-text-color=\"red\">red</span> <span data-background-color=\"blue\" style=\"background-color: var(--editor-colors-blue-background)\">bg</span></p>",
+  "binary": "AgnEg9v1DwAHAQdkZWZhdWx0AwlwYXJhZ3JhcGgHAMSD2/UPAAYGAMSD2/UPAQl0ZXh0U3R5bGUCe32ExIPb9Q8CA3JlZIbEg9v1DwUJdGV4dFN0eWxlBG51bGyExIPb9Q8GASCGxIPb9Q8HCXRleHRTdHlsZQJ7fYTEg9v1DwgCYmeGxIPb9Q8KCXRleHRTdHlsZQRudWxsBJOnhZgMAAcBBXRpdGxlAwdoZWFkaW5nBwCTp4WYDAAGBACTp4WYDAELVGl0bGUgY29sb3IoAJOnhZgMAAVsZXZlbAF9AQA=",
+  "html": "<p class=\"editor-paragraph-block\"><span>red</span> <span>bg</span></p>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "paragraph",
+     "attrs": {
+      "textAlign": null
+     },
+     "content": [
+      {
+       "type": "text",
+       "marks": [
+        {
+         "type": "textStyle"
+        }
+       ],
+       "text": "red"
+      },
+      {
+       "type": "text",
+       "text": " "
+      },
+      {
+       "type": "text",
+       "marks": [
+        {
+         "type": "textStyle"
+        }
+       ],
+       "text": "bg"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "align": {
+  "input": "<p style=\"text-align: center\">mid</p><h2 style=\"text-align: right\">r</h2>",
+  "binary": "Agme+6n+DQAHAQdkZWZhdWx0AwlwYXJhZ3JhcGgHAJ77qf4NAAYEAJ77qf4NAQNtaWQoAJ77qf4NAAl0ZXh0QWxpZ24BdwZjZW50ZXKHnvup/g0AAwdoZWFkaW5nBwCe+6n+DQYGBACe+6n+DQcBcigAnvup/g0GCXRleHRBbGlnbgF3BXJpZ2h0KACe+6n+DQYFbGV2ZWwBfQIEzYb/lwoABwEFdGl0bGUDB2hlYWRpbmcHAM2G/5cKAAYEAM2G/5cKAQtUaXRsZSBhbGlnbigAzYb/lwoABWxldmVsAX0BAA==",
+  "html": "<p class=\"editor-paragraph-block\" style=\"text-align: center;\">mid</p><h2 class=\"editor-heading-block\" style=\"text-align: right;\">r</h2>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "paragraph",
+     "attrs": {
+      "textAlign": "center"
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "mid"
+      }
+     ]
+    },
+    {
+     "type": "heading",
+     "attrs": {
+      "textAlign": "right",
+      "level": 2
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "r"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "breaks": {
+  "input": "<p>a<br>b</p>",
+  "binary": "AgSc2qqSDgAHAQV0aXRsZQMHaGVhZGluZwcAnNqqkg4ABgQAnNqqkg4BDFRpdGxlIGJyZWFrcygAnNqqkg4ABWxldmVsAX0BBrm+vKkEAAcBB2RlZmF1bHQDCXBhcmFncmFwaAcAub68qQQABgQAub68qQQBAWGHub68qQQBAwloYXJkQnJlYWuHub68qQQDBgQAub68qQQEAWIA",
+  "html": "<p class=\"editor-paragraph-block\">a<br>b</p>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "paragraph",
+     "attrs": {
+      "textAlign": null
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "a"
+      },
+      {
+       "type": "hardBreak"
+      },
+      {
+       "type": "text",
+       "text": "b"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "escape": {
+  "input": "<p>&lt;script&gt;alert(1)&lt;/script&gt; &amp; \"q\"</p>",
+  "binary": "AgSimqzeBgAHAQV0aXRsZQMHaGVhZGluZwcAopqs3gYABgQAopqs3gYBDFRpdGxlIGVzY2FwZSgAopqs3gYABWxldmVsAX0BA6ncqb8EAAcBB2RlZmF1bHQDCXBhcmFncmFwaAcAqdypvwQABgQAqdypvwQBHzxzY3JpcHQ+YWxlcnQoMSk8L3NjcmlwdD4gJiAicSIA",
+  "html": "<p class=\"editor-paragraph-block\">&lt;script&gt;alert(1)&lt;/script&gt; &amp; \"q\"</p>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "paragraph",
+     "attrs": {
+      "textAlign": null
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "<script>alert(1)</script> & \"q\""
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "nested_marks": {
+  "input": "<p><strong><em><a href=\"https://a.b/?x=1&amp;y=2\">both</a></em></strong> <code>x</code></p>",
+  "binary": "Ag22ofrWBwAHAQdkZWZhdWx0AwlwYXJhZ3JhcGgHALah+tYHAAYGALah+tYHAQRsaW5r0gF7ImhyZWYiOiJodHRwczovL2EuYi8/eD0xJnk9MiIsInRhcmdldCI6Il9ibGFuayIsInJlbCI6Im5vb3BlbmVyIG5vcmVmZXJyZXIgbm9mb2xsb3ciLCJjbGFzcyI6InRleHQtYWNjZW50LXNlY29uZGFyeSB1bmRlcmxpbmUgdW5kZXJsaW5lLW9mZnNldC1bM3B4XSBob3Zlcjp0ZXh0LWFjY2VudC1wcmltYXJ5IHRyYW5zaXRpb24tY29sb3JzIGN1cnNvci1wb2ludGVyIn2GtqH61gcCBGJvbGQCe32GtqH61gcDBml0YWxpYwJ7fYS2ofrWBwQEYm90aIa2ofrWBwgEbGluawRudWxshrah+tYHCQRib2xkBG51bGyGtqH61gcKBml0YWxpYwRudWxshLah+tYHCwEghrah+tYHDARjb2RlAnt9hLah+tYHDQF4hrah+tYHDgRjb2RlBG51bGwE0u6GuQYABwEFdGl0bGUDB2hlYWRpbmcHANLuhrkGAAYEANLuhrkGARJUaXRsZSBuZXN0ZWRfbWFya3MoANLuhrkGAAVsZXZlbAF9AQA=",
+  "html": "<p class=\"editor-paragraph-block\"><a target=\"_blank\" rel=\"noopener noreferrer nofollow\" class=\"text-accent-secondary underline underline-offset-[3px] hover:text-accent-primary transition-colors cursor-pointer\" href=\"https://a.b/?x=1&amp;y=2\"><strong><em>both</em></strong></a> <code class=\"rounded-sm bg-layer-3 px-[6px] py-[1.5px] font-code font-medium text-(--extended-color-orange-600) border-[0.5px] border-subtle\" spellcheck=\"false\">x</code></p>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "paragraph",
+     "attrs": {
+      "textAlign": null
+     },
+     "content": [
+      {
+       "type": "text",
+       "marks": [
+        {
+         "type": "link",
+         "attrs": {
+          "href": "https://a.b/?x=1&y=2",
+          "target": "_blank",
+          "rel": "noopener noreferrer nofollow",
+          "class": "text-accent-secondary underline underline-offset-[3px] hover:text-accent-primary transition-colors cursor-pointer"
+         }
+        },
+        {
+         "type": "bold"
+        },
+        {
+         "type": "italic"
+        }
+       ],
+       "text": "both"
+      },
+      {
+       "type": "text",
+       "text": " "
+      },
+      {
+       "type": "text",
+       "marks": [
+        {
+         "type": "code"
+        }
+       ],
+       "text": "x"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "ordered_start": {
+  "input": "<ol start=\"3\"><li><p>three</p></li></ol>",
+  "binary": "AgSAk+zwBgAHAQV0aXRsZQMHaGVhZGluZwcAgJPs8AYABgQAgJPs8AYBE1RpdGxlIG9yZGVyZWRfc3RhcnQoAICT7PAGAAVsZXZlbAF9AQbii7ffAgAHAQdkZWZhdWx0AwtvcmRlcmVkTGlzdAcA4ou33wIAAwhsaXN0SXRlbQcA4ou33wIBAwlwYXJhZ3JhcGgHAOKLt98CAgYEAOKLt98CAwV0aHJlZSgA4ou33wIABXN0YXJ0AX0DAA==",
+  "html": "<ol class=\"list-decimal pl-7 space-y-(--list-spacing-y)\" start=\"3\"><li class=\"not-prose space-y-2\"><p class=\"editor-paragraph-block\">three</p></li></ol>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "orderedList",
+     "attrs": {
+      "start": 3,
+      "type": null
+     },
+     "content": [
+      {
+       "type": "listItem",
+       "content": [
+        {
+         "type": "paragraph",
+         "attrs": {
+          "textAlign": null
+         },
+         "content": [
+          {
+           "type": "text",
+           "text": "three"
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "embed": {
+  "input": "<issue-embed-component entity_identifier=\"33333333-3333-3333-3333-333333333333\" project_identifier=\"44444444-4444-4444-4444-444444444444\" workspace_identifier=\"55555555-5555-5555-5555-555555555555\" entity_name=\"issue\"></issue-embed-component>",
+  "binary": "Agavlo6BBwAHAQdkZWZhdWx0AxVpc3N1ZS1lbWJlZC1jb21wb25lbnQoAK+WjoEHABFlbnRpdHlfaWRlbnRpZmllcgF3JDMzMzMzMzMzLTMzMzMtMzMzMy0zMzMzLTMzMzMzMzMzMzMzMygAr5aOgQcAEnByb2plY3RfaWRlbnRpZmllcgF3JDQ0NDQ0NDQ0LTQ0NDQtNDQ0NC00NDQ0LTQ0NDQ0NDQ0NDQ0NCgAr5aOgQcAFHdvcmtzcGFjZV9pZGVudGlmaWVyAXckNTU1NTU1NTUtNTU1NS01NTU1LTU1NTUtNTU1NTU1NTU1NTU1KACvlo6BBwACaWQBfygAr5aOgQcAC2VudGl0eV9uYW1lAXcFaXNzdWUEiYC74wIABwEFdGl0bGUDB2hlYWRpbmcHAImAu+MCAAYEAImAu+MCAQtUaXRsZSBlbWJlZCgAiYC74wIABWxldmVsAX0BAA==",
+  "html": "<issue-embed-component entity_identifier=\"33333333-3333-3333-3333-333333333333\" project_identifier=\"44444444-4444-4444-4444-444444444444\" workspace_identifier=\"55555555-5555-5555-5555-555555555555\" entity_name=\"issue\"></issue-embed-component>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "issue-embed-component",
+     "attrs": {
+      "entity_identifier": "33333333-3333-3333-3333-333333333333",
+      "project_identifier": "44444444-4444-4444-4444-444444444444",
+      "workspace_identifier": "55555555-5555-5555-5555-555555555555",
+      "entity_name": "issue"
+     }
+    }
+   ]
+  }
+ },
+ "emoji": {
+  "input": "<p><span data-type=\"emoji\" data-name=\"smile\">😄</span></p>",
+  "binary": "AgS24qumBwAHAQV0aXRsZQMHaGVhZGluZwcAtuKrpgcABgQAtuKrpgcBC1RpdGxlIGVtb2ppKAC24qumBwAFbGV2ZWwBfQEF88fijgUABwEHZGVmYXVsdAMJcGFyYWdyYXBoBwDzx+KOBQAGBgDzx+KOBQELY3VzdG9tQ29sb3IleyJjb2xvciI6bnVsbCwiYmFja2dyb3VuZENvbG9yIjpudWxsfYTzx+KOBQIE8J+YhIbzx+KOBQQLY3VzdG9tQ29sb3IEbnVsbAA=",
+  "html": "<p class=\"editor-paragraph-block\"><span>😄</span></p>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "paragraph",
+     "attrs": {
+      "textAlign": null
+     },
+     "content": [
+      {
+       "type": "text",
+       "marks": [
+        {
+         "type": "customColor",
+         "attrs": {
+          "color": null,
+          "backgroundColor": null
+         }
+        }
+       ],
+       "text": "😄"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "empty": {
+  "input": "",
+  "binary": "AgSDx8GJDAAHAQV0aXRsZQMHaGVhZGluZwcAg8fBiQwABgQAg8fBiQwBC1RpdGxlIGVtcHR5KACDx8GJDAAFbGV2ZWwBfQEBmYTg+AoABwEHZGVmYXVsdAMJcGFyYWdyYXBoAA==",
+  "html": "<p class=\"editor-paragraph-block\"></p>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "paragraph",
+     "attrs": {
+      "textAlign": null
+     }
+    }
+   ]
+  }
+ },
+ "image_min": {
+  "input": "<image-component src=\"https://example.com/a.png\"></image-component>",
+  "binary": "AgTay9/1DQAHAQV0aXRsZQMHaGVhZGluZwcA2svf9Q0ABgQA2svf9Q0BD1RpdGxlIGltYWdlX21pbigA2svf9Q0ABWxldmVsAX0BBrqous0KAAcBB2RlZmF1bHQDDmltYWdlQ29tcG9uZW50KAC6qLrNCgADc3JjAXcZaHR0cHM6Ly9leGFtcGxlLmNvbS9hLnBuZygAuqi6zQoABXdpZHRoAXcDMzUlKAC6qLrNCgAGaGVpZ2h0AXcEYXV0bygAuqi6zQoACWFsaWdubWVudAF3BGxlZnQoALqous0KAAZzdGF0dXMBdwdwZW5kaW5nAA==",
+  "html": "<image-component src=\"https://example.com/a.png\" width=\"35%\" height=\"auto\" alignment=\"left\" status=\"pending\"></image-component>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "imageComponent",
+     "attrs": {
+      "src": "https://example.com/a.png",
+      "alt": null,
+      "title": null,
+      "width": "35%",
+      "height": "auto",
+      "id": null,
+      "aspectRatio": null,
+      "alignment": "left",
+      "status": "pending"
+     }
+    }
+   ]
+  }
+ },
+ "unicode": {
+  "input": "<p>Ünïcödé — 日本語 🚀</p>",
+  "binary": "AgO5w93PDgAHAQdkZWZhdWx0AwlwYXJhZ3JhcGgHALnD3c8OAAYEALnD3c8OAR7DnG7Dr2PDtmTDqSDigJQg5pel5pys6KqeIPCfmoAE+tyovAIABwEFdGl0bGUDB2hlYWRpbmcHAPrcqLwCAAYEAPrcqLwCAQ1UaXRsZSB1bmljb2RlKAD63Ki8AgAFbGV2ZWwBfQEA",
+  "html": "<p class=\"editor-paragraph-block\">Ünïcödé — 日本語 🚀</p>",
+  "json": {
+   "type": "doc",
+   "content": [
+    {
+     "type": "paragraph",
+     "attrs": {
+      "textAlign": null
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "Ünïcödé — 日本語 🚀"
+      }
+     ]
+    }
+   ]
+  }
+ }
+}
