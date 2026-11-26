@@ -4,6 +4,8 @@ web/node_modules/
 web/build/
 web/.react-router/
 .env
+.DS_Store
+**/.DS_Store
 web/**/node_modules/
 web/**/build/
 web/**/.react-router/

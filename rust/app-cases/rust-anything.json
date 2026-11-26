@@ -1,0 +1,17 @@
+{
+  "schema": "rust-anything/app-cases@1",
+  "name": "run-plane",
+  "run": [
+    "/tmp/run-plane.sh"
+  ],
+  "normalize": [
+    "timestamps",
+    "uuids",
+    "key-order"
+  ],
+  "timeout_secs": 45,
+  "http": {},
+  "effects": {
+    "db_reset": "dropdb --if-exists plane_work_22060 >/dev/null 2>&1; createdb -T plane_tpl_22060 plane_work_22060 && redis-cli -n 15 flushdb >/dev/null"
+  }
+}
