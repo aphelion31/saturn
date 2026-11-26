@@ -1,0 +1,23 @@
+# Local PostgreSQL dependency for `cargo run` development.
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: saturn-postgres-dev
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-saturn}
+      POSTGRES_USER: ${POSTGRES_USER:-saturn}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-saturn}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - saturn-postgres-dev-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  saturn-postgres-dev-data:
+    name: saturn-postgres-dev-data

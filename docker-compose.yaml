@@ -1,0 +1,100 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-saturn}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:-saturn}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-saturn} -d ${POSTGRES_DB:-saturn}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - saturn
+
+  axum:
+    build:
+      context: .
+      dockerfile: docker/axum/Dockerfile
+    image: saturn-axum:${SATURN_VERSION:-0.3.1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-saturn}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-saturn}
+      BIND: 0.0.0.0:3000
+      WEB_URL: ${WEB_URL:-http://localhost:3000}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set}
+      WEB_DIR: /srv/saturn/web
+      STORAGE_DIR: /data/storage
+      TRUST_PROXY: ${TRUST_PROXY:-1}
+      SATURN_JOBS: ${SATURN_JOBS:-1}
+      FILE_SIZE_LIMIT: ${FILE_SIZE_LIMIT:-5242880}
+      DB_POOL: ${DB_POOL:-20}
+      RUST_LOG: ${RUST_LOG:-info,tower_http=warn}
+    volumes:
+      - saturn_storage:/data/storage
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m,uid=1001,gid=1001,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    stop_grace_period: 30s
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:3000/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - saturn
+
+  nginx:
+    build:
+      context: .
+      dockerfile: docker/nginx/Dockerfile
+    image: saturn-nginx:${SATURN_VERSION:-0.3.1}
+    depends_on:
+      axum:
+        condition: service_healthy
+    ports:
+      - "${BIND_HOST:-127.0.0.1}:${PORT:-3000}:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,uid=1001,gid=1001,mode=1777
+      - /var/cache/nginx:rw,noexec,nosuid,size=64m,uid=1001,gid=1001,mode=750
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/ready >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    networks:
+      - saturn
+
+volumes:
+  pgdata:
+  saturn_storage:
+
+networks:
+  saturn:
+    driver: bridge
