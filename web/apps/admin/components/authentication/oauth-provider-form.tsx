@@ -56,7 +56,7 @@ export function OAuthProviderForm<T extends FieldValues>(props: Props<T>) {
       <div className="flex flex-col gap-8">
         <div className="grid w-full grid-cols-2 gap-x-8 gap-y-8">
           <div className="col-span-2 flex flex-col gap-y-4 pt-1 md:col-span-1">
-            <div className="text-h6-medium text-primary">{providerName}-provided details for Plane</div>
+            <div className="text-h6-medium text-primary">{providerName}-provided details for Saturn</div>
             {formFields.map((field) => (
               <ControllerInput
                 key={field.key}
@@ -94,7 +94,7 @@ export function OAuthProviderForm<T extends FieldValues>(props: Props<T>) {
             </div>
           </div>
           <div className="col-span-2 flex flex-col gap-y-6 md:col-span-1">
-            <div className="text-h6-medium text-primary">Plane-provided details for {providerName}</div>
+            <div className="text-h6-medium text-primary">Saturn-provided details for {providerName}</div>
             <div className="flex flex-col gap-y-4">
               <div className="flex flex-col gap-y-4 rounded-lg bg-layer-1 px-6 py-4">
                 {serviceDetails.map((field) => (

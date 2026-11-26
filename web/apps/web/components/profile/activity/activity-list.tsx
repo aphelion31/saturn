@@ -135,7 +135,7 @@ export const ActivityList = observer(function ActivityList(props: Props) {
                         <div className="min-w-0 flex-1 border-b border-subtle py-4">
                           <div className="text-body-xs-regular break-words text-secondary">
                             {activityItem.field === "archived_at" && activityItem.new_value !== "restore" ? (
-                              <span className="font-medium text-primary">Plane</span>
+                              <span className="font-medium text-primary">Saturn</span>
                             ) : activityItem.actor_detail.is_bot ? (
                               <span className="font-medium text-primary">
                                 {activityItem.actor_detail.first_name} Bot

@@ -70,7 +70,7 @@ export const IssueDetailSidebarSections = observer(function IssueDetailSidebarSe
 
   const projectDetails = getProjectById(issue.project_id);
   const createdByDetails = getUserDetails(issue.created_by);
-  const createdByName = createdByDetails?.display_name?.includes("-intake") ? "Plane" : createdByDetails?.display_name;
+  const createdByName = createdByDetails?.display_name?.includes("-intake") ? "Saturn" : createdByDetails?.display_name;
   const hasProjectStructureProperties = !!projectDetails?.cycle_view || !!projectDetails?.module_view;
 
   const auditRows = [

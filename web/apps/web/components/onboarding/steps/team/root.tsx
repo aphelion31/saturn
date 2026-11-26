@@ -308,7 +308,7 @@ export const InviteTeamStep = observer(function InviteTeamStep(props: Props) {
     >
       <CommonOnboardingHeader
         title="Invite your teammates"
-        description="Work in plane happens best with your team. Invite them now to use Plane to its potential."
+        description="Work in Saturn happens best with your team. Invite them now to use Saturn to its potential."
       />
       <div className="flex w-full flex-col gap-6">
         <div className="flex flex-col gap-3">
