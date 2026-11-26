@@ -782,11 +782,11 @@ pub(crate) async fn send_workspace_invitation(st: &AppState, workspace: Uuid, in
                 .append_pair("invitation_id", &id.to_string())
                 .append_pair("slug", &slug)
                 .append_pair("token", &token);
-            let text = format!("{name} has invited you to join them in {workspace_name} on Plane. Visit {link}");
+            let text = format!("{name} has invited you to join them in {workspace_name} on Saturn. Visit {link}");
             crate::outbound::send_mail_bg(
                 st,
                 email.to_owned(),
-                format!("{name} has invited you to join them in {workspace_name} on Plane"),
+                format!("{name} has invited you to join them in {workspace_name} on Saturn"),
                 ammonia::clean(&text),
                 text,
             );
