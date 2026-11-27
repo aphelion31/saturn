@@ -3,12 +3,12 @@
 <desc id="desc">Cumulative GitHub stars sampled weekly over the last 26 weeks, ending at 0 stars.</desc>
 <style>
   :root { color-scheme: light dark; }
-  .bg { fill: #fff; } text { fill: #57606a; font: 13px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
-  .grid { stroke: #d8dee4; stroke-width: 1; }
-  .area { fill: #2f81f7; fill-opacity: .14; } .line { fill: none; stroke: #2f81f7; stroke-width: 3; stroke-linejoin: round; stroke-linecap: round; }
-  .point { fill: #fff; stroke: #2f81f7; stroke-width: 2; } .point.current { fill: #2f81f7; stroke: #fff; stroke-width: 2; }
-  .heading { fill: #24292f; font-size: 17px; font-weight: 600; } .metric { fill: #24292f; font-size: 18px; font-weight: 600; }
-  @media (prefers-color-scheme: dark) { .bg { fill: #0d1117; } text { fill: #8b949e; } .grid { stroke: #30363d; } .area { fill: #58a6ff; fill-opacity: .16; } .line { stroke: #58a6ff; } .point { fill: #0d1117; stroke: #58a6ff; } .point.current { fill: #58a6ff; stroke: #0d1117; } .heading,.metric { fill: #f0f6fc; } }
+  .bg { fill: #fdfbf7; } text { fill: #514a43; font: 13px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+  .grid { stroke: #e7ded1; stroke-width: 1; }
+  .area { fill: #c96e32; fill-opacity: .16; } .line { fill: none; stroke: #ac531b; stroke-width: 3; stroke-linejoin: round; stroke-linecap: round; }
+  .point { fill: #fdfbf7; stroke: #ac531b; stroke-width: 2; } .point.current { fill: #c96e32; stroke: #fdfbf7; stroke-width: 2; }
+  .heading { fill: #14100d; font-size: 17px; font-weight: 600; } .metric { fill: #14100d; font-size: 18px; font-weight: 600; }
+  @media (prefers-color-scheme: dark) { .bg { fill: #0c0a08; } text { fill: #9d9791; } .grid { stroke: #2c2621; } .area { fill: #c96e32; fill-opacity: .2; } .line { stroke: #e5955a; } .point { fill: #0c0a08; stroke: #e5955a; } .point.current { fill: #e5955a; stroke: #0c0a08; } .heading,.metric { fill: #f5efe4; } }
 </style>
 <rect class="bg" width="100%" height="100%" rx="6"/>
 <text class="heading" x="68" y="28">GitHub stars over time</text>
