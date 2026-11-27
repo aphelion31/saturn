@@ -7,6 +7,7 @@
 import { Links, Meta, Outlet, Scripts } from "react-router";
 // assets
 import appleTouchIcon from "@/app/assets/favicon/apple-touch-icon.png?url";
+import faviconSvg from "@/app/assets/favicon/favicon.svg?url";
 import favicon16 from "@/app/assets/favicon/favicon-16x16.png?url";
 import favicon32 from "@/app/assets/favicon/favicon-32x32.png?url";
 import faviconIco from "@/app/assets/favicon/favicon.ico?url";
@@ -28,6 +29,7 @@ const APP_TITLE = "Saturn Publish | Make your Saturn boards public with one-clic
 const APP_DESCRIPTION = "Saturn Publish is a customer feedback management tool built on top of Saturn";
 
 export const links: Route.LinksFunction = () => [
+  { rel: "icon", type: "image/svg+xml", href: faviconSvg },
   { rel: "apple-touch-icon", sizes: "180x180", href: appleTouchIcon },
   { rel: "icon", type: "image/png", sizes: "32x32", href: favicon32 },
   { rel: "icon", type: "image/png", sizes: "16x16", href: favicon16 },
@@ -51,6 +53,8 @@ export function Layout({ children }: { children: React.ReactNode }) {
       <head>
         <meta charSet="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <meta name="theme-color" content="#F4EDE2" media="(prefers-color-scheme: light)" />
+        <meta name="theme-color" content="#0C0A08" media="(prefers-color-scheme: dark)" />
         <meta name="robots" content="noindex, nofollow" />
         <Meta />
         <Links />

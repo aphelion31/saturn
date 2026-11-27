@@ -1,9 +1,6 @@
 <div align="center">
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/brand/saturn-mark-dark.svg">
-  <img src="assets/brand/saturn-mark.svg" alt="Saturn ringed-planet logo" width="140">
-</picture>
+<img src="assets/brand/saturn-mark.svg" alt="Saturn" width="128">
 
 # Saturn
 

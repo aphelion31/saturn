@@ -16,6 +16,86 @@
 @import "@makeplane/propel/styles";
 @source "../**/*.{ts,tsx}";
 
+/* Saturn default theme tokens (Terracotta Copper #C96E32 + Warm Parchment #F5EFE4 + Obsidian Ink #0A0A0A).
+ * Scoped with :not([data-custom-theme="true"]) so user custom themes stay untouched. */
+@layer base {
+  :root:not([data-custom-theme="true"]),
+  :host:not([data-custom-theme="true"]) {
+    /* Light mode — Warm Parchment neutrals */
+    --neutral-white: oklch(0.996 0.004 82);
+    --neutral-100: oklch(0.985 0.007 82);
+    --neutral-200: oklch(0.97 0.011 81);
+    --neutral-300: oklch(0.949 0.016 80);
+    --neutral-400: oklch(0.916 0.016 78);
+    --neutral-500: oklch(0.882 0.016 76);
+    --neutral-600: oklch(0.836 0.015 74);
+    --neutral-700: oklch(0.785 0.014 72);
+    --neutral-800: oklch(0.57 0.012 65);
+    --neutral-900: oklch(0.49 0.012 62);
+    --neutral-1000: oklch(0.415 0.011 58);
+    --neutral-1100: oklch(0.32 0.01 55);
+    --neutral-1200: oklch(0.175 0.008 50);
+    --neutral-black: oklch(0.115 0.005 50);
+
+    /* Light mode — Terracotta Copper brand ramp */
+    --brand-50: oklch(0.986 0.008 58);
+    --brand-100: oklch(0.972 0.016 58);
+    --brand-200: oklch(0.946 0.03 56);
+    --brand-300: oklch(0.905 0.052 55);
+    --brand-400: oklch(0.848 0.082 54);
+    --brand-500: oklch(0.775 0.112 52.5);
+    --brand-600: oklch(0.695 0.128 51.5);
+    --brand-700: oklch(0.612 0.132 50.5);
+    --brand-800: oklch(0.545 0.134 48);
+    --brand-900: oklch(0.475 0.12 46.5);
+    --brand-1000: oklch(0.398 0.102 45.5);
+    --brand-1100: oklch(0.315 0.078 45);
+    --brand-1200: oklch(0.24 0.056 44.5);
+    --brand-default: oklch(0.545 0.134 48);
+
+    @variant dark {
+      /* Dark mode — Obsidian Charcoal neutrals */
+      --neutral-black: oklch(0.145 0.005 55);
+      --neutral-100: oklch(0.18 0.006 56);
+      --neutral-200: oklch(0.212 0.007 57);
+      --neutral-300: oklch(0.244 0.008 58);
+      --neutral-400: oklch(0.282 0.009 59);
+      --neutral-500: oklch(0.326 0.01 60);
+      --neutral-600: oklch(0.376 0.011 61);
+      --neutral-700: oklch(0.435 0.012 62);
+      --neutral-800: oklch(0.595 0.012 65);
+      --neutral-900: oklch(0.68 0.012 68);
+      --neutral-1000: oklch(0.768 0.012 72);
+      --neutral-1100: oklch(0.852 0.013 76);
+      --neutral-1200: oklch(0.932 0.014 80);
+      --neutral-white: oklch(0.972 0.011 82);
+
+      /* Dark mode — Terracotta Copper brand ramp */
+      --brand-50: oklch(0.18 0.028 46);
+      --brand-100: oklch(0.22 0.04 46.5);
+      --brand-200: oklch(0.275 0.056 47);
+      --brand-300: oklch(0.345 0.076 47.5);
+      --brand-400: oklch(0.42 0.098 48);
+      --brand-500: oklch(0.485 0.122 47);
+      --brand-600: oklch(0.545 0.134 48);
+      --brand-700: oklch(0.74 0.122 56);
+      --brand-800: oklch(0.805 0.102 59);
+      --brand-900: oklch(0.885 0.056 62);
+      --brand-1000: oklch(0.935 0.032 64);
+      --brand-1100: oklch(0.965 0.016 66);
+      --brand-1200: oklch(0.985 0.008 68);
+      --brand-default: oklch(0.675 0.13 53);
+
+      /* Keep primary buttons >= 4.5:1 with warm white text while accent text/links glow at 6.1–7.9:1 on obsidian */
+      --bg-accent-primary: var(--brand-600);
+      --bg-accent-primary-hover: var(--brand-500);
+      --bg-accent-primary-active: var(--brand-400);
+      --txt-link-primary: var(--brand-700);
+      --txt-link-primary-hover: var(--brand-800);
+    }
+  }
+}
+
 * {
   -webkit-text-size-adjust: 100%;
   -ms-text-size-adjust: 100%;
