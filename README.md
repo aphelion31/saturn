@@ -13,14 +13,14 @@
 [![GitHub Stars](https://img.shields.io/github/stars/aphelion31/saturn?style=flat-square&logo=github)](https://github.com/aphelion31/saturn/stargazers)
 [![GitHub Release](https://img.shields.io/github/v/release/aphelion31/saturn?style=flat-square&logo=github)](https://github.com/aphelion31/saturn/releases/latest)
 [![CI](https://img.shields.io/github/actions/workflow/status/aphelion31/saturn/ci.yml?branch=develop&style=flat-square&logo=githubactions&logoColor=white)](https://github.com/aphelion31/saturn/actions/workflows/ci.yml)
-[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue?style=flat-square)](LICENSE)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-C96E32?style=flat-square)](LICENSE)
 
 </div>
 
 <div align="center">
 
-  <a href="https://github.com/aphelion31/saturn/releases/download/readme-assets/saturn-demo.mp4">
-    <img src="https://github.com/aphelion31/saturn/releases/download/readme-assets/saturn-demo.webp" alt="Saturn showcase demonstration" width="900">
+  <a href="https://github.com/aphelion31/saturn/releases/download/readme-assets/saturn-demo-v2.mp4">
+    <img src="https://github.com/aphelion31/saturn/releases/download/readme-assets/saturn-demo-v2.webp" alt="Saturn showcase demonstration" width="900">
   </a>
 
   <p><em>Saturn 12-second overview (click for 1080p MP4)</em></p>
@@ -30,7 +30,7 @@
 > **Note:** Saturn is a Rust rewrite of [Plane](https://github.com/makeplane/plane), the open source project
 > management tool. Plane's Django + Celery + Redis + RabbitMQ + Node backend is replaced by one small Rust binary
 > (`axum` + `sqlx`). Plane's React Router SPAs are synced to `1.5.1` (`preview @ 723bb178f9`), rebranded to
-> **Saturn** with a custom geometric ringed-planet logo, built with **Bun `1.4.4`** (`bun.lock`), and served by
+> **Saturn** with a custom terracotta ringed-planet emblem and warm terracotta/parchment/obsidian default theme, built with **Bun `1.4.4`** (`bun.lock`), and served by
 > the same binary as static files. Saturn keeps Plane's PostgreSQL schema, sessions, password hashes (with
 > Argon2id default + transparent legacy `pbkdf2_sha256` upgrade), and API shapes so an existing Plane database
 > works out of the box.
@@ -172,6 +172,7 @@ docker/       Container builds and reverse proxy config (`axum/Dockerfile`, `ngi
 migrations/   PostgreSQL schema dumped from Plane's Django migrations, plus database defaults
 tools/        API smoke test, E2E check, benchmark
 scripts/      git hook checks, branch helper, Bun frontend build
+assets/       brand logo SVGs, email templates, and workspace seed data
 docs/         architecture, process docs, star chart, and retina UI screenshots (`docs/screenshots/`)
 ```
 
