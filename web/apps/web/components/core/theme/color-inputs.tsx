@@ -81,7 +81,7 @@ export const CustomThemeColorInputs = observer(function CustomThemeColorInputs(p
                 name="primary"
                 value={value}
                 onChange={(val) => handleValueChange(val, onChange)}
-                placeholder="#3f76ff"
+                placeholder="#c96e32"
                 className="w-full placeholder:text-placeholder"
                 style={{
                   backgroundColor: value,
