@@ -12,6 +12,7 @@ import { ThemeProvider, useTheme } from "next-themes";
 import { SITE_DESCRIPTION, SITE_NAME } from "@plane/constants";
 // types
 // assets
+import faviconSvg from "@/app/assets/favicon/favicon.svg?url";
 import favicon16 from "@/app/assets/favicon/favicon-16x16.png?url";
 import favicon32 from "@/app/assets/favicon/favicon-32x32.png?url";
 import faviconIco from "@/app/assets/favicon/favicon.ico?url";
@@ -35,6 +36,7 @@ import "@fontsource/ibm-plex-mono";
 const APP_TITLE = "Saturn | Simple, extensible, open-source project management tool.";
 
 export const links: LinksFunction = () => [
+  { rel: "icon", type: "image/svg+xml", href: faviconSvg },
   { rel: "icon", type: "image/png", sizes: "32x32", href: favicon32 },
   { rel: "icon", type: "image/png", sizes: "16x16", href: favicon16 },
   { rel: "shortcut icon", href: faviconIco },
@@ -59,7 +61,8 @@ export function Layout({ children }: { children: ReactNode }) {
       <head>
         <meta charSet="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <meta name="theme-color" content="#fff" />
+        <meta name="theme-color" content="#F4EDE2" media="(prefers-color-scheme: light)" />
+        <meta name="theme-color" content="#0C0A08" media="(prefers-color-scheme: dark)" />
         {/* Meta info for PWA */}
         <meta name="application-name" content="Saturn" />
         <meta name="apple-mobile-web-app-capable" content="yes" />

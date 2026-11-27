@@ -35,12 +35,7 @@ export function InstanceNotReady() {
           </div>
           <div className="flex h-full w-full flex-col items-center justify-center gap-7">
             <div className="flex flex-col items-center gap-11">
-              <div
-                aria-label="Saturn Logo"
-                className="flex size-24 items-center justify-center rounded-3xl bg-gradient-to-br from-[#3F76FF] to-[#5B4BFF] shadow-lg"
-              >
-                <PlaneLogo className="h-14 w-auto text-white" />
-              </div>
+              <PlaneLogo aria-label="Saturn Logo" className="size-24 rounded-3xl shadow-lg" />
               <div className="flex max-w-124 flex-col items-center gap-3">
                 <h1 className="text-h2-semibold text-primary">Welcome to Saturn</h1>
                 <p className="text-center text-body-md-regular text-secondary">

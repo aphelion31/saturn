@@ -25,9 +25,9 @@ export const THEME_OPTIONS: I_THEME_OPTION[] = [
     i18n_label: "System preference",
     type: "light",
     icon: {
-      border: "#DEE2E6",
-      color1: "#FAFAFA",
-      color2: "#3F76FF",
+      border: "#DDD2C3",
+      color1: "#F5EFE4",
+      color2: "#C96E32",
     },
   },
   {
@@ -36,9 +36,9 @@ export const THEME_OPTIONS: I_THEME_OPTION[] = [
     i18n_label: "Light",
     type: "light",
     icon: {
-      border: "#DEE2E6",
-      color1: "#FAFAFA",
-      color2: "#3F76FF",
+      border: "#DDD2C3",
+      color1: "#F5EFE4",
+      color2: "#C96E32",
     },
   },
   {
@@ -47,9 +47,9 @@ export const THEME_OPTIONS: I_THEME_OPTION[] = [
     i18n_label: "Dark",
     type: "dark",
     icon: {
-      border: "#2E3234",
-      color1: "#191B1B",
-      color2: "#3C85D9",
+      border: "#383029",
+      color1: "#14110F",
+      color2: "#D47E43",
     },
   },
   {
@@ -58,9 +58,9 @@ export const THEME_OPTIONS: I_THEME_OPTION[] = [
     i18n_label: "Light high contrast",
     type: "light",
     icon: {
-      border: "#000000",
-      color1: "#FFFFFF",
-      color2: "#3F76FF",
+      border: "#0A0A0A",
+      color1: "#FFFEFB",
+      color2: "#AC531B",
     },
   },
   {
@@ -69,9 +69,9 @@ export const THEME_OPTIONS: I_THEME_OPTION[] = [
     i18n_label: "Dark high contrast",
     type: "dark",
     icon: {
-      border: "#FFFFFF",
-      color1: "#030303",
-      color2: "#3A8BE9",
+      border: "#F5EFE4",
+      color1: "#0C0A08",
+      color2: "#E5955A",
     },
   },
   {
